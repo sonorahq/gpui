@@ -26,7 +26,9 @@ test-support = [
     "x11",
     "proptest",
 ]
-bench = ["test-support", "profiler", "dep:criterion"]
+bench-support = ["profiler", "dep:criterion"]
+# Preserve the published feature name while consumers migrate to `bench-support`.
+bench = ["bench-support"]
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
 wayland = []
@@ -38,6 +40,7 @@ screen-capture = [
 ]
 windows-manifest = ["dep:embed-resource"]
 profiler = ["dep:hdrhistogram"]
+stacker = ["dep:stacksafe"]
 
 [lib]
 path = "src/gpui.rs"
@@ -64,8 +67,8 @@ image.workspace = true
 inventory.workspace = true
 itertools.workspace = true
 log.workspace = true
-num_cpus = "1.13"
-parking = "2.0.0"
+num_cpus = "1.17"
+parking = "2.2.1"
 parking_lot.workspace = true
 postage.workspace = true
 proptest = { workspace = true, optional = true }
@@ -87,7 +90,7 @@ serde_json.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
 async-channel.workspace = true
-stacksafe.workspace = true
+stacksafe = { workspace = true, optional = true }
 strum.workspace = true
 sum_tree.workspace = true
 taffy = "=0.13.0"
@@ -97,8 +100,8 @@ gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
 lyon = "1.0"
-pin-project = "1.1.10"
-spin = "0.10.0"
+pin-project = "1.1.13"
+spin = "0.10.1"
 pollster.workspace = true
 url.workspace = true
 uuid.workspace = true
@@ -143,11 +146,15 @@ unicode-segmentation = { workspace = true }
 http_client = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen = { workspace = true }
+web-sys = { version = "0.3", features = ["console"] }
+
 [build-dependencies]
 embed-resource = { version = "3.0", optional = true }
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
-bindgen = "0.71"
+bindgen = "0.72"
 
 [package.metadata.cargo-shear]
 ignored = [

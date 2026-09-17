@@ -3,7 +3,7 @@ name = "ztracing"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 
 [lints]
 workspace = true
@@ -16,13 +16,13 @@ web = ["dep:async-channel", "dep:js-sys", "dep:wasm-bindgen", "dep:web-sys"]
 zlog.workspace = true
 tracing.workspace = true
 
-tracing-subscriber = "0.3.22"
+tracing-subscriber = "0.3.23"
 
 ztracing_macro.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tracing-tracy = { version = "0.11.4", optional = true, features = ["enable", "ondemand"] }
-tracy-client = { version = "0.18.2", optional = true, features = ["enable", "ondemand"] }
+tracy-client = { version = "0.18.5", optional = true, features = ["enable", "ondemand"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 async-channel = { workspace = true, optional = true }
