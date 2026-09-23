@@ -2008,7 +2008,7 @@ impl WgpuRenderer {
                 let wanted = views
                     .as_ref()
                     .and_then(|_| scene.filtered(scene.batch_order(&batch)))
-                    .map(|index| scene.filter_chain(index))
+                    .map(|index| scene.filter_chain_small(index))
                     .unwrap_or_default();
 
                 let shared = stack

@@ -31,6 +31,7 @@ use std::{
     hash::{Hash, Hasher},
     ops::{Deref, DerefMut, Range},
     sync::Arc,
+    time::Duration,
 };
 
 /// An opaque identifier for a specific font.
@@ -41,6 +42,25 @@ pub struct FontId(pub usize);
 /// An opaque identifier for a specific font family.
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct FontFamilyId(pub usize);
+
+/// Configuration for the font cache eviction strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FontCacheConfig {
+    /// Maximum duration an unused font stays loaded in memory before eviction.
+    pub ttl: Duration,
+    /// Maximum number of font faces kept loaded in memory simultaneously.
+    /// When this count is exceeded, least recently used fonts are evicted.
+    pub max_loaded_fonts: usize,
+}
+
+impl Default for FontCacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(15),
+            max_loaded_fonts: 32,
+        }
+    }
+}
 
 /// Number of subpixel glyph variants along the X axis.
 pub const SUBPIXEL_VARIANTS_X: u8 = 4;
@@ -102,6 +122,42 @@ impl TextSystem {
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform_text_system.add_fonts(fonts)
+    }
+
+    /// Configure the font cache eviction strategy.
+    pub fn set_font_cache_config(&self, config: FontCacheConfig) {
+        self.platform_text_system.set_font_cache_config(config);
+    }
+
+    /// Evicts loaded font files from memory that have not been used recently.
+    /// If `older_than` is None, the platform text system's default TTL is used.
+    pub fn evict_unused_fonts(&self, older_than: Option<Duration>) -> Result<usize> {
+        self.platform_text_system.evict_unused_fonts(older_than)
+    }
+
+    /// Unloads a specific font descriptor from memory, releasing its memory mapping.
+    pub fn unload_font(&self, font: &Font) -> Result<bool> {
+        if let Some(Ok(font_id)) = self.font_ids_by_font.read().get(font) {
+            let font_id = *font_id;
+            self.platform_text_system.unload_font(font_id)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Unloads a specific font ID from memory.
+    pub fn unload_font_id(&self, font_id: FontId) -> Result<bool> {
+        self.platform_text_system.unload_font(font_id)
+    }
+
+    /// Returns the number of currently loaded (in-memory) font instances.
+    pub fn active_font_count(&self) -> usize {
+        self.platform_text_system.active_font_count()
+    }
+
+    /// Clears all loaded font files from memory.
+    pub fn clear_font_cache(&self) -> Result<usize> {
+        self.platform_text_system.clear_font_cache()
     }
 
     /// Get the FontId for the configure font family and style.

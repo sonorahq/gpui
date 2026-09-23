@@ -46,7 +46,7 @@ use crate::InspectorElementRegistry;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
     ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError,
-    CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle,
+    CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle, Font, FontCacheConfig,
     FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId,
     Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
     PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
@@ -2000,6 +2000,31 @@ impl App {
     /// Accessor for the text system.
     pub fn text_system(&self) -> &Arc<TextSystem> {
         &self.text_system
+    }
+
+    /// Configure the font cache eviction strategy.
+    pub fn set_font_cache_config(&self, config: FontCacheConfig) {
+        self.text_system().set_font_cache_config(config);
+    }
+
+    /// Evicts loaded font files from memory that haven't been accessed recently.
+    pub fn evict_unused_fonts(&self, older_than: Option<Duration>) -> Result<usize> {
+        self.text_system().evict_unused_fonts(older_than)
+    }
+
+    /// Unloads a specific font descriptor from memory.
+    pub fn unload_font(&self, font: &Font) -> Result<bool> {
+        self.text_system().unload_font(font)
+    }
+
+    /// Returns the number of currently loaded (in-memory) font instances.
+    pub fn active_font_count(&self) -> usize {
+        self.text_system().active_font_count()
+    }
+
+    /// Clears all loaded font files from memory.
+    pub fn clear_font_cache(&self) -> Result<usize> {
+        self.text_system().clear_font_cache()
     }
 
     /// Check whether a global of the given type has been assigned.

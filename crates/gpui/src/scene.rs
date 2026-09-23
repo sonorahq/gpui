@@ -3,6 +3,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
@@ -166,7 +167,13 @@ impl Scene {
 
     /// A layer and everything that encloses it, outermost first.
     pub fn filter_chain(&self, index: usize) -> Vec<usize> {
-        let mut chain = vec![index];
+        self.filter_chain_small(index).into_vec()
+    }
+
+    /// The stack-backed form used by renderers while walking every primitive batch.
+    pub fn filter_chain_small(&self, index: usize) -> SmallVec<[usize; 4]> {
+        let mut chain = SmallVec::new();
+        chain.push(index);
         let mut walk = self.effects[index].parent;
         while let Some(parent) = walk {
             chain.push(parent);

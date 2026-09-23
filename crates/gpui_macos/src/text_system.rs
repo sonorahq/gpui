@@ -61,6 +61,8 @@ struct FontKey {
     font_family: SharedString,
     font_features: FontFeatures,
     font_fallbacks: Option<FontFallbacks>,
+    font_weight: FontWeight,
+    font_style: FontStyle,
 }
 
 struct MacTextSystemState {
@@ -143,12 +145,19 @@ impl PlatformTextSystem for MacTextSystem {
                 font_family: font.family.clone(),
                 font_features: font.features.clone(),
                 font_fallbacks: font.fallbacks.clone(),
+                font_weight: font.weight,
+                font_style: font.style,
             };
             let candidates = if let Some(font_ids) = lock.font_ids_by_font_key.get(&font_key) {
                 font_ids.as_slice()
             } else {
-                let font_ids =
-                    lock.load_family(&font.family, &font.features, font.fallbacks.as_ref())?;
+                let font_ids = lock.load_family(
+                    &font.family,
+                    &font.features,
+                    font.fallbacks.as_ref(),
+                    font.weight,
+                    font.style,
+                )?;
                 lock.font_ids_by_font_key.insert(font_key.clone(), font_ids);
                 lock.font_ids_by_font_key[&font_key].as_ref()
             };
@@ -270,6 +279,8 @@ impl MacTextSystemState {
             })
             .collect::<Result<Vec<_>>>()?;
         self.memory_source.add_fonts(fonts.into_iter())?;
+        self.font_ids_by_font_key.clear();
+        self.font_selections.clear();
         Ok(())
     }
 
@@ -278,6 +289,8 @@ impl MacTextSystemState {
         name: &str,
         features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
+        weight: FontWeight,
+        style: FontStyle,
     ) -> Result<SmallVec<[FontId; 4]>> {
         let name = gpui::font_name_with_fallbacks(name, ".AppleSystemUIFont");
 
@@ -287,6 +300,12 @@ impl MacTextSystemState {
             .memory_source
             .select_family_by_name(name)
             .or_else(|_| self.system_source.select_family_by_name(name))?;
+        let wanted = font_kit::properties::Properties {
+            style: fontkit_style(style),
+            weight: fontkit_weight(weight),
+            stretch: Default::default(),
+        };
+        let mut selected_font: Option<(FontKitFont, String)> = None;
         for font in family.fonts() {
             let mut font = font.load()?;
 
@@ -371,6 +390,20 @@ impl MacTextSystemState {
                 );
                 continue;
             }
+
+            let should_select = match selected_font.as_ref() {
+                None => true,
+                Some((selected_font, _)) => {
+                    let candidate_properties = [font.properties(), selected_font.properties()];
+                    font_kit::matching::find_best_match(&candidate_properties, &wanted)? == 0
+                }
+            };
+            if should_select {
+                selected_font = Some((font, postscript_name));
+            }
+        }
+
+        if let Some((font, postscript_name)) = selected_font {
             let font_id = FontId(self.fonts.len());
             font_ids.push(font_id);
             self.font_ids_by_postscript_name
