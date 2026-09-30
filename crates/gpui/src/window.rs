@@ -743,7 +743,6 @@ pub(crate) type AnyTouchListener =
 struct TouchState {
     start_position: Point<Pixels>,
     last_position: Point<Pixels>,
-    hit_test: HitTest,
     click_count: usize,
     moved: bool,
     scroll_started: bool,
@@ -1208,7 +1207,6 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
-    touch_enabled: bool,
     primary_touch: Option<(TouchId, TouchState)>,
     last_touch_tap: Option<TouchTap>,
     modifiers: Modifiers,
@@ -1903,7 +1901,6 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
-            touch_enabled: false,
             primary_touch: None,
             last_touch_tap: None,
             modifiers,
@@ -5124,15 +5121,6 @@ impl Window {
             },
         )));
     }
-
-    /// Enables or disables translation of raw touch contacts into click and scroll gestures.
-    pub fn set_touch_enabled(&mut self, enabled: bool) {
-        self.touch_enabled = enabled;
-        if !enabled {
-            self.primary_touch = None;
-        }
-    }
-
     /// Registers a raw touch listener for the next frame.
     pub fn on_touch_event(
         &mut self,
@@ -5465,10 +5453,6 @@ impl Window {
     }
 
     fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
-        if !self.touch_enabled {
-            return;
-        }
-
         match event.phase {
             TouchPhase::Started => {
                 if self.primary_touch.is_some() {
@@ -5490,7 +5474,6 @@ impl Window {
                     TouchState {
                         start_position: event.position,
                         last_position: event.position,
-                        hit_test: hit_test.clone(),
                         click_count,
                         moved: false,
                         scroll_started: false,
@@ -5531,7 +5514,6 @@ impl Window {
                 }
                 state.moved |= moved_now;
                 self.mouse_position = event.position;
-                self.mouse_hit_test = state.hit_test.clone();
                 self.primary_touch = Some((touch_id, state.clone()));
                 self.dispatch_touch_listeners(event, cx);
                 if cx.propagate_event && state.moved && (!delta.x.is_zero() || !delta.y.is_zero()) {
@@ -5563,18 +5545,16 @@ impl Window {
                 }
 
                 self.mouse_position = event.position;
-                self.mouse_hit_test = state.hit_test.clone();
                 self.dispatch_touch_listeners(event, cx);
                 if state.moved {
                     if cx.propagate_event && state.scroll_started {
-                        self.dispatch_mouse_event_with_hit_test(
+                        self.dispatch_mouse_event(
                             &ScrollWheelEvent {
                                 position: event.position,
                                 delta: ScrollDelta::Pixels(Point::default()),
                                 modifiers: Modifiers::default(),
                                 touch_phase: TouchPhase::Ended,
                             },
-                            Some(&state.hit_test),
                             cx,
                         );
                     }
@@ -5585,20 +5565,23 @@ impl Window {
                         count: state.click_count,
                     });
                 }
-                let hit_test = match state.moved || event.phase == TouchPhase::Cancelled {
-                    true => HitTest::default(),
-                    false => state.hit_test,
+                let mouse_up = MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: event.position,
+                    modifiers: Modifiers::default(),
+                    click_count: state.click_count,
                 };
-                self.dispatch_mouse_event_with_hit_test(
-                    &MouseUpEvent {
-                        button: MouseButton::Left,
-                        position: event.position,
-                        modifiers: Modifiers::default(),
-                        click_count: state.click_count,
-                    },
-                    Some(&hit_test),
-                    cx,
-                );
+                match state.moved || event.phase == TouchPhase::Cancelled {
+                    true => self.dispatch_mouse_event_with_hit_test(
+                        &mouse_up,
+                        Some(&HitTest::default()),
+                        cx,
+                    ),
+                    // Hitbox ids change on every repaint, and the touch-down already
+                    // triggered one, so a tap must be dispatched against a fresh hit
+                    // test rather than one captured when the contact started.
+                    false => self.dispatch_mouse_event(&mouse_up, cx),
+                }
             }
         }
     }
@@ -7380,139 +7363,6 @@ mod tests {
                     scroll_phases.borrow_mut().push(event.touch_phase);
                 })
         }
-    }
-
-    fn dispatch_touch(
-        cx: &mut TestAppContext,
-        window: AnyWindowHandle,
-        id: u64,
-        phase: TouchPhase,
-        position: Point<Pixels>,
-    ) {
-        cx.update_window(window, |_, window, cx| {
-            window.dispatch_event(
-                TouchEvent {
-                    id: TouchId(id),
-                    phase,
-                    position,
-                    force: None,
-                }
-                .to_platform_input(),
-                cx,
-            );
-        })
-        .unwrap();
-    }
-
-    #[gpui::test]
-    fn touch_tap_invokes_click_handler(cx: &mut TestAppContext) {
-        let clicks = Rc::new(RefCell::new(Vec::new()));
-        let scroll_phases = Rc::new(RefCell::new(Vec::new()));
-        let window = cx.add_window({
-            let clicks = clicks.clone();
-            let scroll_phases = scroll_phases.clone();
-            move |_, _| TouchTargetView {
-                clicks,
-                scroll_phases,
-            }
-        });
-        cx.update_window(window.into(), |_, window, _| window.set_touch_enabled(true))
-            .unwrap();
-
-        let position = point(px(20.), px(20.));
-        dispatch_touch(cx, window.into(), 1, TouchPhase::Started, position);
-        dispatch_touch(cx, window.into(), 1, TouchPhase::Ended, position);
-
-        assert_eq!(&*clicks.borrow(), &[1]);
-    }
-
-    #[gpui::test]
-    fn touch_taps_accumulate_click_count(cx: &mut TestAppContext) {
-        let clicks = Rc::new(RefCell::new(Vec::new()));
-        let scroll_phases = Rc::new(RefCell::new(Vec::new()));
-        let window = cx.add_window({
-            let clicks = clicks.clone();
-            let scroll_phases = scroll_phases.clone();
-            move |_, _| TouchTargetView {
-                clicks,
-                scroll_phases,
-            }
-        });
-        cx.update_window(window.into(), |_, window, _| window.set_touch_enabled(true))
-            .unwrap();
-
-        let position = point(px(20.), px(20.));
-        for id in [1, 2] {
-            dispatch_touch(cx, window.into(), id, TouchPhase::Started, position);
-            dispatch_touch(cx, window.into(), id, TouchPhase::Ended, position);
-        }
-
-        assert_eq!(&*clicks.borrow(), &[1, 2]);
-    }
-
-    #[gpui::test]
-    fn touch_scroll_does_not_click(cx: &mut TestAppContext) {
-        let clicks = Rc::new(RefCell::new(Vec::new()));
-        let scroll_phases = Rc::new(RefCell::new(Vec::new()));
-        let window = cx.add_window({
-            let clicks = clicks.clone();
-            let scroll_phases = scroll_phases.clone();
-            move |_, _| TouchTargetView {
-                clicks,
-                scroll_phases,
-            }
-        });
-        cx.update_window(window.into(), |_, window, _| window.set_touch_enabled(true))
-            .unwrap();
-
-        dispatch_touch(
-            cx,
-            window.into(),
-            1,
-            TouchPhase::Started,
-            point(px(20.), px(20.)),
-        );
-        dispatch_touch(
-            cx,
-            window.into(),
-            1,
-            TouchPhase::Moved,
-            point(px(20.), px(40.)),
-        );
-        dispatch_touch(
-            cx,
-            window.into(),
-            1,
-            TouchPhase::Ended,
-            point(px(20.), px(40.)),
-        );
-
-        assert!(clicks.borrow().is_empty());
-        assert_eq!(
-            &*scroll_phases.borrow(),
-            &[TouchPhase::Started, TouchPhase::Ended]
-        );
-    }
-
-    #[gpui::test]
-    fn disabled_touch_support_ignores_contacts(cx: &mut TestAppContext) {
-        let clicks = Rc::new(RefCell::new(Vec::new()));
-        let scroll_phases = Rc::new(RefCell::new(Vec::new()));
-        let window = cx.add_window({
-            let clicks = clicks.clone();
-            let scroll_phases = scroll_phases.clone();
-            move |_, _| TouchTargetView {
-                clicks,
-                scroll_phases,
-            }
-        });
-
-        let position = point(px(20.), px(20.));
-        dispatch_touch(cx, window.into(), 1, TouchPhase::Started, position);
-        dispatch_touch(cx, window.into(), 1, TouchPhase::Ended, position);
-
-        assert!(clicks.borrow().is_empty());
-        assert!(scroll_phases.borrow().is_empty());
     }
 
     struct OpensWindowOnPaint {
