@@ -1,5 +1,8 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
+#[path = "../example_support/fonts.rs"]
+mod example_support;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -157,6 +160,9 @@ fn run_example() {
         base: manifest_dir.join("examples"),
     })
     .run(move |cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         cx.activate(true);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
