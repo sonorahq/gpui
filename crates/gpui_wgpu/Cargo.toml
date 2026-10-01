@@ -32,6 +32,7 @@ swash.workspace = true
 unicode-bidi.workspace = true
 unicode-segmentation.workspace = true
 gpui_util.workspace = true
+web-time.workspace = true
 wgpu.workspace = true
 
 # Optional: only needed on platforms with multiple font sources (e.g. Linux)

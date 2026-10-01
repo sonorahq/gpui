@@ -13,8 +13,15 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use web_time::Instant;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
+
+/// How long an offscreen target may go unused before its memory is given back. A frame with a
+/// blur, layer or path on screen touches its targets every time, so only targets that nothing
+/// on screen draws through are released.
+const IDLE_RELEASE: Duration = Duration::from_secs(2);
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 
@@ -198,19 +205,12 @@ struct WgpuResources {
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_data: InstanceData,
-    path_intermediate_texture: Option<wgpu::Texture>,
-    path_intermediate_view: Option<wgpu::TextureView>,
-    path_msaa_texture: Option<wgpu::Texture>,
-    path_msaa_view: Option<wgpu::TextureView>,
-    backdrop_targets: Option<BackdropTargets>,
-}
-
-/// The views a frame needs to blur its backdrops.
-#[derive(Clone)]
-struct BackdropViews {
-    frame: wgpu::TextureView,
-    layers: Vec<wgpu::TextureView>,
-    steps: Vec<[wgpu::TextureView; 2]>,
+    /// Where paths are rasterized before they are copied into the frame.
+    path_intermediate: Option<Scratch>,
+    /// The multisampled target paths are rasterized into and resolved from, when the surface
+    /// format supports multisampling.
+    path_msaa: Option<Scratch>,
+    filter_targets: FilterTargets,
 }
 
 #[repr(C, align(8))]
@@ -246,37 +246,130 @@ const BLUR_REACH: f32 = 4.;
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
 
-/// Offscreen targets used to blur what has already been drawn.
-struct BackdropTargets {
-    frame: wgpu::Texture,
-    frame_view: wgpu::TextureView,
-    layers: Vec<(wgpu::Texture, wgpu::TextureView)>,
-    /// Ping-pong pairs for the blur passes, one per resolution step.
-    steps: Vec<[(wgpu::Texture, wgpu::TextureView); 2]>,
+/// An offscreen render target that is created the first time a frame needs it and released
+/// once it has gone `IDLE_RELEASE` without use.
+struct Scratch {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    used: Instant,
 }
 
-impl BackdropTargets {
-    fn drop_textures(&self) {
-        self.frame.destroy();
-        for (texture, _) in &self.layers {
-            texture.destroy();
+impl Scratch {
+    fn new(
+        device: &wgpu::Device,
+        label: &str,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+        sample_count: u32,
+        usage: wgpu::TextureUsages,
+        now: Instant,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size.0.max(1),
+                height: size.1.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            texture,
+            view,
+            used: now,
         }
-        for pair in &self.steps {
-            for (texture, _) in pair {
-                texture.destroy();
-            }
+    }
+
+    /// Hands out the view and marks the target as in use for the frame drawn at `now`.
+    fn touch(&mut self, now: Instant) -> wgpu::TextureView {
+        self.used = now;
+        self.view.clone()
+    }
+}
+
+/// One of the offscreen targets filters draw through.
+#[derive(Clone, Copy)]
+enum FilterTarget {
+    /// The frame itself, drawn offscreen so a backdrop can sample what lies under it.
+    Frame,
+    /// The target a filtered layer is drawn into, by nesting depth.
+    Layer(usize),
+    /// One half of the ping-pong pair at a blur step.
+    Step(usize, usize),
+}
+
+impl FilterTarget {
+    /// How many times smaller than the frame the target is on each side.
+    fn shrink(self) -> u32 {
+        match self {
+            Self::Step(step, _) => BLUR_STEPS[step],
+            Self::Frame | Self::Layer(_) => 1,
         }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Frame => "backdrop_frame".into(),
+            Self::Layer(depth) => format!("filter_layer_{depth}"),
+            Self::Step(step, half) => format!("blur_{}_{}", BLUR_STEPS[step], half),
+        }
+    }
+}
+
+/// Offscreen targets used to blur and mask what has already been drawn. Each one is allocated
+/// the first time a frame draws through it, so a frame with one shallow blur pays for the
+/// targets it touches rather than for every depth and step.
+#[derive(Default)]
+struct FilterTargets {
+    frame: Option<Scratch>,
+    layers: [Option<Scratch>; LAYER_DEPTH],
+    /// Ping-pong pairs for the blur passes, one per resolution step.
+    steps: [[Option<Scratch>; 2]; BLUR_STEPS.len()],
+}
+
+impl FilterTargets {
+    fn slot(&mut self, target: FilterTarget) -> &mut Option<Scratch> {
+        match target {
+            FilterTarget::Frame => &mut self.frame,
+            FilterTarget::Layer(depth) => &mut self.layers[depth],
+            FilterTarget::Step(step, half) => &mut self.steps[step][half],
+        }
+    }
+
+    fn slots(&mut self) -> impl Iterator<Item = &mut Option<Scratch>> {
+        std::iter::once(&mut self.frame)
+            .chain(self.layers.iter_mut())
+            .chain(self.steps.iter_mut().flatten())
     }
 }
 
 impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
-        self.path_intermediate_texture = None;
-        self.path_intermediate_view = None;
-        self.path_msaa_texture = None;
-        self.path_msaa_view = None;
-        if let Some(targets) = self.backdrop_targets.take() {
-            targets.drop_textures();
+        let paths = [&mut self.path_intermediate, &mut self.path_msaa];
+        for slot in paths.into_iter().chain(self.filter_targets.slots()) {
+            if let Some(scratch) = slot.take() {
+                scratch.texture.destroy();
+            }
+        }
+    }
+
+    /// Drops every offscreen target that no frame has drawn through within `IDLE_RELEASE` of
+    /// `now`. Called after the frame is submitted, so a target the frame used is never idle.
+    fn release_targets_idle_at(&mut self, now: Instant) {
+        let paths = [&mut self.path_intermediate, &mut self.path_msaa];
+        for slot in paths.into_iter().chain(self.filter_targets.slots()) {
+            if slot
+                .as_ref()
+                .is_some_and(|scratch| now.duration_since(scratch.used) >= IDLE_RELEASE)
+            {
+                *slot = None;
+            }
         }
     }
 }
@@ -297,6 +390,8 @@ pub struct WgpuRenderer {
     max_instance_data_size: u64,
     instance_data_alignment: u64,
     uses_webgl_instance_data: bool,
+    /// When the frame being recorded started, which stamps every offscreen target it touches.
+    frame_time: Instant,
     rendering_params: RenderingParameters,
     is_bgr: bool,
     dual_source_blending: bool,
@@ -650,13 +745,11 @@ impl WgpuRenderer {
             globals_bind_group,
             path_globals_bind_group,
             instance_data,
-            // Defer intermediate texture creation to first draw call via ensure_intermediate_textures().
-            // This avoids panics when the device/surface is in an invalid state during initialization.
-            path_intermediate_texture: None,
-            path_intermediate_view: None,
-            path_msaa_texture: None,
-            path_msaa_view: None,
-            backdrop_targets: None,
+            // Offscreen targets are created by the first frame that draws through them, once the
+            // surface is known to be healthy, and released again when they go unused.
+            path_intermediate: None,
+            path_msaa: None,
+            filter_targets: FilterTargets::default(),
         };
 
         Ok(Self {
@@ -671,6 +764,7 @@ impl WgpuRenderer {
             max_instance_data_size,
             instance_data_alignment,
             uses_webgl_instance_data,
+            frame_time: Instant::now(),
             rendering_params,
             is_bgr: false,
             dual_source_blending,
@@ -1300,8 +1394,8 @@ impl WgpuRenderer {
 
     fn resume_pass<'a>(
         encoder: &'a mut wgpu::CommandEncoder,
-        label: &'a str,
-        view: &'a wgpu::TextureView,
+        label: &str,
+        view: &wgpu::TextureView,
         load: wgpu::LoadOp<wgpu::Color>,
     ) -> wgpu::RenderPass<'a> {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1385,12 +1479,14 @@ impl WgpuRenderer {
     /// Blurs a source into one of the ping-pong targets and returns the one holding the result.
     ///
     /// The resolution follows the radius: a small blur stays at full resolution, where downsampling
-    /// would turn text into mush, and only a wide one is worth shrinking first.
+    /// would turn text into mush, and only a wide one is worth shrinking first. A `spare` source
+    /// is a layer nothing reads again, so a full-resolution blur writes its result back into it
+    /// rather than into a target of its own.
     fn blur_source(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        views: &BackdropViews,
         source: &wgpu::TextureView,
+        spare: bool,
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
         instance_offset: &mut u64,
@@ -1425,6 +1521,18 @@ impl WgpuRenderer {
             }],
         )?;
 
+        // Shrinking fills the first target of every step on the way down, and the last of them
+        // then holds the blur.
+        let shrunk: Vec<wgpu::TextureView> = (1..=step)
+            .map(|step| self.filter_view(FilterTarget::Step(step, 0)))
+            .collect();
+        let scratch = self.filter_view(FilterTarget::Step(step, 1));
+        let held = match (shrunk.last(), spare) {
+            (Some(last), _) => last.clone(),
+            (None, true) => source.clone(),
+            (None, false) => self.filter_view(FilterTarget::Step(0, 0)),
+        };
+
         let blit = self.resources().pipelines.blit.clone();
         let blur = self.resources().pipelines.blur.clone();
 
@@ -1438,28 +1546,27 @@ impl WgpuRenderer {
         };
 
         let mut from = source;
-        for shrunk in 0..step {
-            let shrink = BLUR_STEPS[shrunk + 1];
+        for (index, target) in shrunk.iter().enumerate() {
+            let shrink = BLUR_STEPS[index + 1];
             self.fullscreen_pass(
                 encoder,
                 "blur_shrink",
                 &blit,
                 from,
-                &views.steps[shrunk + 1][0],
+                target,
                 &plain,
                 within(clip, sigma * BLUR_REACH * 2., shrink),
             );
-            from = &views.steps[shrunk + 1][0];
+            from = target;
         }
 
         let shrink = BLUR_STEPS[step];
-        let [held, scratch] = &views.steps[step];
         self.fullscreen_pass(
             encoder,
             "blur_across",
             &blur,
             from,
-            scratch,
+            &scratch,
             &across,
             within(clip, sigma * BLUR_REACH, shrink),
         );
@@ -1467,12 +1574,12 @@ impl WgpuRenderer {
             encoder,
             "blur_down",
             &blur,
-            scratch,
-            held,
+            &scratch,
+            &held,
             &down,
             within(clip, 0., shrink),
         );
-        Ok(held.clone())
+        Ok(held)
     }
 
     fn fullscreen_pass(
@@ -1522,8 +1629,7 @@ impl WgpuRenderer {
             return;
         }
         let texture = self.create_texture_bind_group("backdrop_blurred_bind_group", blurred);
-        let instances =
-            binding.first_instance + range.start..binding.first_instance + range.end;
+        let instances = binding.first_instance + range.start..binding.first_instance + range.end;
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &binding.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
@@ -1535,124 +1641,76 @@ impl WgpuRenderer {
         pass.draw(0..4, instances);
     }
 
-    fn backdrop_views(&self) -> Option<BackdropViews> {
-        let targets = self.resources().backdrop_targets.as_ref()?;
-        Some(BackdropViews {
-            frame: targets.frame_view.clone(),
-            layers: targets
-                .layers
-                .iter()
-                .map(|(_, view)| view.clone())
-                .collect(),
-            steps: targets
-                .steps
-                .iter()
-                .map(|[a, b]| [a.1.clone(), b.1.clone()])
-                .collect(),
-        })
-    }
-
-    fn ensure_backdrop_targets(&mut self) {
-        if self.resources().backdrop_targets.is_some() {
-            return;
-        }
-
+    /// The view of one filter target, created at the surface's size (shrunk for a blur step) if
+    /// no frame has drawn through it since it was last released.
+    fn filter_view(&mut self, target: FilterTarget) -> wgpu::TextureView {
         let format = self.surface_config.format;
-        let width = self.surface_config.width.max(1);
-        let height = self.surface_config.height.max(1);
+        let size = (
+            self.surface_config.width.max(1) / target.shrink(),
+            self.surface_config.height.max(1) / target.shrink(),
+        );
+        let now = self.frame_time;
         let resources = self.resources_mut();
-        let target = |label: &str, width: u32, height: u32| {
-            let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: width.max(1),
-                    height: height.max(1),
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            (texture, view)
-        };
-
-        let (frame, frame_view) = target("backdrop_frame", width, height);
-        let layers = (0..LAYER_DEPTH)
-            .map(|depth| target(&format!("filter_layer_{depth}"), width, height))
-            .collect();
-        let steps = BLUR_STEPS
-            .iter()
-            .map(|shrink| {
-                [
-                    target(&format!("blur_{shrink}_a"), width / shrink, height / shrink),
-                    target(&format!("blur_{shrink}_b"), width / shrink, height / shrink),
-                ]
+        let device = &resources.device;
+        resources
+            .filter_targets
+            .slot(target)
+            .get_or_insert_with(|| {
+                Scratch::new(
+                    device,
+                    &target.label(),
+                    format,
+                    size,
+                    1,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    now,
+                )
             })
-            .collect();
-
-        resources.backdrop_targets = Some(BackdropTargets {
-            frame,
-            frame_view,
-            layers,
-            steps,
-        });
+            .touch(now)
     }
 
-    fn create_path_intermediate(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_intermediate"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+    /// The path intermediate and, when paths are multisampled, the target they are rasterized
+    /// into, created if no frame has drawn a path since they were last released.
+    fn path_views(&mut self) -> (wgpu::TextureView, Option<wgpu::TextureView>) {
+        let format = self.surface_config.format;
+        let size = (self.surface_config.width, self.surface_config.height);
+        let sample_count = self.rendering_params.path_sample_count;
+        let now = self.frame_time;
+        let resources = self.resources_mut();
+        let device = &resources.device;
+        let intermediate = resources
+            .path_intermediate
+            .get_or_insert_with(|| {
+                Scratch::new(
+                    device,
+                    "path_intermediate",
+                    format,
+                    size,
+                    1,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    now,
+                )
+            })
+            .touch(now);
+        // The samples are resolved into the intermediate and never read again, so the driver
+        // may keep them in tile memory where it has any.
+        let msaa = (sample_count > 1).then(|| {
+            resources
+                .path_msaa
+                .get_or_insert_with(|| {
+                    Scratch::new(
+                        device,
+                        "path_msaa",
+                        format,
+                        size,
+                        sample_count,
+                        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT,
+                        now,
+                    )
+                })
+                .touch(now)
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
-    }
-
-    fn create_msaa_if_needed(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-        sample_count: u32,
-    ) -> Option<(wgpu::Texture, wgpu::TextureView)> {
-        if sample_count <= 1 {
-            return None;
-        }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_msaa"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Some((texture, view))
+        (intermediate, msaa)
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -1687,51 +1745,14 @@ impl WgpuRenderer {
                 warn!("Failed to poll device during resize: {e:?}");
             }
 
-            // Destroy old textures before allocating new ones to avoid GPU memory spikes
-            if let Some(ref texture) = resources.path_intermediate_texture {
-                texture.destroy();
-            }
-            if let Some(ref texture) = resources.path_msaa_texture {
-                texture.destroy();
-            }
+            // Destroy the old targets before configuring the surface to avoid GPU memory spikes.
+            // The next frame that needs them recreates them at the new size.
+            resources.invalidate_intermediate_textures();
 
             resources
                 .surface
                 .configure(&resources.device, &surface_config);
-
-            // Invalidate intermediate textures - they will be lazily recreated
-            // in draw() after we confirm the surface is healthy. This avoids
-            // panics when the device/surface is in an invalid state during resize.
-            resources.invalidate_intermediate_textures();
         }
-    }
-
-    fn ensure_intermediate_textures(&mut self) {
-        if self.resources().path_intermediate_texture.is_some() {
-            return;
-        }
-
-        let format = self.surface_config.format;
-        let width = self.surface_config.width;
-        let height = self.surface_config.height;
-        let path_sample_count = self.rendering_params.path_sample_count;
-        let resources = self.resources_mut();
-
-        let (t, v) = Self::create_path_intermediate(&resources.device, format, width, height);
-        resources.path_intermediate_texture = Some(t);
-        resources.path_intermediate_view = Some(v);
-
-        let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
-            &resources.device,
-            format,
-            width,
-            height,
-            path_sample_count,
-        )
-        .map(|(t, v)| (Some(t), Some(v)))
-        .unwrap_or((None, None));
-        resources.path_msaa_texture = path_msaa_texture;
-        resources.path_msaa_view = path_msaa_view;
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1874,9 +1895,6 @@ impl WgpuRenderer {
             }
         };
 
-        // Now that we know the surface is healthy, ensure intermediate textures exist
-        self.ensure_intermediate_textures();
-
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1928,6 +1946,7 @@ impl WgpuRenderer {
             );
         }
 
+        self.frame_time = Instant::now();
         if let Err(error) = self.record_frame(scene, &frame_view) {
             log::error!("{error:#}");
             self.resources().queue.submit(std::iter::empty());
@@ -1940,17 +1959,8 @@ impl WgpuRenderer {
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
         let mut instance_offset = 0;
-        if !(scene.backdrops.is_empty() && scene.effects.is_empty())
-            && !self.uses_webgl_instance_data
-        {
-            self.ensure_backdrop_targets();
-        }
-        let views = match (scene.backdrops.is_empty() && scene.effects.is_empty())
-            || self.uses_webgl_instance_data
-        {
-            true => None,
-            false => self.backdrop_views(),
-        };
+        let filtered = !(scene.backdrops.is_empty() && scene.effects.is_empty())
+            && !self.uses_webgl_instance_data;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
             .with_context(|| {
@@ -1975,17 +1985,17 @@ impl WgpuRenderer {
 
         // Layers composite into whatever they are drawn over, so only a backdrop — which samples
         // the frame itself — is worth routing the whole frame through a texture for.
-        let mirrored = !scene.backdrops.is_empty();
-        let main_view = match (&views, mirrored) {
-            (Some(views), true) => &views.frame,
-            _ => frame_view,
+        let mirrored = filtered && !scene.backdrops.is_empty();
+        let main_view = match mirrored {
+            true => self.filter_view(FilterTarget::Frame),
+            false => frame_view.clone(),
         };
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: main_view,
+                    view: &main_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -2001,16 +2011,16 @@ impl WgpuRenderer {
             // is open. Anything that has to break the pass and resume it has to resume it here,
             // or its primitives land in the window while the rest of the frame is still being
             // assembled somewhere else.
-            let mut target = main_view;
+            let mut target = main_view.clone();
             let mut stack: Vec<usize> = Vec::new();
             // What each open layer will be composited through: neighbours that ask for the same
             // filter share one target, so a list of separately blurred rows costs one pass, not one
             // per row.
             let mut spans: Vec<Bounds<ScaledPixels>> = Vec::new();
             for batch in scene.batches() {
-                let wanted = views
-                    .as_ref()
-                    .and_then(|_| scene.filtered(scene.batch_order(&batch)))
+                let wanted = filtered
+                    .then(|| scene.filtered(scene.batch_order(&batch)))
+                    .flatten()
                     .map(|index| scene.filter_chain(index))
                     .unwrap_or_default();
 
@@ -2040,37 +2050,21 @@ impl WgpuRenderer {
                     let index = stack.pop().expect("the stack is not empty");
                     let layer = scene.effects[index];
                     let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
-                    let held = views
-                        .as_ref()
-                        .expect("a filtered layer implies its targets");
-                    let source = &held.layers[stack.len().min(LAYER_DEPTH - 1)];
-                    let onto = match stack.last() {
-                        Some(_) => &held.layers[(stack.len() - 1).min(LAYER_DEPTH - 1)],
-                        None => main_view,
-                    };
 
                     drop(pass);
-                    let blurred = match layer.filter.blurs() {
-                        true => self.blur_source(
-                            &mut encoder,
-                            held,
-                            source,
-                            layer.filter.blur,
-                            Some(layer.blur_bounds(clip)),
-                            &mut instance_offset,
-                        )?,
-                        false => source.clone(),
-                    };
-                    let params = self.write_instance_binding(
-                        "layer_composite_bind_group",
+                    let (onto, blurred, params) = self.close_layer(
+                        &mut encoder,
+                        layer,
+                        clip,
+                        stack.len(),
+                        &main_view,
                         &mut instance_offset,
-                        &[mask_params(layer, clip)],
                     )?;
                     target = onto;
                     pass = Self::resume_pass(
                         &mut encoder,
                         "layer_composite_pass",
-                        target,
+                        &target,
                         wgpu::LoadOp::Load,
                     );
                     self.composite_layer(
@@ -2087,15 +2081,12 @@ impl WgpuRenderer {
                         break;
                     }
                     let layer = scene.effects[*index];
-                    let held = views
-                        .as_ref()
-                        .expect("a filtered layer implies its targets");
                     let depth = stack.len();
                     let load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
 
                     drop(pass);
-                    target = &held.layers[depth];
-                    pass = Self::resume_pass(&mut encoder, "layer_pass", target, load);
+                    target = self.filter_view(FilterTarget::Layer(depth));
+                    pass = Self::resume_pass(&mut encoder, "layer_pass", &target, load);
                     stack.push(*index);
                     spans.push(layer.destination_clip());
                 }
@@ -2129,7 +2120,7 @@ impl WgpuRenderer {
                         pass = Self::resume_pass(
                             &mut encoder,
                             "main_pass_continued",
-                            target,
+                            &target,
                             wgpu::LoadOp::Load,
                         );
 
@@ -2178,9 +2169,9 @@ impl WgpuRenderer {
                         &mut pass,
                     ),
                     PrimitiveBatch::Backdrops(range) => {
-                        let Some(views) = views.as_ref().filter(|_| stack.is_empty()) else {
+                        if !filtered || !stack.is_empty() {
                             continue;
-                        };
+                        }
                         let backdrops = &scene.backdrops[range.clone()];
                         let sigma = backdrops
                             .iter()
@@ -2194,11 +2185,10 @@ impl WgpuRenderer {
                             .map(|backdrop| backdrop.bounds)
                             .reduce(|union, bounds| union.union(&bounds));
                         drop(pass);
-                        let frame = views.frame.clone();
                         let blurred = self.blur_source(
                             &mut encoder,
-                            views,
-                            &frame,
+                            &main_view,
+                            false,
                             sigma,
                             clip,
                             &mut instance_offset,
@@ -2206,7 +2196,7 @@ impl WgpuRenderer {
                         pass = Self::resume_pass(
                             &mut encoder,
                             "main_pass_continued",
-                            target,
+                            &target,
                             wgpu::LoadOp::Load,
                         );
 
@@ -2226,37 +2216,21 @@ impl WgpuRenderer {
             while let Some(index) = stack.pop() {
                 let layer = scene.effects[index];
                 let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
-                let held = views
-                    .as_ref()
-                    .expect("a filtered layer implies its targets");
-                let source = &held.layers[stack.len().min(LAYER_DEPTH - 1)];
-                let onto = match stack.last() {
-                    Some(_) => &held.layers[(stack.len() - 1).min(LAYER_DEPTH - 1)],
-                    None => main_view,
-                };
 
                 drop(pass);
-                let blurred = match layer.filter.blurs() {
-                    true => self.blur_source(
-                        &mut encoder,
-                        held,
-                        source,
-                        layer.filter.blur,
-                        Some(layer.blur_bounds(clip)),
-                        &mut instance_offset,
-                    )?,
-                    false => source.clone(),
-                };
-                let params = self.write_instance_binding(
-                    "layer_composite_bind_group",
+                let (onto, blurred, params) = self.close_layer(
+                    &mut encoder,
+                    layer,
+                    clip,
+                    stack.len(),
+                    &main_view,
                     &mut instance_offset,
-                    &[mask_params(layer, clip)],
                 )?;
                 target = onto;
                 pass = Self::resume_pass(
                     &mut encoder,
                     "layer_composite_pass",
-                    target,
+                    &target,
                     wgpu::LoadOp::Load,
                 );
                 self.composite_layer(
@@ -2269,7 +2243,7 @@ impl WgpuRenderer {
             }
         }
 
-        if let Some(views) = views.as_ref().filter(|_| mirrored) {
+        if mirrored {
             let plain = self.write_instance_binding(
                 "frame_blit_bind_group",
                 &mut instance_offset,
@@ -2280,7 +2254,7 @@ impl WgpuRenderer {
                 &mut encoder,
                 "frame_blit",
                 &blit,
-                &views.frame,
+                &main_view,
                 frame_view,
                 &plain,
                 None,
@@ -2291,7 +2265,46 @@ impl WgpuRenderer {
             .queue
             .submit(std::iter::once(encoder.finish()));
 
+        let now = self.frame_time;
+        self.resources_mut().release_targets_idle_at(now);
+
         Ok(())
+    }
+
+    /// Blurs a filtered layer that has just closed, when its filter asks for a blur, and
+    /// returns the target it composites onto, the view it composites from and the parameters
+    /// of the composite. `depth` is the layer's own nesting depth.
+    fn close_layer(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: LayerEffect,
+        clip: Bounds<ScaledPixels>,
+        depth: usize,
+        main_view: &wgpu::TextureView,
+        instance_offset: &mut u64,
+    ) -> Result<(wgpu::TextureView, wgpu::TextureView, InstanceBinding)> {
+        let source = self.filter_view(FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)));
+        let onto = match depth.checked_sub(1) {
+            Some(parent) => self.filter_view(FilterTarget::Layer(parent.min(LAYER_DEPTH - 1))),
+            None => main_view.clone(),
+        };
+        let blurred = match layer.filter.blurs() {
+            true => self.blur_source(
+                encoder,
+                &source,
+                true,
+                layer.filter.blur,
+                Some(layer.blur_bounds(clip)),
+                instance_offset,
+            )?,
+            false => source,
+        };
+        let params = self.write_instance_binding(
+            "layer_composite_bind_group",
+            instance_offset,
+            &[mask_params(layer, clip)],
+        )?;
+        Ok((onto, blurred, params))
     }
 
     fn write_instances(
@@ -2438,7 +2451,12 @@ impl WgpuRenderer {
             vec![PathSprite { bounds }]
         };
 
-        let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
+        let Some(path_intermediate_view) = self
+            .resources()
+            .path_intermediate
+            .as_ref()
+            .map(|scratch| scratch.view.clone())
+        else {
             return Ok(());
         };
         let instances =
@@ -2486,16 +2504,18 @@ impl WgpuRenderer {
             &vertices,
         )?;
 
+        let (path_intermediate_view, path_msaa_view) = self.path_views();
+        // A multisampled target is only read by its resolve, so its samples are dropped at the
+        // end of the pass instead of being written back.
+        let (target_view, resolve_target, store) = match &path_msaa_view {
+            Some(msaa_view) => (
+                msaa_view,
+                Some(&path_intermediate_view),
+                wgpu::StoreOp::Discard,
+            ),
+            None => (&path_intermediate_view, None, wgpu::StoreOp::Store),
+        };
         let resources = self.resources();
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
-            return Ok(false);
-        };
-
-        let (target_view, resolve_target) = if let Some(ref msaa_view) = resources.path_msaa_view {
-            (msaa_view, Some(path_intermediate_view))
-        } else {
-            (path_intermediate_view, None)
-        };
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2505,7 +2525,7 @@ impl WgpuRenderer {
                     resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
+                        store,
                     },
                     depth_slice: None,
                 })],

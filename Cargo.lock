@@ -2763,6 +2763,7 @@ dependencies = [
  "unicode-bidi",
  "unicode-segmentation",
  "web-sys",
+ "web-time",
  "wgpu",
  "zed-font-kit",
 ]
