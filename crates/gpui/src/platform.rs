@@ -37,7 +37,7 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
-    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
+    FontCacheConfig, FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
     LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
     Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
@@ -1099,6 +1099,33 @@ pub trait PlatformTextSystem: Send + Sync {
     /// Returns the dilation level to use for a glyph painted in the given color.
     fn glyph_dilation_for_color(&self, _color: Hsla) -> u8 {
         0
+    }
+
+    /// Configure the font cache eviction strategy.
+    fn set_font_cache_config(&self, _config: FontCacheConfig) {}
+
+    /// Evicts loaded font files from memory that haven't been accessed recently.
+    /// If `older_than` is specified, only fonts unused for at least that duration are evicted.
+    /// Returns the number of evicted font instances.
+    fn evict_unused_fonts(&self, _older_than: Option<std::time::Duration>) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Unloads a specific font by its ID, releasing its underlying font data / mmap.
+    /// Returns whether the font was unloaded.
+    fn unload_font(&self, _font_id: FontId) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Returns the number of currently loaded (in-memory) font instances.
+    fn active_font_count(&self) -> usize {
+        0
+    }
+
+    /// Clears all loaded font files from memory.
+    /// Returns the number of evicted font instances.
+    fn clear_font_cache(&self) -> Result<usize> {
+        Ok(0)
     }
 }
 
