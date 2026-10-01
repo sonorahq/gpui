@@ -1055,7 +1055,9 @@ impl WaylandWindowStatePtr {
             accepts_text_input
         } else {
             drop(state);
-            true
+            // Upstream stays enabled without a handler; here no focused field means
+            // no text input, so the compositor's on-screen keyboard can hide.
+            false
         };
         if Some(ime_enabled) == client.ime_enabled() {
             return;
