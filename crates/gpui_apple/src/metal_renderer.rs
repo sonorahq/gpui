@@ -49,6 +49,9 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+const INITIAL_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// How long the instance buffer pool watches its peak use before deciding whether to shrink.
+const INSTANCE_BUFFER_SETTLE: Duration = Duration::from_secs(5);
 /// How long an offscreen target may go unused before its memory is given back. A frame with a
 /// blur, layer or path on screen touches its targets every time, so only targets that nothing
 /// on screen draws through are released.
@@ -77,13 +80,18 @@ pub unsafe fn new_renderer(
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
+    /// The most any frame has written since `window` began.
+    peak: usize,
+    window: Instant,
 }
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: INITIAL_INSTANCE_BUFFER_SIZE,
             buffers: Vec::new(),
+            peak: 0,
+            window: Instant::now(),
         }
     }
 }
@@ -126,6 +134,29 @@ impl InstanceBufferPool {
         if buffer.size == self.buffer_size {
             self.buffers.push(buffer.metal_buffer)
         }
+    }
+
+    /// Shrinks the buffers once every frame over the last `INSTANCE_BUFFER_SETTLE` has needed
+    /// under a quarter of one. `used` is what the frame just encoded wrote, and the new size keeps
+    /// twice the peak so the next busy frame does not grow it straight back. Buffers still in
+    /// flight are dropped when they come back, since their size no longer matches.
+    pub(crate) fn settle(&mut self, used: usize) {
+        self.peak = self.peak.max(used);
+        let now = Instant::now();
+        if now.duration_since(self.window) < INSTANCE_BUFFER_SETTLE {
+            return;
+        }
+        let peak = mem::take(&mut self.peak);
+        self.window = now;
+
+        let buffer_size = (peak * 2)
+            .next_power_of_two()
+            .clamp(INITIAL_INSTANCE_BUFFER_SIZE, MAX_INSTANCE_BUFFER_SIZE);
+        if peak * 4 > self.buffer_size || buffer_size >= self.buffer_size {
+            return;
+        }
+        log::info!("decreased instance buffer size to {buffer_size}");
+        self.reset(buffer_size);
     }
 }
 
@@ -699,7 +730,9 @@ impl MetalRenderer {
         )?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
+        let used = writer.offset;
         let instance_buffer = Cell::new(Some(writer.finish()));
+        instance_buffer_pool.lock().settle(used);
         let block = ConcreteBlock::new(move |_| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
