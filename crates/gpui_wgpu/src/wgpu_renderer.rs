@@ -18,6 +18,11 @@ use web_time::Instant;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
+const INITIAL_INSTANCE_DATA_SIZE: u64 = 2 * 1024 * 1024;
+
+/// How long the instance data watches its peak use before deciding whether to shrink.
+const INSTANCE_DATA_SETTLE: Duration = Duration::from_secs(5);
+
 /// How long an offscreen target may go unused before its memory is given back. A frame with a
 /// blur, layer or path on screen touches its targets every time, so only targets that nothing
 /// on screen draws through are released.
@@ -389,6 +394,9 @@ pub struct WgpuRenderer {
     instance_data_capacity: u64,
     max_instance_data_size: u64,
     instance_data_alignment: u64,
+    /// The most instance data any frame has written since `instance_data_window` began.
+    instance_data_peak: u64,
+    instance_data_window: Instant,
     uses_webgl_instance_data: bool,
     /// When the frame being recorded started, which stamps every offscreen target it touches.
     frame_time: Instant,
@@ -647,7 +655,7 @@ impl WgpuRenderer {
             let max_instance_data_size = (u64::from(max_texture_dimension).pow(2)
                 * INSTANCE_TEXTURE_TEXEL_SIZE)
                 .min(MAX_INSTANCE_BUFFER_SIZE);
-            let initial_capacity = (2 * 1024 * 1024).min(max_instance_data_size);
+            let initial_capacity = INITIAL_INSTANCE_DATA_SIZE.min(max_instance_data_size);
             let (instance_data, capacity) =
                 Self::create_instance_texture(&device, initial_capacity, max_texture_dimension);
             (
@@ -664,7 +672,7 @@ impl WgpuRenderer {
                 .max_buffer_size
                 .min(device.limits().max_storage_buffer_binding_size)
                 .min(MAX_INSTANCE_BUFFER_SIZE);
-            let initial_capacity = (2 * 1024 * 1024).min(max_buffer_size);
+            let initial_capacity = INITIAL_INSTANCE_DATA_SIZE.min(max_buffer_size);
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instance_buffer"),
                 size: initial_capacity,
@@ -763,6 +771,8 @@ impl WgpuRenderer {
             instance_data_capacity,
             max_instance_data_size,
             instance_data_alignment,
+            instance_data_peak: 0,
+            instance_data_window: Instant::now(),
             uses_webgl_instance_data,
             frame_time: Instant::now(),
             rendering_params,
@@ -2267,6 +2277,7 @@ impl WgpuRenderer {
 
         let now = self.frame_time;
         self.resources_mut().release_targets_idle_at(now);
+        self.settle_instance_data(instance_offset, now);
 
         Ok(())
     }
@@ -2728,6 +2739,37 @@ impl WgpuRenderer {
         // Bind groups created earlier in the frame keep the previous buffer or
         // texture alive, so allocations written before the grow remain valid;
         // only subsequent writes land in the new allocation.
+        self.replace_instance_data(capacity);
+        Ok(())
+    }
+
+    /// Shrinks the instance data once every frame over the last `INSTANCE_DATA_SETTLE` has
+    /// needed under a quarter of it. `used` is what the frame just submitted wrote, and the
+    /// new capacity keeps twice the peak so the next busy frame does not grow it straight back.
+    fn settle_instance_data(&mut self, used: u64, now: Instant) {
+        self.instance_data_peak = self.instance_data_peak.max(used);
+        if now.duration_since(self.instance_data_window) < INSTANCE_DATA_SETTLE {
+            return;
+        }
+        let peak = std::mem::take(&mut self.instance_data_peak);
+        self.instance_data_window = now;
+
+        let capacity = (peak * 2)
+            .next_power_of_two()
+            .max(INITIAL_INSTANCE_DATA_SIZE)
+            .min(self.max_instance_data_size);
+        if peak * 4 > self.instance_data_capacity || capacity >= self.instance_data_capacity {
+            return;
+        }
+        log::debug!(
+            "instance data shrunk from {} to {capacity}",
+            self.instance_data_capacity
+        );
+        self.replace_instance_data(capacity);
+    }
+
+    /// Swaps the instance data for a fresh allocation of at least `capacity` bytes.
+    fn replace_instance_data(&mut self, capacity: u64) {
         let uses_webgl_instance_data = self.uses_webgl_instance_data;
         let resources = self.resources_mut();
         if uses_webgl_instance_data {
@@ -2746,7 +2788,6 @@ impl WgpuRenderer {
                 }));
             self.instance_data_capacity = capacity;
         }
-        Ok(())
     }
 
     /// Mark the surface as unconfigured so rendering is skipped until a new
