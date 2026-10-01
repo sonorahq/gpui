@@ -2857,6 +2857,21 @@ impl WgpuRenderer {
         Ok(())
     }
 
+    /// Frees offscreen targets that no frame has drawn through for `IDLE_RELEASE`. Every frame
+    /// checks this itself, so a caller only needs it for a window that has stopped drawing.
+    pub fn release_idle_targets(&mut self) {
+        let Some(resources) = self.resources.as_mut() else {
+            return;
+        };
+        resources.release_targets_idle_at(Instant::now());
+        // A dropped texture is only freed when the device is next maintained, which a frame
+        // does on submit. With no frame coming, the device is polled here instead, which also
+        // frees whatever the last frame released.
+        if let Err(error) = resources.device.poll(wgpu::PollType::Poll) {
+            warn!("Failed to poll device after releasing idle targets: {error:?}");
+        }
+    }
+
     pub fn destroy(&mut self) {
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.

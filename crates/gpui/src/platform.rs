@@ -862,6 +862,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
+    /// Whether the renderer keeps GPU memory that only drawing uses, which the window then frees
+    /// through [`Self::release_idle_gpu_memory`] once it stops presenting.
+    fn can_release_idle_gpu_memory(&self) -> bool {
+        false
+    }
+    /// Frees GPU memory the renderer keeps only while it draws, such as offscreen blur and path
+    /// targets. The window calls this once it has gone a while without presenting, since a
+    /// renderer only notices idle targets in the middle of a frame.
+    fn release_idle_gpu_memory(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

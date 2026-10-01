@@ -1955,6 +1955,14 @@ impl PlatformWindow for WaylandWindow {
         self.0.schedule_frame();
     }
 
+    fn can_release_idle_gpu_memory(&self) -> bool {
+        true
+    }
+
+    fn release_idle_gpu_memory(&self) {
+        self.borrow_mut().renderer.release_idle_targets();
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let state = self.borrow();
         state.renderer.sprite_atlas().clone()

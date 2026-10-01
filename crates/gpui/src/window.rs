@@ -88,6 +88,10 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     height: Pixels(750.),
 };
 
+/// How long a window may go without presenting before its renderer frees the GPU memory it
+/// keeps only while drawing.
+const IDLE_GPU_RELEASE: Duration = Duration::from_secs(3);
+
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchPhase {
@@ -1189,6 +1193,10 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// When the window last presented, by the executor's clock.
+    last_present: Instant,
+    /// Whether a task is already waiting to free the renderer's idle GPU memory.
+    idle_gpu_release_armed: bool,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1648,13 +1656,17 @@ impl Window {
                                 }
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
+                                window.arm_idle_gpu_release(cx);
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
                     })
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, cx| {
+                            window.present();
+                            window.arm_idle_gpu_release(cx);
+                        })
                         .log_err();
                 }
 
@@ -1881,6 +1893,8 @@ impl Window {
             active,
             hovered,
             needs_present,
+            last_present: cx.background_executor().now(),
+            idle_gpu_release_armed: false,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3062,6 +3076,37 @@ impl Window {
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Notes that the window just presented and makes sure a task is waiting to free the
+    /// renderer's offscreen targets once it stops. A renderer only notices idle targets while it
+    /// draws, so a window that goes still would otherwise keep whatever its last busy frame
+    /// allocated.
+    fn arm_idle_gpu_release(&mut self, cx: &mut App) {
+        self.last_present = cx.background_executor().now();
+        if self.idle_gpu_release_armed || !self.platform_window.can_release_idle_gpu_memory() {
+            return;
+        }
+        self.idle_gpu_release_armed = true;
+        let handle = self.handle;
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(IDLE_GPU_RELEASE).await;
+                let now = cx.background_executor().now();
+                let released = handle.update(cx, |_, window, _| {
+                    if now.duration_since(window.last_present) < IDLE_GPU_RELEASE {
+                        return false;
+                    }
+                    window.platform_window.release_idle_gpu_memory();
+                    window.idle_gpu_release_armed = false;
+                    true
+                });
+                if released.unwrap_or(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.

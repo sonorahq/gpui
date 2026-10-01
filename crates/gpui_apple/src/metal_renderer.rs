@@ -625,6 +625,12 @@ impl MetalRenderer {
         scratch.texture.clone()
     }
 
+    /// Frees offscreen targets that no frame has drawn through for `IDLE_RELEASE`. Every frame
+    /// checks this itself, so a caller only needs it for a window that has stopped drawing.
+    pub fn release_idle_targets(&mut self) {
+        self.release_targets_idle_at(Instant::now());
+    }
+
     /// Drops every offscreen target that no frame has drawn through within `IDLE_RELEASE` of
     /// `now`. A command buffer retains what it encodes, so a target an earlier frame still uses
     /// on the GPU stays alive until that frame completes.
