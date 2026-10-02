@@ -1408,6 +1408,12 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// The part of the image buffer drawn into `bounds`, as fractions of its width and height:
+    /// origin x, origin y, width, height. A fitted surface that overhangs its element is cropped
+    /// here rather than by the content mask, so its rounded corners land on the visible edge.
+    pub texture_bounds: [f32; 4],
+    pub opacity: f32,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
 }

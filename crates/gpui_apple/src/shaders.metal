@@ -856,12 +856,14 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -878,20 +880,26 @@ vertex SurfaceVertexOutput surface_vertex(
       to_device_position(unit_vertex, surface.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
                                                  surface.content_mask.bounds);
-  // We are going to copy the whole texture, so the texture position corresponds
-  // to the current vertex of the unit triangle.
-  float2 texture_position = unit_vertex;
+  // Only the visible part of the texture is drawn: a fitted surface that overhangs its
+  // element is cropped to the element, so the corner radii fall on the visible edge.
+  float2 texture_position =
+      float2(surface.texture_bounds[0], surface.texture_bounds[1]) +
+      unit_vertex * float2(surface.texture_bounds[2], surface.texture_bounds[3]);
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      surface_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                 constant SurfaceBounds *surfaces
+                                 [[buffer(SurfaceInputIndex_Surfaces)]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
                                  [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+  SurfaceBounds surface = surfaces[input.surface_id];
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
@@ -902,7 +910,11 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  float distance =
+      quad_sdf(input.position.xy, surface.bounds, surface.corner_radii);
+  color.a = surface.opacity * saturate(0.5 - distance);
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

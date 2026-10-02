@@ -7,9 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
-    KAWASE_LEVELS, Kawase, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
-    Scene, Size, point, size,
+    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, Corners, DevicePixels,
+    GAUSSIAN_REACH, KAWASE_LEVELS, Kawase, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch,
+    ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -1851,6 +1851,11 @@ impl MetalRenderer {
             Some(&instance_bindings.surfaces.buffer),
             instance_bindings.surfaces.offset as u64,
         );
+        command_encoder.set_fragment_buffer(
+            SurfaceInputIndex::Surfaces as u64,
+            Some(&instance_bindings.surfaces.buffer),
+            instance_bindings.surfaces.offset as u64,
+        );
         command_encoder.set_vertex_bytes(
             SurfaceInputIndex::ViewportSize as u64,
             mem::size_of_val(&viewport_size) as u64,
@@ -2326,6 +2331,9 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            corner_radii: surface.corner_radii,
+            texture_bounds: surface.texture_bounds,
+            opacity: surface.opacity,
         }))?,
     })
 }
@@ -2513,11 +2521,14 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub texture_bounds: [f32; 4],
+    pub opacity: f32,
 }
 
 #[cfg(any(test, feature = "test-support"))]
