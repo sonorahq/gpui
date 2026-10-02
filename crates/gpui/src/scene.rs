@@ -1414,8 +1414,7 @@ pub struct PaintSurface {
     /// here rather than by the content mask, so its rounded corners land on the visible edge.
     pub texture_bounds: [f32; 4],
     pub opacity: f32,
-    #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub source: crate::SurfaceSource,
 }
 
 impl From<PaintSurface> for Primitive {

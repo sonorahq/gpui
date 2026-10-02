@@ -30,8 +30,6 @@ const BLUR_REACH: f32 = 3.;
 
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -4866,13 +4864,12 @@ impl Window {
     /// same way [`Window::paint_image`] treats an image.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(target_os = "macos")]
     pub fn paint_surface(
         &mut self,
         bounds: Bounds<Pixels>,
         surface_bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
-        image_buffer: CVPixelBuffer,
+        source: crate::SurfaceSource,
     ) {
         use crate::PaintSurface;
 
@@ -4905,7 +4902,7 @@ impl Window {
             corner_radii,
             texture_bounds,
             opacity,
-            image_buffer,
+            source,
         });
     }
 

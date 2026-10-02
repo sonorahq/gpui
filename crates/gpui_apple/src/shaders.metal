@@ -906,9 +906,15 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
                float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
                float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
-  float4 ycbcr = float4(
-      y_texture.sample(texture_sampler, input.texture_position).r,
-      cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+  float y = y_texture.sample(texture_sampler, input.texture_position).r;
+  float2 cb_cr = cb_cr_texture.sample(texture_sampler, input.texture_position).rg;
+  if (surface.video_range != 0) {
+    // Stretch the video range (16 to 235 for luma, 16 to 240 for chroma) to the full one the
+    // conversion below expects.
+    y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+    cb_cr = (cb_cr - 128.0 / 255.0) * (255.0 / 224.0) + 128.0 / 255.0;
+  }
+  float4 ycbcr = float4(y, cb_cr, 1.0);
 
   float4 color = ycbcrToRGBTransform * ycbcr;
   float distance =
