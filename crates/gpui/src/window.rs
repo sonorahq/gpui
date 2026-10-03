@@ -12,14 +12,15 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, Filter, FontId, Global, GlobalElementId, GlyphId,
     GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex, Modifiers,
-    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
-    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseDownEvent, MouseEvent,
+    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, ScrollDelta, ScrollWheelEvent, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TouchEvent, TouchId, TouchPhase, TransformationMatrix,
     Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
     prelude::*, px, rems, size, transparent_black,
@@ -27,6 +28,9 @@ use crate::{
 
 /// A gaussian is cut off after three standard deviations.
 const BLUR_REACH: f32 = 3.;
+const TOUCH_SLOP: Pixels = px(8.);
+const TOUCH_TAP_INTERVAL: Duration = Duration::from_millis(400);
+const TOUCH_TAP_DISTANCE: Pixels = px(16.);
 
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -734,13 +738,34 @@ type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
 
+/// A listener for raw touch contacts received by the window.
+pub(crate) type AnyTouchListener =
+    Box<dyn FnMut(&TouchEvent, DispatchPhase, &mut Window, &mut App) + 'static>;
+
+/// Tracks one primary touch contact while GPUI translates it to mouse-compatible gestures.
+#[derive(Clone)]
+struct TouchState {
+    start_position: Point<Pixels>,
+    last_position: Point<Pixels>,
+    click_count: usize,
+    moved: bool,
+    scroll_started: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TouchTap {
+    position: Point<Pixels>,
+    at: Instant,
+    count: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
     pub(crate) hitbox_id: Option<HitboxId>,
     pub(crate) style: CursorStyle,
 }
 
-#[derive(Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct HitTest {
     pub(crate) ids: SmallVec<[HitboxId; 8]>,
     pub(crate) hover_hitbox_count: usize,
@@ -981,6 +1006,7 @@ pub(crate) struct Frame {
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    pub(crate) touch_listeners: Vec<Option<AnyTouchListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -1027,6 +1053,7 @@ impl Frame {
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
             mouse_listeners: Vec::new(),
+            touch_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
@@ -1052,6 +1079,7 @@ impl Frame {
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
+        self.touch_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
@@ -1183,6 +1211,8 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    primary_touch: Option<(TouchId, TouchState)>,
+    last_touch_tap: Option<TouchTap>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1883,6 +1913,8 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            primary_touch: None,
+            last_touch_tap: None,
             modifiers,
             capslock,
             scale_factor,
@@ -4311,11 +4343,13 @@ impl Window {
 
         let element_bounds = bounds.scale(scale_factor);
         let transform_origin = match grows_from {
-            Some(origin) => element_bounds.origin
-                + point(
-                    element_bounds.size.width * origin.x,
-                    element_bounds.size.height * origin.y,
-                ),
+            Some(origin) => {
+                element_bounds.origin
+                    + point(
+                        element_bounds.size.width * origin.x,
+                        element_bounds.size.height * origin.y,
+                    )
+            }
             None => element_bounds.center(),
         };
         let fades = filter.fade_top + filter.fade_bottom + filter.fade_left + filter.fade_right;
@@ -5132,6 +5166,16 @@ impl Window {
             },
         )));
     }
+    /// Registers a raw touch listener for the next frame.
+    pub fn on_touch_event(
+        &mut self,
+        listener: impl FnMut(&TouchEvent, DispatchPhase, &mut Window, &mut App) + 'static,
+    ) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .touch_listeners
+            .push(Some(Box::new(listener)));
+    }
 
     /// Register a key event listener on this node for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
@@ -5402,6 +5446,8 @@ impl Window {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
+        } else if let PlatformInput::Touch(touch) = &event {
+            self.dispatch_touch_event(touch, cx);
         }
 
         // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
@@ -5451,8 +5497,178 @@ impl Window {
         }
     }
 
+    fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
+        match event.phase {
+            TouchPhase::Started => {
+                if self.primary_touch.is_some() {
+                    return;
+                }
+
+                let now = Instant::now();
+                let click_count = self
+                    .last_touch_tap
+                    .filter(|tap| {
+                        now.duration_since(tap.at) <= TOUCH_TAP_INTERVAL
+                            && (tap.position.x - event.position.x).abs() <= TOUCH_TAP_DISTANCE
+                            && (tap.position.y - event.position.y).abs() <= TOUCH_TAP_DISTANCE
+                    })
+                    .map_or(1, |tap| tap.count + 1);
+                let hit_test = self.rendered_frame.hit_test(event.position);
+                self.primary_touch = Some((
+                    event.id,
+                    TouchState {
+                        start_position: event.position,
+                        last_position: event.position,
+                        click_count,
+                        moved: false,
+                        scroll_started: false,
+                    },
+                ));
+                self.mouse_position = event.position;
+                self.mouse_hit_test = hit_test.clone();
+                self.dispatch_touch_listeners(event, cx);
+                if cx.propagate_event {
+                    self.dispatch_mouse_event_with_hit_test(
+                        &MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: event.position,
+                            modifiers: Modifiers::default(),
+                            click_count,
+                            first_mouse: false,
+                        },
+                        Some(&hit_test),
+                        cx,
+                    );
+                }
+            }
+            TouchPhase::Moved => {
+                let Some((touch_id, mut state)) = self.primary_touch.take() else {
+                    return;
+                };
+                if touch_id != event.id {
+                    self.primary_touch = Some((touch_id, state));
+                    return;
+                }
+
+                let delta = event.position - state.last_position;
+                state.last_position = event.position;
+                let moved_now = (event.position.x - state.start_position.x).abs() > TOUCH_SLOP
+                    || (event.position.y - state.start_position.y).abs() > TOUCH_SLOP;
+                if moved_now {
+                    self.last_touch_tap = None;
+                }
+                state.moved |= moved_now;
+                self.mouse_position = event.position;
+                self.primary_touch = Some((touch_id, state.clone()));
+                self.dispatch_touch_listeners(event, cx);
+                if cx.propagate_event && state.moved && (!delta.x.is_zero() || !delta.y.is_zero()) {
+                    let touch_phase = match state.scroll_started {
+                        true => TouchPhase::Moved,
+                        false => TouchPhase::Started,
+                    };
+                    if let Some((_, state)) = self.primary_touch.as_mut() {
+                        state.scroll_started = true;
+                    }
+                    self.dispatch_mouse_event(
+                        &ScrollWheelEvent {
+                            position: event.position,
+                            delta: ScrollDelta::Pixels(delta),
+                            modifiers: Modifiers::default(),
+                            touch_phase,
+                        },
+                        cx,
+                    );
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                let Some((touch_id, state)) = self.primary_touch.take() else {
+                    return;
+                };
+                if touch_id != event.id {
+                    self.primary_touch = Some((touch_id, state));
+                    return;
+                }
+
+                self.mouse_position = event.position;
+                self.dispatch_touch_listeners(event, cx);
+                if state.moved {
+                    if cx.propagate_event && state.scroll_started {
+                        self.dispatch_mouse_event(
+                            &ScrollWheelEvent {
+                                position: event.position,
+                                delta: ScrollDelta::Pixels(Point::default()),
+                                modifiers: Modifiers::default(),
+                                touch_phase: TouchPhase::Ended,
+                            },
+                            cx,
+                        );
+                    }
+                } else if event.phase == TouchPhase::Ended {
+                    self.last_touch_tap = Some(TouchTap {
+                        position: event.position,
+                        at: Instant::now(),
+                        count: state.click_count,
+                    });
+                }
+                let mouse_up = MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: event.position,
+                    modifiers: Modifiers::default(),
+                    click_count: state.click_count,
+                };
+                match state.moved || event.phase == TouchPhase::Cancelled {
+                    true => self.dispatch_mouse_event_with_hit_test(
+                        &mouse_up,
+                        Some(&HitTest::default()),
+                        cx,
+                    ),
+                    // Hitbox ids change on every repaint, and the touch-down already
+                    // triggered one, so a tap must be dispatched against a fresh hit
+                    // test rather than one captured when the contact started.
+                    false => self.dispatch_mouse_event(&mouse_up, cx),
+                }
+            }
+        }
+    }
+
+    fn dispatch_touch_listeners(&mut self, event: &TouchEvent, cx: &mut App) {
+        let mut listeners = mem::take(&mut self.rendered_frame.touch_listeners);
+        for listener in &mut listeners {
+            let Some(listener) = listener.as_mut() else {
+                continue;
+            };
+            listener(event, DispatchPhase::Capture, self, cx);
+            if !cx.propagate_event {
+                break;
+            }
+        }
+        if cx.propagate_event {
+            for listener in listeners.iter_mut().rev() {
+                let Some(listener) = listener.as_mut() else {
+                    continue;
+                };
+                listener(event, DispatchPhase::Bubble, self, cx);
+                if !cx.propagate_event {
+                    break;
+                }
+            }
+        }
+        self.rendered_frame.touch_listeners = listeners;
+    }
+
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        self.dispatch_mouse_event_with_hit_test(event, None, cx);
+    }
+
+    fn dispatch_mouse_event_with_hit_test(
+        &mut self,
+        event: &dyn Any,
+        hit_test: Option<&HitTest>,
+        cx: &mut App,
+    ) {
+        let hit_test = hit_test
+            .cloned()
+            .unwrap_or_else(|| self.rendered_frame.hit_test(self.mouse_position()));
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
@@ -7162,8 +7378,8 @@ mod tests {
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
         InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
         MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
-        WindowOptions, canvas, div, point, px, size,
+        StatefulInteractiveElement as _, Styled, TestAppContext, TouchEvent, TouchId, TouchPhase,
+        Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
 
     struct EmptyView;
@@ -7171,6 +7387,26 @@ mod tests {
     impl Render for EmptyView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
+        }
+    }
+
+    struct TouchTargetView {
+        clicks: Rc<RefCell<Vec<usize>>>,
+        scroll_phases: Rc<RefCell<Vec<TouchPhase>>>,
+    }
+
+    impl Render for TouchTargetView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            let scroll_phases = self.scroll_phases.clone();
+            div()
+                .size_full()
+                .on_click(move |event, _, _| {
+                    clicks.borrow_mut().push(event.click_count());
+                })
+                .on_scroll_wheel(move |event, _, _| {
+                    scroll_phases.borrow_mut().push(event.touch_phase);
+                })
         }
     }
 
