@@ -30,8 +30,6 @@ const BLUR_REACH: f32 = 3.;
 
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -4311,11 +4309,13 @@ impl Window {
 
         let element_bounds = bounds.scale(scale_factor);
         let transform_origin = match grows_from {
-            Some(origin) => element_bounds.origin
-                + point(
-                    element_bounds.size.width * origin.x,
-                    element_bounds.size.height * origin.y,
-                ),
+            Some(origin) => {
+                element_bounds.origin
+                    + point(
+                        element_bounds.size.width * origin.x,
+                        element_bounds.size.height * origin.y,
+                    )
+            }
             None => element_bounds.center(),
         };
         let fades = filter.fade_top + filter.fade_bottom + filter.fade_left + filter.fade_right;
@@ -4859,20 +4859,50 @@ impl Window {
 
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
+    /// `surface_bounds` is where the whole image buffer would land once fitted; only its overlap
+    /// with `bounds` is drawn, rounded by `corner_radii` and faded by the element opacity, the
+    /// same way [`Window::paint_image`] treats an image.
+    ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        surface_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        source: crate::SurfaceSource,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
 
-        let bounds = self.snap_bounds(bounds);
+        let visible_bounds = bounds.intersect(&surface_bounds);
+        if visible_bounds.size.width <= Pixels::ZERO
+            || visible_bounds.size.height <= Pixels::ZERO
+            || surface_bounds.size.width <= Pixels::ZERO
+            || surface_bounds.size.height <= Pixels::ZERO
+        {
+            return;
+        }
+        let texture_bounds = [
+            (visible_bounds.origin.x - surface_bounds.origin.x) / surface_bounds.size.width,
+            (visible_bounds.origin.y - surface_bounds.origin.y) / surface_bounds.size.height,
+            visible_bounds.size.width / surface_bounds.size.width,
+            visible_bounds.size.height / surface_bounds.size.height,
+        ];
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(visible_bounds.size)
+            .scale(self.scale_factor());
+        let opacity = self.element_opacity();
+        let bounds = self.snap_bounds(visible_bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            corner_radii,
+            texture_bounds,
+            opacity,
+            source,
         });
     }
 

@@ -47,6 +47,7 @@ mod shader_compilation {
             ("subpixel_sprite", true),
             ("subpixel_sprite_layered", false),
             ("polychrome_sprite", true),
+            ("surface", true),
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);
