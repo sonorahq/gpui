@@ -471,6 +471,16 @@ impl LineWrapper {
         // Bengali (https://en.wikipedia.org/wiki/Bengali_(Unicode_block))
         matches!(c, '\u{0980}'..='\u{09FF}') ||
 
+        // Hebrew and Arabic, whose letters join into words rather than standing alone
+        // https://en.wikipedia.org/wiki/Hebrew_(Unicode_block)
+        // https://en.wikipedia.org/wiki/Arabic_script_in_Unicode
+        matches!(c, '\u{0590}'..='\u{05FF}') ||
+        matches!(c, '\u{0600}'..='\u{06FF}') ||
+        matches!(c, '\u{0750}'..='\u{077F}') ||
+        matches!(c, '\u{08A0}'..='\u{08FF}') ||
+        matches!(c, '\u{FB1D}'..='\u{FDFF}') ||
+        matches!(c, '\u{FE70}'..='\u{FEFF}') ||
+
         // Some other known special characters that should be treated as word characters,
         // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
         // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`

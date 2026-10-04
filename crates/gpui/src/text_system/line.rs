@@ -382,6 +382,20 @@ fn paint_line(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    if !layout.reads_left_to_right() {
+        return paint_bidi_line(
+            origin,
+            layout,
+            line_height,
+            align,
+            align_width,
+            decoration_runs,
+            wrap_boundaries,
+            tint,
+            window,
+            cx,
+        );
+    }
     let line_bounds = Bounds::new(
         origin,
         size(
@@ -635,6 +649,18 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    if !layout.reads_left_to_right() {
+        return paint_bidi_background(
+            origin,
+            layout,
+            line_height,
+            align,
+            align_width,
+            decoration_runs,
+            wrap_boundaries,
+            window,
+        );
+    }
     let line_bounds = Bounds::new(
         origin,
         size(
@@ -788,12 +814,200 @@ fn aligned_origin_x(
     };
 
     let line_width = end_of_line - last_glyph_x;
+    aligned_x(origin.x, align_width, line_width, align)
+}
 
+/// Where a line `line_width` wide starts so it sits as `align` asks within `align_width`.
+fn aligned_x(
+    origin_x: Pixels,
+    align_width: Pixels,
+    line_width: Pixels,
+    align: &TextAlign,
+) -> Pixels {
     match align {
-        TextAlign::Left => origin.x,
-        TextAlign::Center => (origin.x * 2.0 + align_width - line_width) / 2.0,
-        TextAlign::Right => origin.x + align_width - line_width,
+        TextAlign::Left => origin_x,
+        TextAlign::Center => (origin_x * 2.0 + align_width - line_width) / 2.0,
+        TextAlign::Right => origin_x + align_width - line_width,
     }
+}
+
+/// Paints a layout that does not read left to right, such as one holding Arabic or Hebrew. Each
+/// glyph goes where [`LineLayout::bidi_lines`] puts it on its wrapped line, and an underline or
+/// strikethrough reaches across the glyphs it covers on each line.
+fn paint_bidi_line(
+    origin: Point<Pixels>,
+    layout: &LineLayout,
+    line_height: Pixels,
+    align: TextAlign,
+    align_width: Option<Pixels>,
+    decoration_runs: &[DecorationRun],
+    wrap_boundaries: &[WrapBoundary],
+    tint: Option<Hsla>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<()> {
+    let lines = layout.bidi_lines(wrap_boundaries);
+    let line_bounds = Bounds::new(
+        origin,
+        size(layout.width, line_height * lines.lines.len() as f32),
+    );
+    window.paint_layer(line_bounds, |window| {
+        let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
+        let baseline = point(px(0.), padding_top + layout.ascent);
+        let text_system = cx.text_system().clone();
+        for (line_ix, (glyphs, width)) in lines.lines.iter().enumerate() {
+            let left = aligned_x(
+                origin.x,
+                align_width.unwrap_or(layout.width),
+                *width,
+                &align,
+            );
+            let top = origin.y + line_height * line_ix as f32;
+            let underline_y = top + baseline.y + layout.descent * 0.618;
+            let strikethrough_y = top + (layout.ascent * 0.5 + baseline.y) * 0.5;
+            let mut underline = None;
+            let mut strikethrough = None;
+            for flat in glyphs.clone() {
+                let (run_ix, glyph_ix) = lines.glyphs[flat];
+                let run = &layout.runs[run_ix];
+                let glyph = &run.glyphs[glyph_ix];
+                let x = left + lines.x[flat];
+                let right = x + lines.advance[flat];
+                let decoration = decoration_at(decoration_runs, glyph.index);
+                let color = tint.unwrap_or(decoration.map_or(black(), |run| run.color));
+
+                let wanted = decoration.and_then(|run| {
+                    run.underline.map(|style| UnderlineStyle {
+                        color: Some(tint.or(style.color).unwrap_or(run.color)),
+                        ..style
+                    })
+                });
+                if let Some((from, to, style)) = extend_span(&mut underline, wanted, x, right) {
+                    window.paint_underline(point(from, underline_y), to - from, &style);
+                }
+                let wanted = decoration.and_then(|run| {
+                    run.strikethrough.map(|style| StrikethroughStyle {
+                        color: Some(tint.or(style.color).unwrap_or(run.color)),
+                        ..style
+                    })
+                });
+                if let Some((from, to, style)) = extend_span(&mut strikethrough, wanted, x, right) {
+                    window.paint_strikethrough(point(from, strikethrough_y), to - from, &style);
+                }
+
+                let glyph_origin = point(x, top);
+                let max_glyph_bounds = Bounds {
+                    origin: glyph_origin,
+                    size: text_system.bounding_box(run.font_id, layout.font_size).size,
+                };
+                if !max_glyph_bounds.intersects(&window.content_mask().bounds) {
+                    continue;
+                }
+                let at = glyph_origin + baseline + point(px(0.), glyph.position.y);
+                match glyph.is_emoji {
+                    true if tint.is_some() => {}
+                    true => window.paint_emoji(at, run.font_id, glyph.id, layout.font_size)?,
+                    false => {
+                        window.paint_glyph(at, run.font_id, glyph.id, layout.font_size, color)?
+                    }
+                }
+            }
+            if let Some((from, to, style)) = underline {
+                window.paint_underline(point(from, underline_y), to - from, &style);
+            }
+            if let Some((from, to, style)) = strikethrough {
+                window.paint_strikethrough(point(from, strikethrough_y), to - from, &style);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Paints the backgrounds of a layout that does not read left to right, each reaching across the
+/// glyphs it covers on each wrapped line.
+fn paint_bidi_background(
+    origin: Point<Pixels>,
+    layout: &LineLayout,
+    line_height: Pixels,
+    align: TextAlign,
+    align_width: Option<Pixels>,
+    decoration_runs: &[DecorationRun],
+    wrap_boundaries: &[WrapBoundary],
+    window: &mut Window,
+) -> Result<()> {
+    let lines = layout.bidi_lines(wrap_boundaries);
+    let line_bounds = Bounds::new(
+        origin,
+        size(layout.width, line_height * lines.lines.len() as f32),
+    );
+    window.paint_layer(line_bounds, |window| {
+        for (line_ix, (glyphs, width)) in lines.lines.iter().enumerate() {
+            let left = aligned_x(
+                origin.x,
+                align_width.unwrap_or(layout.width),
+                *width,
+                &align,
+            );
+            let top = origin.y + line_height * line_ix as f32;
+            let mut background = None;
+            let mut spans = Vec::new();
+            for flat in glyphs.clone() {
+                let (run_ix, glyph_ix) = lines.glyphs[flat];
+                let index = layout.runs[run_ix].glyphs[glyph_ix].index;
+                let wanted =
+                    decoration_at(decoration_runs, index).and_then(|run| run.background_color);
+                let x = left + lines.x[flat];
+                spans.extend(extend_span(
+                    &mut background,
+                    wanted,
+                    x,
+                    x + lines.advance[flat],
+                ));
+            }
+            spans.extend(background);
+            for (from, to, color) in spans {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: point(from, top),
+                        size: size(to - from, line_height),
+                    },
+                    color,
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The decoration run that covers byte `index`, or the last one past their end.
+fn decoration_at(runs: &[DecorationRun], index: usize) -> Option<&DecorationRun> {
+    let mut end = 0;
+    runs.iter()
+        .find(|run| {
+            end += run.len as usize;
+            index < end
+        })
+        .or(runs.last())
+}
+
+/// Grows the open decoration span over a glyph from `left` to `right` when the glyph wants the
+/// same decoration, or opens the one it wants and hands back the span that closes.
+fn extend_span<S: Copy + PartialEq>(
+    span: &mut Option<(Pixels, Pixels, S)>,
+    wanted: Option<S>,
+    left: Pixels,
+    right: Pixels,
+) -> Option<(Pixels, Pixels, S)> {
+    if let (Some((from, to, style)), Some(want)) = (span.as_mut(), wanted)
+        && *style == want
+    {
+        *from = (*from).min(left);
+        *to = (*to).max(right);
+        return None;
+    }
+    let closed = span.take();
+    *span = wanted.map(|style| (left, right, style));
+    closed
 }
 
 #[cfg(test)]
