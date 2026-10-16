@@ -34,7 +34,7 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_shm_pool, wl_surface, wl_touch,
     },
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
@@ -101,7 +101,8 @@ use gpui::{
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
+    Size, TouchEvent, TouchId, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point,
+    profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -317,6 +318,7 @@ pub(crate) struct WaylandClientState {
     pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
+    wl_touch: Option<wl_touch::WlTouch>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -345,6 +347,7 @@ pub(crate) struct WaylandClientState {
     pub capslock: Capslock,
     axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
+    touches: HashMap<i32, (WaylandWindowStatePtr, Point<Pixels>)>,
     continuous_scroll_delta: Option<Point<Pixels>>,
     discrete_scroll_delta: Option<Point<f32>>,
     vertical_modifier: f32,
@@ -703,6 +706,9 @@ impl Drop for WaylandClient {
         if let Some(wl_pointer) = &state.wl_pointer {
             wl_pointer.release();
         }
+        if let Some(wl_touch) = &state.wl_touch {
+            wl_touch.release();
+        }
         if let Some(cursor_shape_device) = &state.cursor_shape_device {
             cursor_shape_device.destroy();
         }
@@ -900,6 +906,7 @@ impl WaylandClient {
             compositor_gpu,
             wl_seat: seat,
             wl_pointer: None,
+            wl_touch: None,
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
@@ -948,6 +955,7 @@ impl WaylandClient {
             scroll_event_received: false,
             axis_source: AxisSource::Wheel,
             mouse_location: None,
+            touches: HashMap::default(),
             continuous_scroll_delta: None,
             discrete_scroll_delta: None,
             vertical_modifier: -1.0,
@@ -1381,6 +1389,10 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     if let Some(wl_pointer) = state.wl_pointer.take() {
                         wl_pointer.release();
                     }
+                    if let Some(wl_touch) = state.wl_touch.take() {
+                        wl_touch.release();
+                    }
+                    state.touches.clear();
                     if let Some(wl_keyboard) = state.wl_keyboard.take() {
                         wl_keyboard.release();
                     }
@@ -1735,6 +1747,16 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
 
                 state.wl_pointer = Some(pointer);
             }
+            if capabilities.contains(wl_seat::Capability::Touch) {
+                let touch = seat.get_touch(qh, ());
+                if let Some(wl_touch) = &state.wl_touch {
+                    wl_touch.release();
+                }
+                state.wl_touch = Some(touch);
+            } else if let Some(wl_touch) = state.wl_touch.take() {
+                wl_touch.release();
+                state.touches.clear();
+            }
         }
     }
 }
@@ -2074,6 +2096,78 @@ fn linux_button_to_gpui(button: u32) -> Option<MouseButton> {
         BTN_FORWARD | BTN_EXTRA => MouseButton::Navigate(NavigationDirection::Forward),
         _ => return None,
     })
+}
+
+/// Sends one Wayland touch contact to the GPUI window event stream.
+fn dispatch_touch_event(
+    window: &WaylandWindowStatePtr,
+    id: i32,
+    phase: TouchPhase,
+    position: Point<Pixels>,
+) {
+    window.handle_input(PlatformInput::Touch(TouchEvent {
+        id: TouchId(id as u64),
+        phase,
+        position,
+        force: None,
+    }));
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+
+        match event {
+            wl_touch::Event::Down {
+                surface, id, x, y, ..
+            } => {
+                let Some(window) = get_window(&mut state, &surface.id()) else {
+                    return;
+                };
+                let position = point(px(x as f32), px(y as f32));
+                state.touches.insert(id, (window.clone(), position));
+                drop(state);
+                dispatch_touch_event(&window, id, TouchPhase::Started, position);
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                let Some((window, last_position)) = state.touches.get_mut(&id) else {
+                    return;
+                };
+                let position = point(px(x as f32), px(y as f32));
+                *last_position = position;
+                let window = window.clone();
+                drop(state);
+                dispatch_touch_event(&window, id, TouchPhase::Moved, position);
+            }
+            wl_touch::Event::Up { id, .. } => {
+                let Some((window, position)) = state.touches.remove(&id) else {
+                    return;
+                };
+                drop(state);
+                dispatch_touch_event(&window, id, TouchPhase::Ended, position);
+            }
+            wl_touch::Event::Cancel => {
+                let touches = state
+                    .touches
+                    .drain()
+                    .map(|(id, (window, position))| (window, id, position))
+                    .collect::<Vec<_>>();
+                drop(state);
+                for (window, id, position) in touches {
+                    dispatch_touch_event(&window, id, TouchPhase::Cancelled, position);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
