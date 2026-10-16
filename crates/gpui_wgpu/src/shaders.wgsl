@@ -1321,6 +1321,13 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    corner_radii: Corners,
+    // The part of the frame drawn into `bounds`: origin x, origin y, width, height, as fractions
+    // of the frame. A fitted surface that overhangs its element is cropped here.
+    texture_bounds: vec4<f32>,
+    opacity: f32,
+    // Non-zero when the samples span the video range rather than the full one.
+    video_range: u32,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1347,7 +1354,8 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 
     var out = SurfaceVarying();
     out.position = to_device_position(unit_vertex, surface_locals.bounds);
-    out.texture_position = unit_vertex;
+    out.texture_position =
+        surface_locals.texture_bounds.xy + unit_vertex * surface_locals.texture_bounds.zw;
     out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
     return out;
 }
@@ -1359,12 +1367,18 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let y_cb_cr = vec4<f32>(
-        textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r,
-        textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
-        1.0);
+    var y = textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r;
+    var cb_cr = textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg;
+    if (surface_locals.video_range != 0u) {
+        // Stretch the video range (16 to 235 for luma, 16 to 240 for chroma) to the full one
+        // the conversion below expects.
+        y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+        cb_cr = (cb_cr - vec2<f32>(128.0 / 255.0)) * (255.0 / 224.0) + vec2<f32>(128.0 / 255.0);
+    }
 
-    return ycbcr_to_RGB * y_cb_cr;
+    let color = ycbcr_to_RGB * vec4<f32>(y, cb_cr, 1.0);
+    let distance = quad_sdf(input.position.xy, surface_locals.bounds, surface_locals.corner_radii);
+    return blend_color(vec4<f32>(color.rgb, 1.0), surface_locals.opacity * saturate(0.5 - distance));
 }
 
 

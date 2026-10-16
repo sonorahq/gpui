@@ -7,9 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
-    KAWASE_LEVELS, Kawase, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
-    Scene, Size, point, size,
+    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, Corners, DevicePixels,
+    GAUSSIAN_REACH, KAWASE_LEVELS, Kawase, LayerEffect, Nv12Range, PaintSurface, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, SurfaceSource, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -1851,6 +1851,11 @@ impl MetalRenderer {
             Some(&instance_bindings.surfaces.buffer),
             instance_bindings.surfaces.offset as u64,
         );
+        command_encoder.set_fragment_buffer(
+            SurfaceInputIndex::Surfaces as u64,
+            Some(&instance_bindings.surfaces.buffer),
+            instance_bindings.surfaces.offset as u64,
+        );
         command_encoder.set_vertex_bytes(
             SurfaceInputIndex::ViewportSize as u64,
             mem::size_of_val(&viewport_size) as u64,
@@ -1858,38 +1863,56 @@ impl MetalRenderer {
         );
 
         for (index, surface) in surfaces.iter().enumerate() {
-            let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
-            );
-
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
+            let texture_size = surface.source.size();
+            let (y_texture, cb_cr_texture) = match &surface.source {
+                SurfaceSource::Surface(image_buffer) => {
+                    assert_eq!(
+                        image_buffer.get_pixel_format(),
+                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                    );
+                    let plane = |format, plane| {
+                        self.core_video_texture_cache
+                            .create_texture_from_image(
+                                image_buffer.as_concrete_TypeRef(),
+                                None,
+                                format,
+                                image_buffer.get_width_of_plane(plane),
+                                image_buffer.get_height_of_plane(plane),
+                                plane,
+                            )
+                            .unwrap()
+                    };
+                    // The CoreVideo textures own the Metal ones; holding them until the draw is
+                    // encoded keeps the views below alive.
+                    let (y, cb_cr) = (
+                        plane(MTLPixelFormat::R8Unorm, 0),
+                        plane(MTLPixelFormat::RG8Unorm, 1),
+                    );
+                    let texture = |texture: &core_video::metal_texture::CVMetalTexture| unsafe {
+                        metal::TextureRef::from_ptr(CVMetalTextureGetTexture(
+                            texture.as_concrete_TypeRef(),
+                        ) as *mut _)
+                        .to_owned()
+                    };
+                    (texture(&y), texture(&cb_cr))
+                }
+                SurfaceSource::Nv12(frame) => (
+                    self.upload_plane(
+                        MTLPixelFormat::R8Unorm,
+                        frame.width(),
+                        frame.height(),
+                        1,
+                        frame.y(),
+                    ),
+                    self.upload_plane(
+                        MTLPixelFormat::RG8Unorm,
+                        frame.chroma_width(),
+                        frame.chroma_height(),
+                        2,
+                        frame.cb_cr(),
+                    ),
+                ),
+            };
 
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
@@ -1897,14 +1920,10 @@ impl MetalRenderer {
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
             // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
+            command_encoder
+                .set_fragment_texture(SurfaceInputIndex::YTexture as u64, Some(&y_texture));
+            command_encoder
+                .set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, Some(&cb_cr_texture));
 
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
@@ -1914,6 +1933,34 @@ impl MetalRenderer {
                 (first_surface + index) as u64,
             );
         }
+    }
+}
+
+impl MetalRenderer {
+    /// A new texture holding one plane of a frame from system memory. A fresh texture each
+    /// frame, since writing into one an earlier frame's commands may still be reading would race
+    /// the GPU; Metal keeps it alive until those commands finish.
+    fn upload_plane(
+        &self,
+        format: MTLPixelFormat,
+        width: u32,
+        height: u32,
+        bytes_per_pixel: u32,
+        bytes: &[u8],
+    ) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_pixel_format(format);
+        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        let texture = self.device.new_texture(&descriptor);
+        texture.replace_region(
+            metal::MTLRegion::new_2d(0, 0, width as u64, height as u64),
+            0,
+            bytes.as_ptr() as *const _,
+            (width * bytes_per_pixel) as u64,
+        );
+        texture
     }
 }
 
@@ -2326,6 +2373,13 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            corner_radii: surface.corner_radii,
+            texture_bounds: surface.texture_bounds,
+            opacity: surface.opacity,
+            video_range: match &surface.source {
+                SurfaceSource::Nv12(frame) => (frame.range() == Nv12Range::Video) as u32,
+                _ => 0,
+            },
         }))?,
     })
 }
@@ -2513,11 +2567,16 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub texture_bounds: [f32; 4],
+    pub opacity: f32,
+    /// Non-zero when the samples span the video range rather than the full one.
+    pub video_range: u32,
 }
 
 #[cfg(any(test, feature = "test-support"))]

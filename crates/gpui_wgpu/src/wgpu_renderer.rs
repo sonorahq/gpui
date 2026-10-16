@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, BlurPasses, Bounds, DevicePixels, GAUSSIAN_REACH, GpuSpecs,
-    KAWASE_LEVELS, Kawase, LayerEffect, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size,
-    get_gamma_correction_ratios,
+    KAWASE_LEVELS, Kawase, LayerEffect, Nv12Range, PaintSurface, Path, Point, PrimitiveBatch,
+    ScaledPixels, Scene, Size, SurfaceSource, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -90,11 +90,18 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
     }
 }
 
+/// One surface's uniform. Laid out to match `SurfaceParams` in `shaders.wgsl`, padded to the
+/// sixteen bytes a uniform struct rounds up to.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    corner_radii: [f32; 4],
+    texture_bounds: [f32; 4],
+    opacity: f32,
+    video_range: u32,
+    pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -2285,9 +2292,9 @@ impl WgpuRenderer {
                             &mut pass,
                         );
                     }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(range) => {
+                        self.draw_surfaces(&scene.surfaces[range], &mut pass)
+                    }
                 }
             }
 
@@ -2452,6 +2459,136 @@ impl WgpuRenderer {
                     },
                 ],
             })
+    }
+
+    /// Draws frames from system memory, one draw each: their planes are uploaded into new
+    /// textures every frame, which wgpu orders against the frames still reading older ones.
+    fn draw_surfaces(&self, surfaces: &[PaintSurface], pass: &mut wgpu::RenderPass<'_>) {
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.surfaces);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        for surface in surfaces {
+            let frame = match &surface.source {
+                SurfaceSource::Nv12(frame) => frame,
+                // CoreVideo buffers only exist where Metal draws them.
+                #[cfg(target_os = "macos")]
+                SurfaceSource::Surface(_) => continue,
+            };
+            let y = self.upload_plane(
+                "surface_y",
+                wgpu::TextureFormat::R8Unorm,
+                frame.width(),
+                frame.height(),
+                1,
+                frame.y(),
+            );
+            let cb_cr = self.upload_plane(
+                "surface_cb_cr",
+                wgpu::TextureFormat::Rg8Unorm,
+                frame.chroma_width(),
+                frame.chroma_height(),
+                2,
+                frame.cb_cr(),
+            );
+            let radii = surface.corner_radii;
+            let params = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+                corner_radii: [
+                    radii.top_left.0,
+                    radii.top_right.0,
+                    radii.bottom_right.0,
+                    radii.bottom_left.0,
+                ],
+                texture_bounds: surface.texture_bounds,
+                opacity: surface.opacity,
+                video_range: (frame.range() == Nv12Range::Video) as u32,
+                pad: [0; 2],
+            };
+            let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("surface_params"),
+                size: std::mem::size_of::<SurfaceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            resources
+                .queue
+                .write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("surface_bind_group"),
+                    layout: &resources.bind_group_layouts.surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &y.create_view(&Default::default()),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(
+                                &cb_cr.create_view(&Default::default()),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        },
+                    ],
+                });
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+    }
+
+    /// A new texture holding one plane of a frame, `bytes_per_pixel` bytes to a texel.
+    fn upload_plane(
+        &self,
+        label: &str,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        bytes_per_pixel: u32,
+        bytes: &[u8],
+    ) -> wgpu::Texture {
+        let resources = self.resources();
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        resources.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * bytes_per_pixel),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        texture
     }
 
     fn draw_instances(

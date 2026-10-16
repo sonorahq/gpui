@@ -283,6 +283,7 @@ struct DirectXRenderPipelines {
     subpixel_sprites: PipelineState<SubpixelSprite>,
     subpixel_sprites_layered: Shading,
     poly_sprites: PipelineState<PolychromeSprite>,
+    surfaces: PipelineState<SurfaceInstance>,
 }
 
 struct DirectXGlobalElements {
@@ -1107,7 +1108,9 @@ impl DirectXRenderer {
                     }
                     Ok(())
                 }
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::Surfaces(range) => {
+                    self.draw_surfaces(range.start, &scene.surfaces[range])
+                }
             }
             .with_context(|| {
                 format!(
@@ -1297,6 +1300,16 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.polychrome_sprites,
+            )?;
+        }
+
+        if !scene.surfaces.is_empty() {
+            let surfaces: Vec<SurfaceInstance> =
+                scene.surfaces.iter().map(SurfaceInstance::from).collect();
+            self.pipelines.surfaces.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &surfaces,
             )?;
         }
 
@@ -1549,9 +1562,65 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
+    /// Draws frames from system memory, one draw each. Their planes go into new immutable
+    /// textures every frame, so no frame still in flight reads a texture being written.
+    fn draw_surfaces(&mut self, first: usize, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let batch_params = self
+            .globals
+            .batch_params_buffer
+            .as_ref()
+            .context("batch params buffer missing")?;
+        let pipeline = &self.pipelines.surfaces;
+        anyhow::ensure!(
+            first + surfaces.len() <= pipeline.buffer_size,
+            "DirectX instance range exceeds the {} buffer",
+            pipeline.label
+        );
+        for (index, surface) in surfaces.iter().enumerate() {
+            let SurfaceSource::Nv12(frame) = &surface.source;
+            let planes = [
+                create_plane_texture(
+                    &devices.device,
+                    DXGI_FORMAT_R8_UNORM,
+                    frame.width(),
+                    frame.height(),
+                    1,
+                    frame.y(),
+                )?,
+                create_plane_texture(
+                    &devices.device,
+                    DXGI_FORMAT_R8G8_UNORM,
+                    frame.chroma_width(),
+                    frame.chroma_height(),
+                    2,
+                    frame.cb_cr(),
+                )?,
+            ];
+            update_batch_start(
+                &devices.device_context,
+                batch_params,
+                (first + index) as u32,
+            )?;
+            set_pipeline_state(
+                &devices.device_context,
+                slice::from_ref(&pipeline.view),
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                &pipeline.vertex,
+                &pipeline.fragment,
+                &pipeline.blend_state,
+            );
+            unsafe {
+                let context = &devices.device_context;
+                context.PSSetSamplers(0, Some(slice::from_ref(&self.globals.sampler)));
+                context.PSSetShaderResources(2, Some(&planes));
+                context.DrawInstanced(4, 1, 0, 0);
+                // Unbind the planes, so the textures are released once the GPU is done.
+                context.PSSetShaderResources(2, Some(&[None, None]));
+            }
         }
         Ok(())
     }
@@ -1781,6 +1850,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let surfaces = PipelineState::new(
+            device,
+            "surface_pipeline",
+            ShaderModule::Surface,
+            4,
+            create_blend_state(device)?,
+        )?;
 
         Ok(Self {
             backdrop_pipeline,
@@ -1800,6 +1876,7 @@ impl DirectXRenderPipelines {
             subpixel_sprites,
             subpixel_sprites_layered,
             poly_sprites,
+            surfaces,
         })
     }
 }
@@ -2075,6 +2152,75 @@ impl<T> PipelineState<T> {
         }
         Ok(())
     }
+}
+
+/// One surface's instance, laid out like `SurfaceInstance` in `shaders.hlsl`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SurfaceInstance {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+    /// The part of the frame drawn into `bounds`: origin x, origin y, width, height, as
+    /// fractions of the frame.
+    texture_bounds: [f32; 4],
+    opacity: f32,
+    /// Non-zero when the samples span the video range rather than the full one.
+    video_range: u32,
+}
+
+impl From<&PaintSurface> for SurfaceInstance {
+    fn from(surface: &PaintSurface) -> Self {
+        let SurfaceSource::Nv12(frame) = &surface.source;
+        Self {
+            bounds: surface.bounds,
+            content_mask: surface.content_mask.bounds,
+            corner_radii: surface.corner_radii,
+            texture_bounds: surface.texture_bounds,
+            opacity: surface.opacity,
+            video_range: (frame.range() == Nv12Range::Video) as u32,
+        }
+    }
+}
+
+/// A shader resource holding one plane of a frame from system memory, `bytes_per_pixel` bytes
+/// to a texel, created immutable with its contents.
+fn create_plane_texture(
+    device: &ID3D11Device,
+    format: DXGI_FORMAT,
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u32,
+    bytes: &[u8],
+) -> Result<Option<ID3D11ShaderResourceView>> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let data = D3D11_SUBRESOURCE_DATA {
+        pSysMem: bytes.as_ptr() as _,
+        SysMemPitch: width * bytes_per_pixel,
+        SysMemSlicePitch: 0,
+    };
+    let texture = unsafe {
+        let mut output = None;
+        device.CreateTexture2D(&desc, Some(&data), Some(&mut output))?;
+        output.context("cannot create a surface plane texture")?
+    };
+    let mut view = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut view))? };
+    Ok(view)
 }
 
 #[derive(Clone, Copy)]
@@ -2636,6 +2782,7 @@ pub(crate) mod shader_resources {
         /// Fragment only. `vertex_source` sends it to `SubpixelSprite` for a vertex stage.
         SubpixelSpriteLayered,
         PolychromeSprite,
+        Surface,
         EmojiRasterization,
     }
 
@@ -2759,6 +2906,10 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
                 },
+                ShaderModule::Surface => match target {
+                    ShaderTarget::Vertex => SURFACE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => SURFACE_FRAGMENT_BYTES,
+                },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
@@ -2857,6 +3008,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::SubpixelSpriteLayered => "subpixel_sprite_layered",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::Surface => "surface",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }

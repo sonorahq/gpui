@@ -1294,6 +1294,76 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 
 /*
 **
+**              Surfaces
+**
+*/
+
+struct SurfaceInstance {
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    // The part of the frame drawn into `bounds`: origin x, origin y, width, height, as fractions
+    // of the frame. A fitted surface that overhangs its element is cropped here.
+    float4 texture_bounds;
+    float opacity;
+    // Non-zero when the samples span the video range rather than the full one.
+    uint video_range;
+};
+
+struct SurfaceVertexOutput {
+    nointerpolation uint surface_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_position: POSITION;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct SurfaceFragmentInput {
+    nointerpolation uint surface_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_position: POSITION;
+};
+
+StructuredBuffer<SurfaceInstance> surfaces: register(t1);
+Texture2D<float> t_surface_y: register(t2);
+Texture2D<float2> t_surface_cb_cr: register(t3);
+
+SurfaceVertexOutput surface_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint surface_id = batch_start_index + instance_id;
+    SurfaceInstance surface = surfaces[surface_id];
+
+    SurfaceVertexOutput output;
+    output.position = to_device_position(unit_vertex, surface.bounds);
+    output.texture_position = surface.texture_bounds.xy + unit_vertex * surface.texture_bounds.zw;
+    output.surface_id = surface_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
+                                                    surface.content_mask);
+    return output;
+}
+
+float4 surface_fragment(SurfaceFragmentInput input): SV_Target {
+    SurfaceInstance surface = surfaces[input.surface_id];
+    float y = t_surface_y.Sample(s_sprite, input.texture_position);
+    float2 cb_cr = t_surface_cb_cr.Sample(s_sprite, input.texture_position);
+    if (surface.video_range != 0u) {
+        // Stretch the video range (16 to 235 for luma, 16 to 240 for chroma) to the full one
+        // the conversion below expects.
+        y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+        cb_cr = (cb_cr - 128.0 / 255.0) * (255.0 / 224.0) + 128.0 / 255.0;
+    }
+    float cb = cb_cr.x - 0.5;
+    float cr = cb_cr.y - 0.5;
+    float3 rgb = float3(
+        y + 1.4020 * cr,
+        y - 0.3441 * cb - 0.7141 * cr,
+        y + 1.7720 * cb);
+
+    float distance = quad_sdf(input.position.xy, surface.bounds, surface.corner_radii);
+    return float4(saturate(rgb), surface.opacity * saturate(0.5 - distance));
+}
+
+/*
+**
 **              Backdrops
 **
 */
