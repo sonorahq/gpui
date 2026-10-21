@@ -5014,8 +5014,13 @@ impl Window {
     /// Note that the `quad.corner_radii` are allowed to exceed the bounds, creating sharp corners
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
-    pub fn paint_quad(&mut self, quad: PaintQuad) {
+    pub fn paint_quad(&mut self, quad: impl Into<SmoothQuad>) {
         self.invalidator.debug_assert_paint();
+
+        let SmoothQuad {
+            quad,
+            corner_smoothing,
+        } = quad.into();
 
         let opacity = self.element_opacity();
         let snapped_bounds = self.snap_bounds(quad.bounds);
@@ -5029,7 +5034,7 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
-            corner_smoothing: quad.corner_smoothing,
+            corner_smoothing,
             pad: 0,
         };
 
@@ -8136,17 +8141,33 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
-    /// How far the corners are smoothed from circular arcs towards a squircle, from 0 to 1.
-    /// See [`crate::Styled::corner_smoothing`].
+}
+
+/// A quad whose corners are smoothed from circular arcs towards a squircle. Kept apart from
+/// [`PaintQuad`] so code that builds a `PaintQuad` for upstream GPUI builds against this one.
+#[derive(Clone)]
+pub struct SmoothQuad {
+    /// The quad to paint.
+    pub quad: PaintQuad,
+    /// How far its corners are smoothed, from 0 to 1. See [`crate::Styled::corner_smoothing`].
     pub corner_smoothing: f32,
+}
+
+impl From<PaintQuad> for SmoothQuad {
+    fn from(quad: PaintQuad) -> Self {
+        SmoothQuad {
+            quad,
+            corner_smoothing: 0.,
+        }
+    }
 }
 
 impl PaintQuad {
     /// Sets how far the quad's corners are smoothed towards a squircle, from 0 to 1.
-    pub fn corner_smoothing(self, corner_smoothing: f32) -> Self {
-        PaintQuad {
+    pub fn corner_smoothing(self, corner_smoothing: f32) -> SmoothQuad {
+        SmoothQuad {
+            quad: self,
             corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
-            ..self
         }
     }
 
@@ -8204,7 +8225,6 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
-        corner_smoothing: 0.,
     }
 }
 
@@ -8217,7 +8237,6 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
-        corner_smoothing: 0.,
     }
 }
 
@@ -8234,7 +8253,6 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
-        corner_smoothing: 0.,
     }
 }
 

@@ -1,4 +1,7 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{
+    FontId, GlyphId, LetterSpacing, Pixels, PlatformTextSystem, Point, SharedString, Size, point,
+    px,
+};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -700,6 +703,7 @@ impl LineLayoutCache {
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            apply_letter_spacing(&mut layout, runs);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -851,6 +855,7 @@ impl LineLayoutCache {
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
+        apply_letter_spacing(&mut layout, runs);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -927,6 +932,47 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
+    pub letter_spacing: LetterSpacing,
+}
+
+/// Moves each glyph along by the letter spacing of the characters before it, and
+/// widens the line by all of it. A cluster shaped into one glyph is spaced once.
+fn apply_letter_spacing(layout: &mut LineLayout, runs: &[FontRun]) {
+    if runs.iter().all(|run| run.letter_spacing.0 == 0.) {
+        return;
+    }
+    let mut ends = Vec::with_capacity(runs.len());
+    let mut end = 0;
+    for run in runs {
+        end += run.len;
+        ends.push((end, layout.font_size * run.letter_spacing.0));
+    }
+    let spacing_at = |index: usize| {
+        ends.iter()
+            .find(|(end, _)| index < *end)
+            .map_or(Pixels::ZERO, |(_, spacing)| *spacing)
+    };
+    let mut glyphs: Vec<&mut ShapedGlyph> = layout
+        .runs
+        .iter_mut()
+        .flat_map(|run| run.glyphs.iter_mut())
+        .collect();
+    glyphs.sort_by_key(|glyph| glyph.index);
+    let mut offset = Pixels::ZERO;
+    let mut previous = None;
+    for glyph in glyphs {
+        if previous != Some(glyph.index) {
+            if let Some(index) = previous {
+                offset += spacing_at(index);
+            }
+            previous = Some(glyph.index);
+        }
+        glyph.position.x += offset;
+    }
+    if let Some(index) = previous {
+        offset += spacing_at(index);
+    }
+    layout.width += offset;
 }
 
 trait AsCacheKeyRef {
@@ -1186,5 +1232,35 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    fn run(len: usize, ems: f32) -> FontRun {
+        FontRun {
+            len,
+            font_id: FontId(0),
+            letter_spacing: LetterSpacing(ems),
+        }
+    }
+
+    #[test]
+    fn test_letter_spacing_follows_each_character_in_its_run() {
+        // 16px text, the first two characters spaced 0.25em (4px), the third not.
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1), glyph_at(16., 2)]);
+
+        apply_letter_spacing(&mut layout, &[run(2, 0.25), run(1, 0.)]);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 12., 24.]);
+        assert_eq!(layout.width, px(108.));
+    }
+
+    #[test]
+    fn test_letter_spacing_spaces_a_cluster_once() {
+        // A base and its combining mark share an index and move together.
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(0., 0), glyph_at(8., 3)]);
+
+        apply_letter_spacing(&mut layout, &[run(4, 0.5)]);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 0., 16.]);
+        assert_eq!(layout.width, px(116.));
     }
 }

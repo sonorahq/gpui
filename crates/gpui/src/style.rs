@@ -7,9 +7,9 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, LetterSpacing,
+    Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun,
+    Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -544,6 +544,9 @@ pub struct TextStyle {
     /// The font style, e.g. italic
     pub font_style: FontStyle,
 
+    /// The space after each character, in ems, like CSS `letter-spacing`
+    pub letter_spacing: LetterSpacing,
+
     /// The background color of the text
     pub background_color: Option<Hsla>,
 
@@ -582,6 +585,7 @@ impl Default for TextStyle {
             line_height: phi(),
             font_weight: FontWeight::default(),
             font_style: FontStyle::default(),
+            letter_spacing: LetterSpacing::default(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -636,6 +640,7 @@ impl TextStyle {
             fallbacks: self.font_fallbacks.clone(),
             weight: self.font_weight,
             style: self.font_style,
+            letter_spacing: self.letter_spacing,
         }
     }
 
@@ -654,6 +659,7 @@ impl TextStyle {
                 fallbacks: self.font_fallbacks.clone(),
                 weight: self.font_weight,
                 style: self.font_style,
+                letter_spacing: self.letter_spacing,
             },
             color: self.color,
             background_color: self.background_color,

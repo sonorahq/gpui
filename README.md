@@ -27,6 +27,7 @@ the GPU-accelerated UI framework behind Zed. Everything below works on wgpu, Met
   - `Window::with_pixel_snapping` keeps a subtree off the pixel grid
 
 - **Text**
+  - `Styled::letter_spacing`, like CSS `letter-spacing`, in ems
   - Requested font weights honoured in cosmic-text
   - Variable-font `wght` axis
   - Weight-aware font fallback
