@@ -118,6 +118,7 @@ gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
 lyon = "1.0"
+naga = { workspace = true, features = ["wgsl-in"] }
 pin-project = "1.1.10"
 spin.workspace = true
 url.workspace = true
@@ -147,6 +148,7 @@ uuid = { workspace = true, features = ["js"] }
 
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+naga = { workspace = true, features = ["wgsl-in", "msl-out"] }
 objc2-core-foundation.workspace = true
 objc2-core-video = { workspace = true, features = ["CVPixelBuffer"] }
 
@@ -163,6 +165,7 @@ libc.workspace = true
 
 
 [target.'cfg(target_os = "windows")'.dependencies]
+naga = { workspace = true, features = ["wgsl-in", "hlsl-out"] }
 windows = { workspace = true, features = [
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",
@@ -181,6 +184,7 @@ web-time.workspace = true
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 gpui_util.workspace = true
 lyon = { version = "1.0", features = ["extra"] }
+naga = { workspace = true, features = ["wgsl-in", "msl-out", "hlsl-out"] }
 rand = { workspace = true, default-features = true }
 scheduler = { workspace = true, features = ["test-support"] }
 unicode-segmentation.workspace = true

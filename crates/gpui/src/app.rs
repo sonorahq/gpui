@@ -2429,6 +2429,16 @@ impl App {
         &self.text_system
     }
 
+    /// Validates a custom shader and registers it for painting with
+    /// [`Window::paint_shader`]. Registering the same source again is cheap and returns the
+    /// same shader. An invalid source is logged and returned as an error.
+    pub fn register_shader(
+        &mut self,
+        source: crate::ShaderSource,
+    ) -> Result<crate::Shader, crate::ShaderError> {
+        crate::Shader::new(source)
+    }
+
     /// Invokes a callback with grapheme clusters that exhausted font fallback.
     ///
     /// Registering a callback replaces the previous callback and enables missing-glyph
