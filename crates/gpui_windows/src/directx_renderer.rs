@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use collections::FxHashMap;
 use gpui_util::ResultExt;
 use windows::{
     Win32::{
@@ -283,6 +284,7 @@ struct DirectXRenderPipelines {
     subpixel_sprites: PipelineState<SubpixelSprite>,
     subpixel_sprites_layered: Shading,
     poly_sprites: PipelineState<PolychromeSprite>,
+    custom_shaders: CustomShaders,
 }
 
 struct DirectXGlobalElements {
@@ -1091,7 +1093,9 @@ impl DirectXRenderer {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
-                PrimitiveBatch::Shaders { .. } => Ok(()),
+                PrimitiveBatch::Shaders { shader, range } => {
+                    self.draw_custom_shaders(shader, range.start, range.len())
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     self.draw_paths_to_intermediate(paths)?;
@@ -1360,6 +1364,14 @@ impl DirectXRenderer {
             )?;
         }
 
+        if !scene.shaders.is_empty() {
+            self.pipelines.custom_shaders.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &scene.shaders,
+            )?;
+        }
+
         if !scene.underlines.is_empty() {
             self.pipelines.underline_pipeline.update_buffer(
                 &devices.device,
@@ -1422,6 +1434,26 @@ impl DirectXRenderer {
                 .batch_params_buffer
                 .as_ref()
                 .context("batch params buffer missing")?,
+            start as u32,
+            len as u32,
+        )
+    }
+
+    fn draw_custom_shaders(&mut self, shader: ShaderId, start: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let viewport = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .viewport;
+        self.pipelines.custom_shaders.draw(
+            &devices.device,
+            &devices.device_context,
+            shader,
+            [viewport.Width, viewport.Height],
             start as u32,
             len as u32,
         )
@@ -1898,6 +1930,7 @@ impl DirectXRenderPipelines {
             subpixel_sprites,
             subpixel_sprites_layered,
             poly_sprites,
+            custom_shaders: CustomShaders::new(device)?,
         })
     }
 }
@@ -2173,6 +2206,232 @@ impl<T> PipelineState<T> {
         }
         Ok(())
     }
+}
+
+/// The globals the custom shader prelude reads, laid out as its `GpuiShaderGlobals`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CustomShaderGlobals {
+    viewport_size: [f32; 2],
+    premultiplied_alpha: u32,
+    pad: u32,
+}
+
+/// The constants naga adds to `SV_VertexID` and `SV_InstanceID`, which Direct3D 11 counts from
+/// zero in every draw, so the shader indexes the instances of its batch.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct NagaConstants {
+    first_vertex: i32,
+    first_instance: i32,
+    other: u32,
+    pad: u32,
+}
+
+/// The stages of one custom shader, compiled from its HLSL translation.
+struct CustomPipeline {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+}
+
+/// Everything custom shaders draw with: a raw buffer of the frame's instances, since naga reads
+/// storage buffers as `ByteAddressBuffer`, the two constant buffers the prelude reads, and a
+/// pipeline per shader, compiled the first time a frame draws it.
+struct CustomShaders {
+    buffer: Option<ID3D11Buffer>,
+    view: Option<ID3D11ShaderResourceView>,
+    /// How many instances the buffer holds.
+    capacity: usize,
+    globals: Option<ID3D11Buffer>,
+    constants: Option<ID3D11Buffer>,
+    blend_state: ID3D11BlendState,
+    /// A shader that failed to compile is kept as `None`, so it is not compiled again every
+    /// frame.
+    pipelines: FxHashMap<ShaderId, Option<CustomPipeline>>,
+}
+
+impl CustomShaders {
+    fn new(device: &ID3D11Device) -> Result<Self> {
+        Ok(Self {
+            buffer: None,
+            view: None,
+            capacity: 0,
+            globals: create_constant_buffer::<CustomShaderGlobals>(device)?,
+            constants: create_constant_buffer::<NagaConstants>(device)?,
+            blend_state: create_blend_state(device)?,
+            pipelines: FxHashMap::default(),
+        })
+    }
+
+    fn update_buffer(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        data: &[ShaderQuad],
+    ) -> Result<()> {
+        if self.capacity < data.len() || self.buffer.is_none() {
+            let element_size = std::mem::size_of::<ShaderQuad>();
+            let required_size = std::mem::size_of_val(data);
+            anyhow::ensure!(
+                required_size <= MAX_INSTANCE_BUFFER_SIZE,
+                "custom shader buffer needs {required_size} bytes, above the maximum of {MAX_INSTANCE_BUFFER_SIZE}"
+            );
+            let capacity = data
+                .len()
+                .next_power_of_two()
+                .max(16)
+                .min(MAX_INSTANCE_BUFFER_SIZE / element_size);
+            let buffer = create_raw_buffer(device, element_size * capacity)?;
+            self.view = create_raw_buffer_view(device, &buffer, element_size * capacity)?;
+            self.buffer = Some(buffer);
+            self.capacity = capacity;
+        }
+        let buffer = self
+            .buffer
+            .as_ref()
+            .context("custom shader buffer missing")?;
+        update_buffer(device_context, buffer, data)
+    }
+
+    /// Draws `count` instances of `shader` from `first` on, or nothing when the shader does not
+    /// compile on this device.
+    fn draw(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        shader: ShaderId,
+        viewport_size: [f32; 2],
+        first: u32,
+        count: u32,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            (first + count) as usize <= self.capacity,
+            "DirectX instance range exceeds the custom shader buffer"
+        );
+        let pipeline = self.pipelines.entry(shader).or_insert_with(|| {
+            compile_custom_pipeline(device, shader)
+                .inspect_err(|error| log::error!("{error:#}"))
+                .ok()
+        });
+        let Some(pipeline) = pipeline else {
+            return Ok(());
+        };
+
+        // Quads blend straight alpha here, so the prelude leaves its colour unpremultiplied.
+        let globals = self
+            .globals
+            .as_ref()
+            .context("custom shader globals missing")?;
+        update_buffer(
+            device_context,
+            globals,
+            &[CustomShaderGlobals {
+                viewport_size,
+                premultiplied_alpha: 0,
+                pad: 0,
+            }],
+        )?;
+        let constants = self
+            .constants
+            .as_ref()
+            .context("custom shader constants missing")?;
+        update_buffer(
+            device_context,
+            constants,
+            &[NagaConstants {
+                first_vertex: 0,
+                first_instance: first as i32,
+                other: 0,
+                pad: 0,
+            }],
+        )?;
+
+        let globals_slot = gpui::HlslShader::GLOBALS_REGISTER;
+        let constants_slot = gpui::HlslShader::CONSTANTS_REGISTER;
+        let instances_slot = gpui::HlslShader::INSTANCES_REGISTER;
+        unsafe {
+            device_context.VSSetConstantBuffers(globals_slot, Some(slice::from_ref(&self.globals)));
+            device_context.PSSetConstantBuffers(globals_slot, Some(slice::from_ref(&self.globals)));
+            device_context
+                .VSSetConstantBuffers(constants_slot, Some(slice::from_ref(&self.constants)));
+            device_context
+                .PSSetConstantBuffers(constants_slot, Some(slice::from_ref(&self.constants)));
+            device_context.VSSetShaderResources(instances_slot, Some(slice::from_ref(&self.view)));
+            device_context.PSSetShaderResources(instances_slot, Some(slice::from_ref(&self.view)));
+            device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            device_context.VSSetShader(&pipeline.vertex, None);
+            device_context.PSSetShader(&pipeline.fragment, None);
+            device_context.OMSetBlendState(&self.blend_state, None, 0xFFFFFFFF);
+            device_context.DrawInstanced(4, count, 0, 0);
+        }
+        Ok(())
+    }
+}
+
+/// Translates a custom shader to HLSL and compiles both of its stages for shader model 5.0,
+/// which needs a device of feature level 11 or above.
+fn compile_custom_pipeline(device: &ID3D11Device, shader: ShaderId) -> Result<CustomPipeline> {
+    let program = gpui::shader_program(shader)
+        .with_context(|| format!("custom shader {} was never registered", shader.0))?;
+    anyhow::ensure!(
+        unsafe { device.GetFeatureLevel() }.0 >= D3D_FEATURE_LEVEL_11_0.0,
+        "custom shader `{}` needs Direct3D feature level 11",
+        program.label
+    );
+    let hlsl = program.to_hlsl()?;
+    let vertex = compile_hlsl(&hlsl.source, &hlsl.vertex_entry, "vs_5_0", &program.label)?;
+    let fragment = compile_hlsl(&hlsl.source, &hlsl.fragment_entry, "ps_5_0", &program.label)?;
+    Ok(CustomPipeline {
+        vertex: create_vertex_shader(device, blob_bytes(&vertex))?,
+        fragment: create_fragment_shader(device, blob_bytes(&fragment))?,
+    })
+}
+
+/// Compiles one entry point of HLSL source with the system's `d3dcompiler_47.dll`.
+fn compile_hlsl(
+    source: &str,
+    entry: &str,
+    target: &str,
+    label: &str,
+) -> Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    use windows::Win32::Graphics::Direct3D::{
+        Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile},
+        ID3DInclude,
+    };
+    use windows::core::PCSTR;
+
+    let entry = std::ffi::CString::new(entry)?;
+    let target = std::ffi::CString::new(target)?;
+    let name = std::ffi::CString::new(label)?;
+    let mut code = None;
+    let mut errors = None;
+    let result = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            PCSTR::from_raw(name.as_ptr().cast()),
+            None,
+            None::<&ID3DInclude>,
+            PCSTR::from_raw(entry.as_ptr().cast()),
+            PCSTR::from_raw(target.as_ptr().cast()),
+            D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(error) = result {
+        let message = errors
+            .as_ref()
+            .map(|errors| String::from_utf8_lossy(blob_bytes(errors)).into_owned())
+            .unwrap_or_else(|| error.to_string());
+        anyhow::bail!("custom shader `{label}` failed to compile: {message}");
+    }
+    code.context("the shader compiler returned no bytecode")
+}
+
+fn blob_bytes(blob: &windows::Win32::Graphics::Direct3D::ID3DBlob) -> &[u8] {
+    unsafe { slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()) }
 }
 
 #[derive(Clone, Copy)]
@@ -2628,6 +2887,42 @@ fn create_buffer(
     let mut buffer = None;
     unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
     Ok(buffer.unwrap())
+}
+
+/// A buffer shaders read as a `ByteAddressBuffer`, written from the CPU every frame.
+fn create_raw_buffer(device: &ID3D11Device, size: usize) -> Result<ID3D11Buffer> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: size as u32,
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        MiscFlags: D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS.0 as u32,
+        StructureByteStride: 0,
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
+    buffer.context("the device returned no buffer")
+}
+
+fn create_raw_buffer_view(
+    device: &ID3D11Device,
+    buffer: &ID3D11Buffer,
+    size: usize,
+) -> Result<Option<ID3D11ShaderResourceView>> {
+    let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D11_SRV_DIMENSION_BUFFEREX,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+            BufferEx: D3D11_BUFFEREX_SRV {
+                FirstElement: 0,
+                NumElements: (size / 4) as u32,
+                Flags: D3D11_BUFFEREX_SRV_FLAG_RAW.0 as u32,
+            },
+        },
+    };
+    let mut view = None;
+    unsafe { device.CreateShaderResourceView(buffer, Some(&desc), Some(&mut view)) }?;
+    Ok(view)
 }
 
 #[inline]

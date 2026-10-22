@@ -248,8 +248,10 @@ impl ShaderProgram {
     }
 
     /// Translates the shader to HLSL for shader model 5.0. The globals are bound at constant
-    /// buffer `b0`, the batch's first instance at `b1` and the instances, as a raw buffer, at
-    /// texture register `t0`.
+    /// buffer [`HlslShader::GLOBALS_REGISTER`], the batch's first instance at
+    /// [`HlslShader::CONSTANTS_REGISTER`] and the instances, as a raw buffer, at texture register
+    /// [`HlslShader::INSTANCES_REGISTER`]. They sit past the registers the built in shaders use,
+    /// so drawing a custom shader leaves those bindings alone.
     #[cfg(any(target_os = "windows", test))]
     pub fn to_hlsl(&self) -> Result<HlslShader, ShaderError> {
         use naga::back::hlsl;
@@ -268,20 +270,20 @@ impl ShaderProgram {
                         group: 0,
                         binding: 0,
                     },
-                    target(0),
+                    target(HlslShader::GLOBALS_REGISTER),
                 ),
                 (
                     naga::ResourceBinding {
                         group: 1,
                         binding: 0,
                     },
-                    target(0),
+                    target(HlslShader::INSTANCES_REGISTER),
                 ),
             ]
             .into_iter()
             .collect(),
             fake_missing_bindings: false,
-            special_constants_binding: Some(target(1)),
+            special_constants_binding: Some(target(HlslShader::CONSTANTS_REGISTER)),
             ..Default::default()
         };
         let mut source = String::new();
@@ -370,6 +372,17 @@ pub struct HlslShader {
     pub vertex_entry: String,
     /// The name of the fragment function, compiled for `ps_5_0`.
     pub fragment_entry: String,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl HlslShader {
+    /// The constant buffer register the globals are read from.
+    pub const GLOBALS_REGISTER: u32 = 2;
+    /// The constant buffer register naga reads the batch's first vertex and instance from, as
+    /// `int first_vertex, first_instance` followed by a word of padding.
+    pub const CONSTANTS_REGISTER: u32 = 3;
+    /// The texture register the raw instance buffer is read from.
+    pub const INSTANCES_REGISTER: u32 = 2;
 }
 
 /// Rewrites the `ConstantBuffer<T>` declarations naga emits, which need shader model 5.1, as
@@ -546,8 +559,8 @@ mod tests {
         let hlsl = program.to_hlsl().unwrap();
         assert!(hlsl.source.contains(&hlsl.vertex_entry));
         assert!(hlsl.source.contains(&hlsl.fragment_entry));
-        assert!(hlsl.source.contains("register(t0)"));
-        assert!(hlsl.source.contains("register(b1)"));
+        assert!(hlsl.source.contains("register(t2)"));
+        assert!(hlsl.source.contains("register(b3)"));
         assert!(!hlsl.source.contains("ConstantBuffer<"));
         if let Ok(path) = std::env::var("GPUI_DUMP_SHADER_TRANSLATIONS") {
             std::fs::write(format!("{path}.hlsl"), &hlsl.source).unwrap();
@@ -572,8 +585,12 @@ mod tests {
             let shader = Shader::new(ShaderSource::new(label, wgsl))
                 .unwrap_or_else(|error| panic!("{error}"));
             let program = shader_program(shader.id()).unwrap();
-            program.to_msl().unwrap_or_else(|error| panic!("{error}"));
-            program.to_hlsl().unwrap_or_else(|error| panic!("{error}"));
+            let msl = program.to_msl().unwrap_or_else(|error| panic!("{error}"));
+            let hlsl = program.to_hlsl().unwrap_or_else(|error| panic!("{error}"));
+            if let Ok(path) = std::env::var("GPUI_DUMP_SHADER_TRANSLATIONS") {
+                std::fs::write(format!("{path}-{label}.metal"), &msl.source).unwrap();
+                std::fs::write(format!("{path}-{label}.hlsl"), &hlsl.source).unwrap();
+            }
         }
     }
 
