@@ -160,6 +160,13 @@ impl Render for Procedural {
             .color(2, hsla(0x6ae1ff))
             .color(3, rgba(0xffffff0d));
 
+        let scan = ShaderInstance::at(time)
+            .params(0, &[3.0, 0.7, 1.0, 3.0])
+            .params(4, &[4.0, 0.45, 0.5, 0.16])
+            .color(0, hsla(0x07080c))
+            .color(1, rgba(0x5fd4ffb0))
+            .color(3, rgba(0xffffff0a));
+
         let sparkle = ShaderInstance::at(time)
             .params(0, &[3.0, 0.8, 1.0, 2.0])
             .params(4, &[3.0, 0.9, 1.0, 0.2])
@@ -303,14 +310,34 @@ impl Render for Procedural {
                             )
                             .child(div().relative().w(px(150.)).h(px(56.)).child(fill(
                                 shaders.liquid_metal,
-                                metal(0.0, body),
+                                metal(0.0, body).param(3, 0.7),
                                 px(18.),
                             )))
                             .child(div().relative().size(px(120.)).child(fill(
                                 shaders.dot_matrix,
                                 ripple,
                                 px(60.),
-                            ))),
+                            )))
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .h(px(120.))
+                                    .p(px(20.))
+                                    .flex()
+                                    .flex_col()
+                                    .justify_end()
+                                    .child(fill(shaders.dot_matrix, scan, px(24.)))
+                                    .child(fill(
+                                        shaders.liquid_metal,
+                                        metal(1.4, gpui::transparent_black()),
+                                        px(24.),
+                                    ))
+                                    .child(div().relative().child("Rim mode"))
+                                    .child(div().relative().child(label(
+                                        "a metal border over another surface",
+                                    ))),
+                            ),
                     )
                     .child(
                         div()
@@ -359,7 +386,7 @@ impl Render for Procedural {
                 div()
                     .absolute()
                     .left(px(500.))
-                    .top(px(300.))
+                    .top(px(282.))
                     .w(px(320.))
                     .h(px(190.))
                     .rounded(px(34.))
