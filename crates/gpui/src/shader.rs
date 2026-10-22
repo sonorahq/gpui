@@ -553,6 +553,29 @@ mod tests {
     }
 
     #[test]
+    fn example_shaders_validate_and_translate() {
+        let examples = [
+            (
+                "liquid_metal",
+                include_str!("../examples/procedural/liquid_metal.wgsl"),
+            ),
+            (
+                "dot_matrix",
+                include_str!("../examples/procedural/dot_matrix.wgsl"),
+            ),
+            ("rings", include_str!("../examples/procedural/rings.wgsl")),
+            ("aurora", include_str!("../examples/procedural/aurora.wgsl")),
+        ];
+        for (label, wgsl) in examples {
+            let shader = Shader::new(ShaderSource::new(label, wgsl))
+                .unwrap_or_else(|error| panic!("{error}"));
+            let program = shader_program(shader.id()).unwrap();
+            program.to_msl().unwrap_or_else(|error| panic!("{error}"));
+            program.to_hlsl().unwrap_or_else(|error| panic!("{error}"));
+        }
+    }
+
+    #[test]
     fn instance_layout_matches_the_prelude() {
         use crate::ShaderQuad;
         assert_eq!(std::mem::size_of::<ShaderQuad>(), 208);
