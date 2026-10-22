@@ -1,6 +1,10 @@
 // Aurora: a slow liquid gradient between up to four colours, for large backgrounds and for
-// frosted panels to sit on. Noise warped by more noise gives it soft folds, the colours are
-// mixed in Oklab, and a dither of one 8 bit step keeps the long gradients from banding.
+// frosted panels to sit on. Noise warped by more noise gives it soft folds, and a dither of one
+// 8 bit step keeps the long gradients from banding.
+//
+// It is built to be cheap over a whole window. The colours are mixed with their components
+// squared, which is close to linear light for soft gradients and far cheaper than a per pixel
+// trip through Oklab, and the folds are slow waves with only two lookups of noise.
 //
 // params[0].x  speed, 1 is a slow drift
 // params[0].y  feature size in logical pixels, around a third of the area it covers
@@ -9,12 +13,19 @@
 // params[1].x  how many of the colours to use, 2 to 4
 // colors[0..3] the palette, from the bottom of the folds to the top
 
+fn light(color: vec4<f32>) -> vec3<f32> {
+    return color.rgb * color.rgb;
+}
+
 fn palette(input: ShaderInput, count: i32, s: f32) -> vec3<f32> {
-    let span = f32(count - 1);
-    let position = saturate(s) * span;
-    let index = min(i32(floor(position)), count - 2);
-    let blend = smoothstep(0.0, 1.0, position - f32(index));
-    return mix_oklab(input.colors[index].rgb, input.colors[index + 1].rgb, blend);
+    let position = saturate(s) * f32(count - 1);
+    let c0 = light(input.colors[0]);
+    let c1 = light(input.colors[1]);
+    let c2 = light(input.colors[2]);
+    let c3 = light(input.colors[3]);
+    let low = mix(c0, c1, smoothstep(0.0, 1.0, saturate(position)));
+    let middle = mix(low, c2, smoothstep(0.0, 1.0, saturate(position - 1.0)));
+    return mix(middle, c3, smoothstep(0.0, 1.0, saturate(position - 2.0)));
 }
 
 fn shade(input: ShaderInput) -> vec4<f32> {
@@ -25,23 +36,24 @@ fn shade(input: ShaderInput) -> vec4<f32> {
     let count = clamp(i32(input.params[1].x + 0.5), 2, 4);
 
     let q = input.position / scale;
-    let fold = vec2<f32>(
-        fbm(q + vec2<f32>(0.0, 0.045 * t), 3),
-        fbm(q + vec2<f32>(5.2, 1.3) - vec2<f32>(0.035 * t, 0.0), 3),
+    // Slow waves fold the plane, a little noise keeps the folds from repeating, and the field
+    // read through them is waves and noise again.
+    let drift = gradient_noise(q * 0.9 + vec2<f32>(0.03 * t, -0.02 * t));
+    let fold = 0.5 * vec2<f32>(
+        sin(q.y * 1.3 + 0.11 * t + drift) + sin(q.x * 0.7 - 0.07 * t),
+        cos(q.x * 1.1 - 0.09 * t) + sin(q.y * 0.6 + 0.05 * t - drift),
     );
-    let field = fbm(q * 0.8 + warp * 1.7 * fold + vec2<f32>(0.02 * t, -0.015 * t), 3);
+    let r = q * 0.8 + warp * 1.7 * fold;
+    let waves = sin(r.x * 0.9 + sin(r.y * 1.4 + 0.06 * t)) + sin(r.y * 0.8 - 0.04 * t + cos(r.x * 0.5));
+    let field = 0.38 * waves + 0.3 * gradient_noise(r * 1.3 - vec2<f32>(0.0, 0.02 * t));
 
     // Lean the palette from its first colour at the bottom to its last at the top, with the
     // folds carrying it back and forth across that.
     let s = 0.5 + 0.75 * field + 0.35 * (0.5 - input.uv.y) + 0.15 * fold.x;
     let full = palette(input, count, s);
 
-    var average = vec3<f32>(0.0);
-    for (var i = 0; i < count; i++) {
-        average += srgb_to_linear(input.colors[i].rgb);
-    }
-    average = linear_to_srgb(average / f32(count));
+    let average = (light(input.colors[0]) + light(input.colors[1]) + select(vec3<f32>(0.0), light(input.colors[2]), count > 2) + select(vec3<f32>(0.0), light(input.colors[3]), count > 3)) / f32(count);
 
-    let color = mix_oklab(average, full, contrast);
+    let color = sqrt(max(mix(average, full, contrast), vec3<f32>(0.0)));
     return vec4<f32>(dither(color, input.frag_coord), input.colors[0].a);
 }
