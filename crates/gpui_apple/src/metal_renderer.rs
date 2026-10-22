@@ -1,11 +1,12 @@
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
+use collections::FxHashMap;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
     KAWASE_LEVELS, Kawase, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
-    Scene, Size, point, size,
+    Scene, ShaderId, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -181,6 +182,9 @@ pub struct MetalRenderer {
     blit_pipeline_state: metal::RenderPipelineState,
     composite_pipeline_state: metal::RenderPipelineState,
     masked_pipeline_state: metal::RenderPipelineState,
+    /// A pipeline per custom shader, built from its MSL translation the first time a frame draws
+    /// it. A shader that failed to build is kept as `None`, so it is not built again every frame.
+    custom_pipeline_states: FxHashMap<ShaderId, Option<metal::RenderPipelineState>>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -568,6 +572,7 @@ impl MetalRenderer {
             blit_pipeline_state,
             composite_pipeline_state,
             masked_pipeline_state,
+            custom_pipeline_states: FxHashMap::default(),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1076,7 +1081,17 @@ impl MetalRenderer {
                 PrimitiveBatch::Quads(range) => {
                     self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
                 }
-                PrimitiveBatch::Shaders { .. } => {}
+                PrimitiveBatch::Shaders { shader, range } => {
+                    if let Some(pipeline) = self.custom_pipeline_state(shader) {
+                        self.draw_custom_shaders(
+                            &pipeline,
+                            range,
+                            instance_bindings,
+                            viewport_size,
+                            command_encoder,
+                        );
+                    }
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     // The texture the frame is drawing into right now: the innermost open
@@ -1698,6 +1713,86 @@ impl MetalRenderer {
             6,
             quads.len() as u64,
             quads.start as u64,
+        );
+    }
+
+    /// The pipeline of a custom shader, built the first time a frame draws it. `None` means it
+    /// failed to build, which is logged once and leaves its instances undrawn.
+    fn custom_pipeline_state(&mut self, shader: ShaderId) -> Option<metal::RenderPipelineState> {
+        if let Some(pipeline) = self.custom_pipeline_states.get(&shader) {
+            return pipeline.clone();
+        }
+        let pipeline =
+            build_custom_pipeline_state(&self.device, shader, MTLPixelFormat::BGRA8Unorm)
+                .inspect_err(|error| log::error!("{error:#}"))
+                .ok();
+        self.custom_pipeline_states.insert(shader, pipeline.clone());
+        pipeline
+    }
+
+    fn draw_custom_shaders(
+        &self,
+        pipeline: &metal::RenderPipelineStateRef,
+        shaders: Range<usize>,
+        instance_bindings: &InstanceBindings,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        if shaders.is_empty() {
+            return;
+        }
+
+        // Quads blend straight alpha on Metal, so the prelude leaves its colour unpremultiplied.
+        let globals = CustomShaderGlobals {
+            viewport_size: [
+                i32::from(viewport_size.width) as f32,
+                i32::from(viewport_size.height) as f32,
+            ],
+            premultiplied_alpha: 0,
+            pad: 0,
+        };
+        let buffer = &instance_bindings.shaders;
+        // naga reads the length of the instance buffer from here, though nothing it emits for
+        // the prelude bounds checks against it.
+        let length = (buffer.buffer.length() as usize).saturating_sub(buffer.offset) as u32;
+
+        command_encoder.set_render_pipeline_state(pipeline);
+        let globals_size = mem::size_of::<CustomShaderGlobals>() as u64;
+        let globals_bytes = &globals as *const CustomShaderGlobals as *const c_void;
+        let length_size = mem::size_of::<u32>() as u64;
+        let length_bytes = &length as *const u32 as *const c_void;
+        command_encoder.set_vertex_bytes(
+            gpui::MslShader::GLOBALS_BUFFER,
+            globals_size,
+            globals_bytes,
+        );
+        command_encoder.set_fragment_bytes(
+            gpui::MslShader::GLOBALS_BUFFER,
+            globals_size,
+            globals_bytes,
+        );
+        command_encoder.set_vertex_bytes(gpui::MslShader::SIZES_BUFFER, length_size, length_bytes);
+        command_encoder.set_fragment_bytes(
+            gpui::MslShader::SIZES_BUFFER,
+            length_size,
+            length_bytes,
+        );
+        command_encoder.set_vertex_buffer(
+            gpui::MslShader::INSTANCES_BUFFER,
+            Some(&buffer.buffer),
+            buffer.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            gpui::MslShader::INSTANCES_BUFFER,
+            Some(&buffer.buffer),
+            buffer.offset as u64,
+        );
+        command_encoder.draw_primitives_instanced_base_instance(
+            metal::MTLPrimitiveType::TriangleStrip,
+            0,
+            4,
+            shaders.len() as u64,
+            shaders.start as u64,
         );
     }
 
@@ -2328,6 +2423,54 @@ fn build_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+/// The globals the custom shader prelude reads, laid out as its `GpuiShaderGlobals`.
+#[repr(C)]
+struct CustomShaderGlobals {
+    viewport_size: [f32; 2],
+    premultiplied_alpha: u32,
+    pad: u32,
+}
+
+/// Translates a custom shader to MSL, compiles it and builds a pipeline that blends it the way
+/// quads are blended.
+fn build_custom_pipeline_state(
+    device: &metal::DeviceRef,
+    shader: ShaderId,
+    pixel_format: metal::MTLPixelFormat,
+) -> Result<metal::RenderPipelineState> {
+    let program = gpui::shader_program(shader)
+        .with_context(|| format!("custom shader {} was never registered", shader.0))?;
+    let msl = program.to_msl()?;
+    let library = device
+        .new_library_with_source(&msl.source, &metal::CompileOptions::new())
+        .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))?;
+    let function = |name: &str| {
+        library
+            .get_function(name, None)
+            .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))
+    };
+    let vertex_fn = function(&msl.vertex_entry)?;
+    let fragment_fn = function(&msl.fragment_entry)?;
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(&program.label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))
+}
+
 fn build_path_sprite_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -2410,6 +2553,7 @@ struct InstanceBinding {
 struct InstanceBindings {
     backdrops: InstanceBinding,
     quads: InstanceBinding,
+    shaders: InstanceBinding,
     shadows: InstanceBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
@@ -2421,6 +2565,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
     Ok(InstanceBindings {
         backdrops: writer.write(&scene.backdrops)?,
         quads: writer.write(&scene.quads)?,
+        shaders: writer.write(&scene.shaders)?,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
