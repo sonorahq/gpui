@@ -11,9 +11,9 @@
 mod example_support;
 
 use gpui::{
-    App, Bounds, Context, Corners, FocusHandle, Hsla, KeyDownEvent, Pixels, Render, Shader,
-    ShaderInstance, ShaderSource, Window, WindowBounds, WindowOptions, canvas, div, prelude::*, px,
-    rgb, rgba, size,
+    App, Bounds, Context, Corners, FocusHandle, Hsla, KeyDownEvent, LiquidGlass, Pixels, Render,
+    Shader, ShaderInstance, ShaderSource, Window, WindowBounds, WindowOptions, canvas, div,
+    prelude::*, px, rgb, rgba, size,
 };
 use gpui_platform::application;
 use std::time::Instant;
@@ -177,6 +177,16 @@ impl Render for Procedural {
                 .color(2, interior)
         };
         let body = hsla(0x0c0c0f);
+        let glass = LiquidGlass {
+            blur: px(5.),
+            refraction: px(26.),
+            thickness: px(36.),
+            chroma: 0.1,
+            specular: 0.9,
+            light_angle: -0.6,
+            saturation: 0.45,
+            tint: rgba(0xffffff0d).into(),
+        };
 
         div()
             .id("procedural")
@@ -344,6 +354,42 @@ impl Render for Procedural {
                                     ))),
                             ),
                     ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(500.))
+                    .top(px(300.))
+                    .w(px(320.))
+                    .h(px(190.))
+                    .rounded(px(34.))
+                    .liquid_glass(glass)
+                    .p(px(24.))
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Liquid glass"),
+                    )
+                    .child(label("blur, lens rim, prism and highlight")),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(1080.))
+                    .top(px(196.))
+                    .size(px(104.))
+                    .rounded(px(52.))
+                    .liquid_glass(LiquidGlass {
+                        blur: px(0.),
+                        refraction: px(30.),
+                        thickness: px(52.),
+                        ..glass
+                    }),
             )
     }
 }
