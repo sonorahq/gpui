@@ -262,7 +262,8 @@ impl Scene {
             self.effects[index].end = self.effects[index].start;
         }
         self.shadows.sort_by_key(|shadow| shadow.order);
-        self.backdrops.sort_by_key(|backdrop| backdrop.order);
+        self.backdrops
+            .sort_by_key(|backdrop| (backdrop.order, backdrop.blur.to_bits()));
         self.quads.sort_by_key(|quad| quad.order);
         self.shaders
             .sort_by_key(|shader| (shader.order, shader.shader));
@@ -966,12 +967,16 @@ impl<'a> Iterator for BatchIterator<'a> {
                 Some(PrimitiveBatch::Shadows(shadows_start..shadows_end))
             }
             PrimitiveKind::Backdrop => {
+                // A batch is blurred once, so only backdrops that ask for the same blur share one.
+                let blur = self.backdrops_iter.peek().unwrap().blur;
                 let backdrops_start = self.backdrops_start;
                 let mut backdrops_end = backdrops_start + 1;
                 self.backdrops_iter.next();
                 while self
                     .backdrops_iter
-                    .next_if(|backdrop| (backdrop.order, batch_kind) < max_order_and_kind)
+                    .next_if(|backdrop| {
+                        (backdrop.order, batch_kind) < max_order_and_kind && backdrop.blur == blur
+                    })
                     .is_some()
                 {
                     backdrops_end += 1;
@@ -1211,6 +1216,21 @@ pub struct Backdrop {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    /// How far the rim of the glass bends what lies behind it inward, in scaled pixels. Zero
+    /// leaves a plain blur, and so does a zero `thickness`.
+    pub refraction: f32,
+    /// How far in from the edge the bend reaches, in scaled pixels.
+    pub thickness: f32,
+    /// How far the red and blue channels part where the glass bends, as a share of the bend.
+    pub chroma: f32,
+    /// The strength of the highlight along the edge, from 0 to 1.
+    pub specular: f32,
+    /// Where the highlight's light comes from, in radians clockwise from the top.
+    pub light_angle: f32,
+    /// How much more saturated the glass shows what is behind it. Zero leaves it as it is.
+    pub saturation: f32,
+    /// A colour laid over what the glass shows, its alpha saying how strongly.
+    pub tint: Hsla,
 }
 
 impl From<Backdrop> for Primitive {

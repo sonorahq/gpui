@@ -225,7 +225,8 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
 // Backdrops are not drawn on the WebGL path; these keep the module complete.
 fn load_backdrop(instance_id: u32) -> Backdrop {
     let empty = Bounds(vec2<f32>(0.0), vec2<f32>(0.0));
-    return Backdrop(0u, 0.0, 0.0, 0.0, empty, empty, Corners(0.0, 0.0, 0.0, 0.0));
+    let none = Corners(0.0, 0.0, 0.0, 0.0);
+    return Backdrop(0u, 0.0, 0.0, 0.0, empty, empty, none, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Hsla(0.0, 0.0, 0.0, 0.0));
 }
 
 fn load_blur(instance_id: u32) -> Blur {

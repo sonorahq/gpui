@@ -11,19 +11,19 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, Filter, FontId, Global, GlobalElementId, GlyphId,
     GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent,
-    KeyEvent, Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex, Modifiers,
-    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
-    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shader,
-    ShaderInstance, ShaderQuad, Shadow, SharedString, Size, StrikethroughStyle, Style,
-    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    KeyEvent, Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex, LiquidGlass,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shader, ShaderInstance, ShaderQuad, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
+    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4978,8 +4978,7 @@ impl Window {
         result
     }
 
-    /// Paint one or more quads into the scene for the next frame at the current stacking context.
-    /// Blur whatever has already been painted behind the given bounds.
+    /// Blurs whatever has already been painted behind the given bounds.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_backdrop(
@@ -4989,9 +4988,33 @@ impl Window {
         corner_smoothing: f32,
         blur: Pixels,
     ) {
+        self.paint_liquid_glass(
+            bounds,
+            corner_radii,
+            corner_smoothing,
+            LiquidGlass {
+                blur,
+                ..LiquidGlass::default()
+            },
+        );
+    }
+
+    /// Shows whatever has already been painted behind the given bounds through liquid glass:
+    /// blurred, bent inward near the edge, parted into colour where it bends, lit along the
+    /// rim and tinted. Glass that neither blurs nor bends paints nothing.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_liquid_glass(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        glass: LiquidGlass,
+    ) {
         self.invalidator.debug_assert_paint();
 
-        if blur <= Pixels::ZERO {
+        let bends = glass.refraction > Pixels::ZERO && glass.thickness > Pixels::ZERO;
+        if glass.blur <= Pixels::ZERO && !bends {
             return;
         }
 
@@ -4999,11 +5022,18 @@ impl Window {
         self.next_frame.scene.insert_primitive(Backdrop {
             order: 0,
             corner_smoothing,
-            blur: blur.0 * scale_factor,
+            blur: glass.blur.0.max(0.) * scale_factor,
             opacity: self.element_opacity(),
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
             corner_radii: corner_radii.scale(scale_factor),
+            refraction: glass.refraction.0.max(0.) * scale_factor,
+            thickness: glass.thickness.0.max(0.) * scale_factor,
+            chroma: glass.chroma.max(0.),
+            specular: glass.specular.clamp(0., 1.),
+            light_angle: glass.light_angle,
+            saturation: glass.saturation,
+            tint: glass.tint,
         });
     }
 

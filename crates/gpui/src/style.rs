@@ -298,6 +298,10 @@ pub struct Style {
     /// Blur whatever is painted behind this element
     pub backdrop_blur: Option<Pixels>,
 
+    /// Show whatever is painted behind this element through liquid glass. It takes the place of
+    /// `backdrop_blur`, with a blur of its own.
+    pub liquid_glass: Option<LiquidGlass>,
+
     /// Draw this element and its subtree offscreen, and put the result through these effects
     pub filter: LayerFilter,
 
@@ -352,6 +356,31 @@ pub enum Visibility {
     Visible,
     /// The element should not be drawn, but should still take up space in the layout.
     Hidden,
+}
+
+/// Glass that blurs and bends what is painted behind an element. Near the rounded edge it acts
+/// as a lens that pulls the backdrop inward, parts its colours a little and catches a highlight.
+/// Every field at zero is a plain blur of `blur`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct LiquidGlass {
+    /// The standard deviation of the blur behind the glass.
+    pub blur: Pixels,
+    /// How far the edge bends the backdrop inward at its strongest.
+    pub refraction: Pixels,
+    /// How far in from the edge the bend reaches.
+    pub thickness: Pixels,
+    /// How far the red and blue channels part where the glass bends, as a share of the bend.
+    /// Around 0.1 to 0.3 reads as a faint prism.
+    pub chroma: f32,
+    /// The strength of the highlight along the edge, from 0 to 1.
+    pub specular: f32,
+    /// Where the highlight's light comes from, in radians clockwise from the top.
+    pub light_angle: f32,
+    /// How much more saturated the glass shows the backdrop. Zero leaves it as it is and 0.5
+    /// is half as saturated again.
+    pub saturation: f32,
+    /// A colour laid over what the glass shows, its alpha saying how strongly.
+    pub tint: Hsla,
 }
 
 /// The possible values of the box-shadow property
@@ -830,7 +859,9 @@ impl Style {
 
         window.paint_drop_shadows(bounds, corner_radii, smoothing, &self.box_shadow);
 
-        if let Some(blur) = self.backdrop_blur {
+        if let Some(glass) = self.liquid_glass {
+            window.paint_liquid_glass(bounds, corner_radii, smoothing, glass);
+        } else if let Some(blur) = self.backdrop_blur {
             window.paint_backdrop(bounds, corner_radii, smoothing, blur);
         }
 
@@ -938,6 +969,7 @@ impl Default for Style {
             corner_smoothing: 0.,
             box_shadow: Default::default(),
             backdrop_blur: None,
+            liquid_glass: None,
             filter: LayerFilter::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

@@ -509,8 +509,10 @@ mod tests {
 
     #[test]
     fn registering_the_same_source_twice_returns_one_shader() {
-        let first = Shader::new(ShaderSource::new("gradient", GRADIENT)).unwrap();
-        let second = Shader::new(ShaderSource::new("again", GRADIENT)).unwrap();
+        // Other tests register `GRADIENT` too, so this one keeps a source of its own.
+        let source = format!("{GRADIENT}\n// registered twice");
+        let first = Shader::new(ShaderSource::new("gradient", source.clone())).unwrap();
+        let second = Shader::new(ShaderSource::new("again", source)).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.label(), "gradient");
     }

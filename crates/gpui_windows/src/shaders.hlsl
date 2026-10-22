@@ -1341,6 +1341,13 @@ struct Backdrop {
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
+    float refraction;
+    float thickness;
+    float chroma;
+    float specular;
+    float light_angle;
+    float saturation;
+    Hsla tint;
 };
 
 struct BackdropVertexOutput {
@@ -1355,6 +1362,72 @@ struct BackdropFragmentInput {
 };
 
 StructuredBuffer<Backdrop> backdrops: register(t1);
+
+// The direction away from a backdrop's outline at `position`, from the gradient of its distance
+// field, or zero where the gradient vanishes.
+float2 backdrop_normal(Backdrop backdrop, float2 position) {
+    float2 e = float2(0.75, 0.0);
+    float2 gradient = float2(
+        quad_sdf(position + e.xy, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing)
+            - quad_sdf(position - e.xy, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing),
+        quad_sdf(position + e.yx, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing)
+            - quad_sdf(position - e.yx, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing));
+    float length_squared = dot(gradient, gradient);
+    return length_squared > 1e-8 ? gradient * rsqrt(length_squared) : float2(0.0, 0.0);
+}
+
+// What a backdrop shows at `position`, `edge_distance` from its edge: the blurred frame, seen
+// through liquid glass when the backdrop asks for it. Near the edge the glass is a lens that
+// reads the frame further in along the outline's normal, parting red from blue where it bends,
+// and its rim catches a highlight from `light_angle`. The result stays premultiplied.
+float4 liquid_glass(Backdrop backdrop, float2 position, float edge_distance) {
+    float2 viewport = global_viewport_size;
+    bool bends = backdrop.refraction > 0.0 && backdrop.thickness > 0.0;
+    bool shines = backdrop.specular > 0.0;
+    if (!bends && !shines && backdrop.saturation == 0.0 && backdrop.tint.a <= 0.0) {
+        return t_sprite.SampleLevel(s_sprite, position / viewport, 0.0);
+    }
+
+    float depth = max(-edge_distance, 0.0);
+    float2 normal = backdrop_normal(backdrop, position);
+    // The rim of a rounded lens: steepest at the edge and flat where the bend ends.
+    float edge = 1.0 - saturate(depth / max(backdrop.thickness, 1e-3));
+    float bend = bends ? 1.0 - sqrt(max(1.0 - edge * edge, 0.0)) : 0.0;
+    float2 shift = normal * backdrop.refraction * bend;
+
+    float4 color = t_sprite.SampleLevel(s_sprite, (position - shift) / viewport, 0.0);
+    if (backdrop.chroma > 0.0 && bend > 0.0) {
+        float4 red = t_sprite.SampleLevel(s_sprite, (position - shift * (1.0 + backdrop.chroma)) / viewport, 0.0);
+        float4 blue = t_sprite.SampleLevel(s_sprite, (position - shift * max(1.0 - backdrop.chroma, 0.0)) / viewport, 0.0);
+        color = float4(red.r, color.g, blue.b, color.a);
+        color.rgb = min(color.rgb, color.aaa);
+    }
+
+    if (backdrop.saturation != 0.0) {
+        float luma = dot(color.rgb, GRAYSCALE_FACTORS);
+        float3 saturated = lerp(float3(luma, luma, luma), color.rgb, 1.0 + backdrop.saturation);
+        color.rgb = clamp(saturated, float3(0.0, 0.0, 0.0), color.aaa);
+    }
+
+    if (backdrop.tint.a > 0.0) {
+        float4 tint = hsla_to_rgba(backdrop.tint);
+        color = float4(tint.rgb * tint.a, tint.a) + color * (1.0 - tint.a);
+    }
+
+    if (shines) {
+        // A fine line along the rim, brightest where the edge faces the light and fainter on the
+        // edge across from it, over a broad glow where the lens bends.
+        float2 light = float2(sin(backdrop.light_angle), -cos(backdrop.light_angle));
+        float facing = dot(normal, light);
+        float toward = pow(max(facing, 0.0), 2.0) + 0.45 * pow(max(-facing, 0.0), 2.0);
+        float rim = exp(-depth / 1.25) + 0.35 * exp(-depth / 5.0);
+        float glow = 0.2 * bend * (0.6 + 0.4 * facing);
+        float highlight = backdrop.specular * saturate(rim * toward + glow);
+        color = float4(highlight, highlight, highlight, highlight) + color * (1.0 - highlight);
+    }
+
+    return color;
+}
 
 BackdropVertexOutput backdrop_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
@@ -1377,9 +1450,9 @@ BackdropVertexOutput backdrop_vertex(uint vertex_id: SV_VertexID, uint instance_
 float4 backdrop_fragment(BackdropFragmentInput input): SV_Target {
     Backdrop backdrop = backdrops[input.backdrop_id];
     float2 position = input.position.xy;
-    float4 sampled = t_sprite.Sample(s_sprite, position / global_viewport_size);
     float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
     float coverage = saturate(0.5 - distance);
+    float4 sampled = liquid_glass(backdrop, position, distance);
 
     return sampled * coverage * backdrop.opacity;
 }

@@ -606,6 +606,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Shows whatever is painted behind this element through liquid glass, which blurs it and
+    /// bends it near the edge. It takes the place of [`Self::backdrop_blur`].
+    fn liquid_glass(mut self, glass: crate::LiquidGlass) -> Self {
+        self.style().liquid_glass = Some(glass);
+        self
+    }
+
     /// Sets the font weight of this element
     ///
     /// This value cascades to its child elements.

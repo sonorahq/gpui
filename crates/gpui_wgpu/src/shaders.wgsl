@@ -1412,6 +1412,13 @@ struct Backdrop {
     bounds: Bounds,
     content_mask: Bounds,
     corner_radii: Corners,
+    refraction: f32,
+    thickness: f32,
+    chroma: f32,
+    specular: f32,
+    light_angle: f32,
+    saturation: f32,
+    tint: Hsla,
 }
 
 struct BackdropVarying {
@@ -1449,11 +1456,78 @@ fn fs_backdrop(input: BackdropVarying) -> @location(0) vec4<f32> {
 
     let backdrop = load_backdrop(input.backdrop_id);
     let position = input.position.xy;
-    let sampled = textureSample(t_sprite, s_sprite, position / globals.viewport_size);
     let distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
     let coverage = saturate(0.5 - distance);
+    let sampled = liquid_glass(backdrop, position, distance);
 
     return sampled * coverage * backdrop.opacity;
+}
+
+// The direction away from a backdrop's outline at `position`, from the gradient of its distance
+// field, or zero where the gradient vanishes.
+fn backdrop_normal(backdrop: Backdrop, position: vec2<f32>) -> vec2<f32> {
+    let e = vec2<f32>(0.75, 0.0);
+    let gradient = vec2<f32>(
+        quad_sdf(position + e.xy, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing)
+            - quad_sdf(position - e.xy, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing),
+        quad_sdf(position + e.yx, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing)
+            - quad_sdf(position - e.yx, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing),
+    );
+    let length_squared = dot(gradient, gradient);
+    return select(vec2<f32>(0.0), gradient * inverseSqrt(length_squared), length_squared > 1e-8);
+}
+
+// What a backdrop shows at `position`, `distance` from its edge: the blurred frame, seen through
+// liquid glass when the backdrop asks for it. Near the edge the glass is a lens that reads the
+// frame further in along the outline's normal, parting red from blue where it bends, and its
+// rim catches a highlight from `light_angle`. The result stays premultiplied.
+fn liquid_glass(backdrop: Backdrop, position: vec2<f32>, distance: f32) -> vec4<f32> {
+    let viewport = globals.viewport_size;
+    let bends = backdrop.refraction > 0.0 && backdrop.thickness > 0.0;
+    let lit = backdrop.specular > 0.0;
+    if !bends && !lit && backdrop.saturation == 0.0 && backdrop.tint.a <= 0.0 {
+        return textureSampleLevel(t_sprite, s_sprite, position / viewport, 0.0);
+    }
+
+    let depth = max(-distance, 0.0);
+    let normal = backdrop_normal(backdrop, position);
+    // The rim of a rounded lens: steepest at the edge and flat where the bend ends.
+    let edge = 1.0 - saturate(depth / max(backdrop.thickness, 1e-3));
+    let bend = select(0.0, 1.0 - sqrt(max(1.0 - edge * edge, 0.0)), bends);
+    let shift = normal * backdrop.refraction * bend;
+
+    var color = textureSampleLevel(t_sprite, s_sprite, (position - shift) / viewport, 0.0);
+    if backdrop.chroma > 0.0 && bend > 0.0 {
+        let red = textureSampleLevel(t_sprite, s_sprite, (position - shift * (1.0 + backdrop.chroma)) / viewport, 0.0);
+        let blue = textureSampleLevel(t_sprite, s_sprite, (position - shift * max(1.0 - backdrop.chroma, 0.0)) / viewport, 0.0);
+        color = vec4<f32>(red.r, color.g, blue.b, color.a);
+        color = vec4<f32>(min(color.rgb, vec3<f32>(color.a)), color.a);
+    }
+
+    if backdrop.saturation != 0.0 {
+        let luma = dot(color.rgb, GRAYSCALE_FACTORS);
+        let saturated = mix(vec3<f32>(luma), color.rgb, 1.0 + backdrop.saturation);
+        color = vec4<f32>(clamp(saturated, vec3<f32>(0.0), vec3<f32>(color.a)), color.a);
+    }
+
+    if backdrop.tint.a > 0.0 {
+        let tint = hsla_to_rgba(backdrop.tint);
+        color = vec4<f32>(tint.rgb * tint.a, tint.a) + color * (1.0 - tint.a);
+    }
+
+    if lit {
+        // A fine line along the rim, brightest where the edge faces the light and fainter on the
+        // edge across from it, over a broad glow where the lens bends.
+        let light = vec2<f32>(sin(backdrop.light_angle), -cos(backdrop.light_angle));
+        let facing = dot(normal, light);
+        let toward = pow(max(facing, 0.0), 2.0) + 0.45 * pow(max(-facing, 0.0), 2.0);
+        let rim = exp(-depth / 1.25) + 0.35 * exp(-depth / 5.0);
+        let glow = 0.2 * bend * (0.6 + 0.4 * facing);
+        let highlight = backdrop.specular * saturate(rim * toward + glow);
+        color = vec4<f32>(highlight) + color * (1.0 - highlight);
+    }
+
+    return color;
 }
 
 /// The hole the blurred copy lands in: alpha alone, blended so the destination keeps `1 - k`
