@@ -82,6 +82,9 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+/// How many display ticks in a row may ask for nothing before the window stops taking them,
+/// until something asks for a frame again.
+const IDLE_TICKS_BEFORE_STOP: u8 = 4;
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 
@@ -667,6 +670,10 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
+    /// Whether anything asked for a frame since the last display tick.
+    frame_wanted: bool,
+    /// Display ticks in a row that nothing asked for.
+    idle_ticks: u8,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -855,6 +862,30 @@ impl MacWindowState {
         frame_source.start(display_id).log_err();
         let waker = frame_source.waker();
         self.renderer.set_frame_waker(move || waker.wake());
+    }
+
+    /// Notes that something wants a frame, taking display ticks again if they had stopped.
+    fn want_frame(&mut self) {
+        self.frame_wanted = true;
+        self.idle_ticks = 0;
+        if !self
+            .frame_source
+            .as_ref()
+            .is_some_and(WindowFrameSource::is_running)
+        {
+            self.start_display_link();
+        }
+    }
+
+    /// Counts a display tick that nothing asked for, and stops taking them after a few.
+    fn tick_done(&mut self) {
+        if std::mem::take(&mut self.frame_wanted) {
+            return;
+        }
+        self.idle_ticks = self.idle_ticks.saturating_add(1);
+        if self.idle_ticks >= IDLE_TICKS_BEFORE_STOP {
+            self.stop_display_link();
+        }
     }
 
     fn stop_display_link(&mut self) {
@@ -1111,6 +1142,8 @@ impl MacWindow {
                     false,
                     use_display_p3,
                 ),
+                frame_wanted: false,
+                idle_ticks: 0,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -2128,6 +2161,15 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+    }
+
+    fn schedule_frame(&self) {
+        self.0.lock().want_frame();
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let state = self.0.clone();
+        Some(Rc::new(move || state.lock().want_frame()))
     }
 
     fn can_release_idle_gpu_memory(&self) -> bool {
@@ -3376,7 +3418,9 @@ extern "C" fn step(view: *mut c_void) {
             signal_source,
             ..Default::default()
         });
-        window_state.lock().request_frame_callback = Some(callback);
+        let mut lock = window_state.lock();
+        lock.request_frame_callback = Some(callback);
+        lock.tick_done();
     }
 }
 
