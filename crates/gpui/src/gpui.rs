@@ -56,6 +56,7 @@ pub mod randomized_element_tree;
 mod scene;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod seeds;
+mod shader;
 mod shared_uri;
 mod spring;
 mod style;
@@ -202,6 +203,7 @@ pub use profiler::*;
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
+pub use shader::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;

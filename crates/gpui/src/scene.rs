@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -47,6 +47,7 @@ pub struct Scene {
     pub effects: Vec<LayerEffect>,
     effect_stack: Vec<usize>,
     pub quads: Vec<Quad>,
+    pub shaders: Vec<ShaderQuad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
@@ -67,6 +68,7 @@ impl Scene {
         self.effects.clear();
         self.effect_stack.clear();
         self.quads.clear();
+        self.shaders.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
@@ -138,6 +140,7 @@ impl Scene {
             PrimitiveBatch::Shadows(range) => self.shadows[range.start].order,
             PrimitiveBatch::Backdrops(range) => self.backdrops[range.start].order,
             PrimitiveBatch::Quads(range) => self.quads[range.start].order,
+            PrimitiveBatch::Shaders { range, .. } => self.shaders[range.start].order,
             PrimitiveBatch::Paths(range) => self.paths[range.start].order,
             PrimitiveBatch::Underlines(range) => self.underlines[range.start].order,
             PrimitiveBatch::MonochromeSprites { range, .. } => {
@@ -204,6 +207,10 @@ impl Scene {
                 quad.order = order;
                 self.quads.push(*quad);
             }
+            Primitive::Shader(shader) => {
+                shader.order = order;
+                self.shaders.push(*shader);
+            }
             Primitive::Path(path) => {
                 path.order = order;
                 path.id = PathId(self.paths.len());
@@ -257,6 +264,8 @@ impl Scene {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.backdrops.sort_by_key(|backdrop| backdrop.order);
         self.quads.sort_by_key(|quad| quad.order);
+        self.shaders
+            .sort_by_key(|shader| (shader.order, shader.shader));
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -295,6 +304,8 @@ impl Scene {
             backdrops_iter: self.backdrops.iter().peekable(),
             quads_start: 0,
             quads_iter: self.quads.iter().peekable(),
+            shaders_start: 0,
+            shaders_iter: self.shaders.iter().peekable(),
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
             underlines_start: 0,
@@ -324,6 +335,7 @@ pub(crate) enum PrimitiveKind {
     Backdrop,
     #[default]
     Quad,
+    Shader,
     Path,
     Underline,
     MonochromeSprite,
@@ -806,6 +818,7 @@ pub enum Primitive {
     Shadow(Shadow),
     Backdrop(Backdrop),
     Quad(Quad),
+    Shader(ShaderQuad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
@@ -821,6 +834,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Backdrop(backdrop) => &backdrop.bounds,
             Primitive::Quad(quad) => &quad.bounds,
+            Primitive::Shader(shader) => &shader.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
@@ -835,6 +849,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Backdrop(backdrop) => &backdrop.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
+            Primitive::Shader(shader) => &shader.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
@@ -861,6 +876,8 @@ struct BatchIterator<'a> {
     backdrops_iter: Peekable<slice::Iter<'a, Backdrop>>,
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
+    shaders_start: usize,
+    shaders_iter: Peekable<slice::Iter<'a, ShaderQuad>>,
     paths_start: usize,
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
     underlines_start: usize,
@@ -889,6 +906,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::Backdrop,
             ),
             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
+            (
+                self.shaders_iter.peek().map(|s| s.order),
+                PrimitiveKind::Shader,
+            ),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
             (
                 self.underlines_iter.peek().map(|u| u.order),
@@ -971,6 +992,27 @@ impl<'a> Iterator for BatchIterator<'a> {
                 }
                 self.quads_start = quads_end;
                 Some(PrimitiveBatch::Quads(quads_start..quads_end))
+            }
+            PrimitiveKind::Shader => {
+                let shader = self.shaders_iter.peek().unwrap().shader;
+                let shaders_start = self.shaders_start;
+                let mut shaders_end = shaders_start + 1;
+                self.shaders_iter.next();
+                while self
+                    .shaders_iter
+                    .next_if(|instance| {
+                        (instance.order, batch_kind) < max_order_and_kind
+                            && instance.shader == shader
+                    })
+                    .is_some()
+                {
+                    shaders_end += 1;
+                }
+                self.shaders_start = shaders_end;
+                Some(PrimitiveBatch::Shaders {
+                    shader,
+                    range: shaders_start..shaders_end,
+                })
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -1094,6 +1136,11 @@ pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Backdrops(Range<usize>),
     Quads(Range<usize>),
+    /// Instances of one custom shader.
+    Shaders {
+        shader: ShaderId,
+        range: Range<usize>,
+    },
     Paths(Range<usize>),
     Underlines(Range<usize>),
     MonochromeSprites {
@@ -1119,6 +1166,9 @@ impl PrimitiveBatch {
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Backdrops(range) => format!("backdrops ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
+            Self::Shaders { shader, range } => {
+                format!("shader {} ({})", shader.0, range.len())
+            }
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
             Self::MonochromeSprites { texture_id, range } => {
@@ -1189,6 +1239,41 @@ pub struct Quad {
 impl From<Quad> for Primitive {
     fn from(quad: Quad) -> Self {
         Primitive::Quad(quad)
+    }
+}
+
+/// One instance of a custom shader, drawn over a rounded rectangle. Its layout is the
+/// `GpuiShaderInstance` struct of the shader prelude, so the renderers upload it as is.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct ShaderQuad {
+    /// Where the instance falls among the frame's primitives.
+    pub order: DrawOrder,
+    /// The shader that colours it.
+    pub shader: ShaderId,
+    /// The element opacity it is faded by.
+    pub opacity: f32,
+    /// The time the app painted it with, in seconds.
+    pub time: f32,
+    /// Its bounds in device pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The area it is clipped to.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The radii of its corners in device pixels.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Device pixels per logical pixel.
+    pub scale_factor: f32,
+    /// Keeps `params` on the 16 byte boundary the shader reads it at.
+    pub pad: [u32; 3],
+    /// The parameters the app painted it with.
+    pub params: [f32; crate::SHADER_PARAM_COUNT],
+    /// The colours the app painted it with, as straight alpha sRGB.
+    pub colors: [[f32; 4]; crate::SHADER_COLOR_COUNT],
+}
+
+impl From<ShaderQuad> for Primitive {
+    fn from(shader: ShaderQuad) -> Self {
+        Primitive::Shader(shader)
     }
 }
 

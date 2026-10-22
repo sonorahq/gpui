@@ -1076,6 +1076,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Quads(range) => {
                     self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
                 }
+                PrimitiveBatch::Shaders { .. } => {}
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     // The texture the frame is drawing into right now: the innermost open

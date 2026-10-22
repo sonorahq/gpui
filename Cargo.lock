@@ -2487,6 +2487,7 @@ dependencies = [
  "libc",
  "log",
  "lyon",
+ "naga",
  "num_cpus",
  "objc2 0.6.4",
  "objc2-core-foundation",
