@@ -97,17 +97,32 @@ fn hash_u32(x: u32) -> u32 {
     return (h >> 22u) ^ h;
 }
 
+/// A well mixed 32 bit hash of a lattice cell.
+fn hash2d_u32(cell: vec2<i32>) -> u32 {
+    return hash_u32(bitcast<u32>(cell.x) + bitcast<u32>(cell.y) * 0x9e3779b9u);
+}
+
 /// A uniform value in [0, 1) for a lattice cell.
 fn hash2d(cell: vec2<i32>) -> f32 {
-    let h = hash_u32(bitcast<u32>(cell.x) ^ hash_u32(bitcast<u32>(cell.y) + 0x9e3779b9u));
+    let h = hash2d_u32(cell);
     return f32(h >> 8u) / 16777216.0;
 }
 
 /// Two uniform values in [0, 1) for a lattice cell.
 fn hash2d_vec(cell: vec2<i32>) -> vec2<f32> {
-    let h = hash_u32(bitcast<u32>(cell.x) ^ hash_u32(bitcast<u32>(cell.y) + 0x9e3779b9u));
+    let h = hash2d_u32(cell);
     let g = hash_u32(h + 0x632be5abu);
     return vec2<f32>(f32(h >> 8u), f32(g >> 8u)) / 16777216.0;
+}
+
+// A value in [0, 1) for a lattice cell from float arithmetic alone, which GPUs run several
+// times faster than the 32 bit integer multiplies of `hash_u32`. Two rounds of scaling by
+// irrational constants and keeping the fraction scatter neighbouring cells well enough for
+// smooth noise.
+fn gpui_cell_hash(cell: vec2<i32>) -> f32 {
+    var p = fract(vec2<f32>(cell) * vec2<f32>(0.1618034, 0.2718282));
+    p += dot(p, p.yx + vec2<f32>(41.31, 17.47));
+    return fract(p.x * p.y * 95.4307);
 }
 
 fn gpui_quintic(t: vec2<f32>) -> vec2<f32> {
@@ -118,16 +133,22 @@ fn gpui_quintic(t: vec2<f32>) -> vec2<f32> {
 fn value_noise(p: vec2<f32>) -> f32 {
     let cell = vec2<i32>(floor(p));
     let f = gpui_quintic(fract(p));
-    let a = hash2d(cell);
-    let b = hash2d(cell + vec2<i32>(1, 0));
-    let c = hash2d(cell + vec2<i32>(0, 1));
-    let d = hash2d(cell + vec2<i32>(1, 1));
+    let a = gpui_cell_hash(cell);
+    let b = gpui_cell_hash(cell + vec2<i32>(1, 0));
+    let c = gpui_cell_hash(cell + vec2<i32>(0, 1));
+    let d = gpui_cell_hash(cell + vec2<i32>(1, 1));
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
+// One of eight unit gradients for a lattice cell, picked by its hash, which avoids the cost of
+// turning a random angle into a direction.
 fn gpui_gradient(cell: vec2<i32>, offset: vec2<f32>) -> f32 {
-    let angle = hash2d(cell) * 6.2831853;
-    return dot(vec2<f32>(cos(angle), sin(angle)), offset);
+    let h = u32(gpui_cell_hash(cell) * 16.0);
+    let x = select(-1.0, 1.0, (h & 1u) != 0u);
+    let y = select(-1.0, 1.0, (h & 2u) != 0u);
+    let axis = select(vec2<f32>(x, 0.0), vec2<f32>(0.0, y), (h & 8u) != 0u);
+    let gradient = select(axis, vec2<f32>(x, y) * 0.70710678, (h & 4u) != 0u);
+    return dot(gradient, offset);
 }
 
 /// Smooth gradient noise, roughly in [-1, 1], with features about one unit apart.
