@@ -4,8 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, BlurPasses, Bounds, DevicePixels, GAUSSIAN_REACH, GpuSpecs,
-    KAWASE_LEVELS, Kawase, LayerEffect, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size,
-    get_gamma_correction_ratios,
+    KAWASE_LEVELS, Kawase, LayerEffect, Path, Point, PrimitiveBatch, ScaledPixels, Scene, ShaderId,
+    Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -56,6 +56,9 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_storage.wgsl"),
     include_str!("shaders_subpixel.wgsl"),
 );
+
+/// How custom shaders read their instances on WebGL2, in place of the storage buffer transport.
+const CUSTOM_SHADER_WEBGL_TRANSPORT: &str = include_str!("custom_shader_webgl.wgsl");
 
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
@@ -160,6 +163,11 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    /// The colour target custom shader pipelines are created against, the same as quads draw to.
+    custom_target: wgpu::ColorTargetState,
+    /// A pipeline per custom shader, created the first time a frame draws it. A shader that
+    /// failed to compile is kept as `None`, so it is not compiled again every frame.
+    custom: FxHashMap<ShaderId, Option<wgpu::RenderPipeline>>,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -176,6 +184,7 @@ struct InstanceBinding {
 struct InstanceBindings {
     backdrops: InstanceBinding,
     quads: InstanceBinding,
+    shaders: InstanceBinding,
     shadows: InstanceBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
@@ -1295,7 +1304,7 @@ impl WgpuRendererCore {
             &layouts.surfaces,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
+            &[Some(color_target.clone())],
             1,
             &shader_module,
         );
@@ -1320,6 +1329,8 @@ impl WgpuRendererCore {
             subpixel_sprites_layered,
             poly_sprites,
             surfaces,
+            custom_target: color_target,
+            custom: FxHashMap::default(),
         }
     }
 
@@ -2353,6 +2364,16 @@ impl WgpuRendererCore {
                         instance_range(range),
                         &mut pass,
                     ),
+                    PrimitiveBatch::Shaders { shader, range } => {
+                        if let Some(pipeline) = self.custom_pipeline(shader) {
+                            self.draw_instances(
+                                &instance_bindings.shaders,
+                                &pipeline,
+                                instance_range(range),
+                                &mut pass,
+                            );
+                        }
+                    }
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,
@@ -2606,6 +2627,11 @@ impl WgpuRendererCore {
                 instance_offset,
                 &scene.quads,
             )?,
+            shaders: self.write_instance_binding(
+                "shaders_bind_group",
+                instance_offset,
+                &scene.shaders,
+            )?,
             shadows: self.write_instance_binding(
                 "shadows_bind_group",
                 instance_offset,
@@ -2721,6 +2747,83 @@ impl WgpuRendererCore {
             0..4,
             instances.first_instance + range.start..instances.first_instance + range.end,
         );
+    }
+
+    /// The pipeline of a custom shader, compiled the first time a frame draws it. `None` means
+    /// it failed to compile, which is logged once and leaves its instances undrawn.
+    fn custom_pipeline(&mut self, shader: ShaderId) -> Option<wgpu::RenderPipeline> {
+        if let Some(pipeline) = self.resources.pipelines.custom.get(&shader) {
+            return pipeline.clone();
+        }
+        let pipeline = self.create_custom_pipeline(shader);
+        self.resources
+            .pipelines
+            .custom
+            .insert(shader, pipeline.clone());
+        pipeline
+    }
+
+    fn create_custom_pipeline(&self, shader: ShaderId) -> Option<wgpu::RenderPipeline> {
+        let Some(program) = gpui::shader_program(shader) else {
+            log::error!("custom shader {} was never registered", shader.0);
+            return None;
+        };
+        let transport = match self.uses_webgl_instance_data {
+            true => CUSTOM_SHADER_WEBGL_TRANSPORT,
+            false => gpui::SHADER_STORAGE_TRANSPORT,
+        };
+        let resources = self.resources();
+        let device = &resources.device;
+
+        // The source was validated when it was registered, by the naga wgpu runs, so this
+        // only catches what the device itself rejects.
+        #[cfg(not(target_family = "wasm"))]
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&program.label),
+            source: wgpu::ShaderSource::Wgsl(program.compose(transport).into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&program.label),
+            bind_group_layouts: &[
+                Some(&resources.bind_group_layouts.globals),
+                Some(&resources.bind_group_layouts.instances),
+            ],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&program.label),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some(gpui::SHADER_VERTEX_ENTRY),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some(gpui::SHADER_FRAGMENT_ENTRY),
+                targets: &[Some(resources.pipelines.custom_target.clone())],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(error) = gpui::block_on(scope.pop()) {
+            log::error!(
+                "custom shader `{}` failed to compile: {error}",
+                program.label
+            );
+            return None;
+        }
+        Some(pipeline)
     }
 
     fn draw_sprites(
@@ -3775,6 +3878,56 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn headless_renderer_draws_custom_shaders_between_quads() -> anyhow::Result<()> {
+        let shader = gpui::Shader::new(gpui::ShaderSource::new(
+            "flat",
+            "fn shade(input: ShaderInput) -> vec4<f32> { return input.colors[1]; }",
+        ))?;
+        let bounds = Bounds {
+            origin: Point {
+                x: 0.0.into(),
+                y: 0.0.into(),
+            },
+            size: Size {
+                width: 32.0.into(),
+                height: 32.0.into(),
+            },
+        };
+        let instance = |shader: gpui::ShaderId| gpui::ShaderQuad {
+            order: 0,
+            shader,
+            opacity: 1.0,
+            time: 0.0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::all(16.0.into()),
+            scale_factor: 1.0,
+            pad: [0; 3],
+            params: [0.0; 16],
+            colors: [[0.0; 4], [0.0, 0.0, 1.0, 1.0], [0.0; 4], [0.0; 4]],
+        };
+
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0.0, 0.0, 64.0, 32.0, gpui::red()));
+        scene.insert_primitive(instance(shader.id()));
+        scene.insert_primitive(solid_quad(24.0, 0.0, 40.0, 32.0, gpui::red()));
+        let mut unknown = instance(gpui::ShaderId(u32::MAX));
+        unknown.bounds.origin.x = 40.0.into();
+        unknown.content_mask.bounds.origin.x = 40.0.into();
+        scene.insert_primitive(unknown);
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 32))?;
+        assert_pixel(&image, 12, 16, BLUE);
+        assert_pixel(&image, 1, 1, RED);
+        assert_pixel(&image, 28, 16, RED);
+        assert_pixel(&image, 56, 16, RED);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn headless_renderer_captures_each_requested_size() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
         let mut scene = Scene::default();
@@ -3861,6 +4014,18 @@ mod tests {
     #[test]
     fn storage_buffer_shader_is_valid_wgsl() {
         validate_wgsl(STORAGE_BUFFER_SHADERS, naga::valid::Capabilities::empty());
+    }
+
+    #[test]
+    fn custom_shader_webgl_transport_is_valid_wgsl() {
+        let source = format!(
+            "{}\n{}\nfn shade(input: ShaderInput) -> vec4<f32> {{ return input.colors[0]; }}",
+            gpui::SHADER_PRELUDE,
+            CUSTOM_SHADER_WEBGL_TRANSPORT,
+        );
+        assert!(!source.contains("var<storage"));
+        validate_wgsl(&source, naga::valid::Capabilities::empty());
+        assert_eq!(std::mem::size_of::<gpui::ShaderQuad>(), 13 * 16);
     }
 
     #[test]
