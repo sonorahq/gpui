@@ -51,4 +51,4 @@ the GPU-accelerated UI framework behind Zed. Everything below works on wgpu, Met
 
 ## Licence
 
-Apache-2.0, inherited from Zed. See `LICENSE-APACHE`.
+Apache-2.0, inherited from Zed. See `LICENSE` and `NOTICE`.
