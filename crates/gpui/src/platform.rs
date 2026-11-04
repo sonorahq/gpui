@@ -551,6 +551,12 @@ pub trait Platform: 'static {
     fn compositor_name(&self) -> &'static str {
         ""
     }
+
+    /// Whether gpui coasts touchpad scrolls on after the fingers lift, because the platform says
+    /// when they lift but sends no momentum of its own, as on Wayland.
+    fn coasts_scrolls(&self) -> bool {
+        false
+    }
     /// The environment of the display server a platform that can switch windowing modes is
     /// connected to. See [`App::graphical_environment`].
     fn graphical_environment(&self) -> Option<GraphicalEnvironment> {

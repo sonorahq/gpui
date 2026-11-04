@@ -26,7 +26,7 @@ use crate::{
     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
-use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+use crate::gestures::{GestureTuning, RecognizedTouchGesture, ScrollCoast, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
 
 /// A gaussian is cut off after three standard deviations.
@@ -1307,6 +1307,8 @@ pub struct Window {
     pub(crate) window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
+    /// Touchpad momentum, on a platform that leaves it to gpui.
+    scroll_coast: Option<ScrollCoast>,
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
@@ -1682,6 +1684,10 @@ impl Window {
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let gesture_tuning = cx
+            .platform
+            .gestures()
+            .map_or_else(GestureTuning::default, |gestures| gestures.tuning());
         let last_frame_time = Rc::new(Cell::new(None));
 
         platform_window
@@ -2230,11 +2236,8 @@ impl Window {
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
-            touch_gestures: TouchGestureRecognizer::new(
-                cx.platform
-                    .gestures()
-                    .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
-            ),
+            touch_gestures: TouchGestureRecognizer::new(gesture_tuning),
+            scroll_coast: cx.platform.coasts_scrolls().then(ScrollCoast::new),
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
@@ -6026,6 +6029,9 @@ impl Window {
             PlatformInput::MouseDown(mouse_down) => {
                 self.mouse_position = mouse_down.position;
                 self.modifiers = mouse_down.modifiers;
+                if let Some(coast) = self.scroll_coast.as_mut() {
+                    coast.stop();
+                }
                 PlatformInput::MouseDown(mouse_down)
             }
             PlatformInput::MouseUp(mouse_up) => {
@@ -6048,6 +6054,9 @@ impl Window {
             PlatformInput::ScrollWheel(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
                 self.modifiers = scroll_wheel.modifiers;
+                if let Some(coast) = self.scroll_coast.as_mut() {
+                    coast.observe(&scroll_wheel);
+                }
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
             PlatformInput::Pinch(pinch) => {
@@ -6133,6 +6142,13 @@ impl Window {
         } else if let Some(touch_event) = event.touch_event() {
             self.dispatch_touch_event(touch_event, cx);
         }
+        if self
+            .scroll_coast
+            .as_ref()
+            .is_some_and(ScrollCoast::has_momentum)
+        {
+            self.schedule_scroll_coast_tick();
+        }
         if let PlatformInput::LongPress(long_press) = &event {
             match long_press.phase {
                 crate::TouchPhase::Started if !self.default_prevented => {
@@ -6189,6 +6205,15 @@ impl Window {
             && cx.hand_active_drag_to_platform(self.handle.window_id())
         {
             self.refresh();
+        }
+    }
+
+    /// Stops a touchpad scroll coasting on after the fingers lifted, for a listener that has
+    /// already acted on the gesture, such as one that turned the page, so the momentum does not
+    /// carry on into whatever is shown next.
+    pub fn stop_scroll_coast(&mut self) {
+        if let Some(coast) = self.scroll_coast.as_mut() {
+            coast.stop();
         }
     }
 
@@ -6316,6 +6341,36 @@ impl Window {
             })
             .log_err();
         }));
+    }
+
+    /// Queues the next step of a touchpad coast, unless one is queued already. The step is
+    /// dispatched where the pointer is, which on a touchpad has not moved since the scroll.
+    fn schedule_scroll_coast_tick(&mut self) {
+        let Some(coast) = self.scroll_coast.as_mut() else {
+            return;
+        };
+        if coast.ticking {
+            return;
+        }
+        coast.ticking = true;
+        self.on_next_frame(|window, cx| {
+            let position = window.mouse_position;
+            let Some(coast) = window.scroll_coast.as_mut() else {
+                return;
+            };
+            coast.ticking = false;
+            if let Some(step) = coast.tick(position) {
+                cx.propagate_event = true;
+                window.dispatch_mouse_event(&step, cx);
+            }
+            if window
+                .scroll_coast
+                .as_ref()
+                .is_some_and(ScrollCoast::has_momentum)
+            {
+                window.schedule_scroll_coast_tick();
+            }
+        });
     }
 
     fn schedule_touch_momentum_tick(&mut self) {
