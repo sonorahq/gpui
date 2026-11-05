@@ -1392,12 +1392,18 @@ impl MetalRenderer {
             DevicePixels(target.width() as i32),
             DevicePixels(target.height() as i32),
         );
-        let encoder = new_command_encoder_for_texture(
-            command_buffer,
-            target,
-            size,
-            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
-        );
+        // A scissored pass leaves the rest of its target alone, and the passes after it read only
+        // what the passes before them wrote. Clearing the whole target first is a full write of a
+        // window-sized texture, which on a tiled GPU costs more than a narrow blur itself.
+        let encoder = match within {
+            Some(_) => new_discarding_command_encoder(command_buffer, target, size),
+            None => new_command_encoder_for_texture(
+                command_buffer,
+                target,
+                size,
+                Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+            ),
+        };
         encoder.set_render_pipeline_state(pipeline);
         encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(source));
         if let Some(params) = params {
@@ -2193,6 +2199,34 @@ fn filters_enabled() -> bool {
 
 /// Starts a render pass into `texture`. The pass descriptor retains the texture, so it may be a
 /// temporary the caller drops before the encoder ends.
+/// An encoder on `texture` that keeps nothing it held, for a pass that writes everything it later
+/// reads.
+fn new_discarding_command_encoder<'a>(
+    command_buffer: &'a metal::CommandBufferRef,
+    texture: &metal::TextureRef,
+    viewport_size: Size<DevicePixels>,
+) -> &'a metal::RenderCommandEncoderRef {
+    let render_pass_descriptor = metal::RenderPassDescriptor::new();
+    let color_attachment = render_pass_descriptor
+        .color_attachments()
+        .object_at(0)
+        .unwrap();
+    color_attachment.set_texture(Some(texture));
+    color_attachment.set_load_action(metal::MTLLoadAction::DontCare);
+    color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+    let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+    command_encoder.set_viewport(metal::MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: i32::from(viewport_size.width) as f64,
+        height: i32::from(viewport_size.height) as f64,
+        znear: 0.0,
+        zfar: 1.0,
+    });
+    command_encoder
+}
+
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &metal::TextureRef,
