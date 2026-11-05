@@ -849,10 +849,12 @@ impl MacWindowState {
             return;
         };
         let data = self.native_view.as_ptr() as *mut c_void;
-        self.frame_source
-            .get_or_insert_with(|| WindowFrameSource::new(data, step))
-            .start(display_id)
-            .log_err();
+        let frame_source = self
+            .frame_source
+            .get_or_insert_with(|| WindowFrameSource::new(data, step));
+        frame_source.start(display_id).log_err();
+        let waker = frame_source.waker();
+        self.renderer.set_frame_waker(move || waker.wake());
     }
 
     fn stop_display_link(&mut self) {
@@ -3353,6 +3355,11 @@ extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    // A frame still on the GPU means this tick would only queue behind it. The next tick asks
+    // again, and the window stays dirty until then.
+    if lock.renderer.gpu_behind() {
+        return;
+    }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         let (signal_at, signal_source) = lock

@@ -33,7 +33,10 @@ use std::{
     mem::MaybeUninit,
     ops::Range,
     ptr, slice,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -59,6 +62,9 @@ const INSTANCE_BUFFER_SETTLE: Duration = Duration::from_secs(5);
 const IDLE_RELEASE: Duration = Duration::from_secs(2);
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
+/// How long a frame may stay on the GPU before the window draws again without waiting for it, so a
+/// completion that never arrives cannot freeze the window.
+const FRAME_STALL: Duration = Duration::from_millis(250);
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -193,12 +199,41 @@ pub struct MetalRenderer {
     path_targets: Option<PathTargets>,
     path_sample_count: u32,
     filter_targets: FilterTargets,
+    /// Frames `draw` has committed that the GPU has not finished yet, and what wakes the window
+    /// once they are done.
+    frame_pacing: Arc<FramePacing>,
+    /// When `draw` last committed a frame.
+    committed_at: Instant,
     /// When the frame being encoded started, which stamps every offscreen target it touches.
     frame_time: Instant,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// Frames on the GPU and the window's request for one more. The window skips a display tick
+/// while a frame is still running, and the frame that finishes asks for the one it held back.
+#[derive(Default)]
+struct FramePacing {
+    in_flight: AtomicUsize,
+    waiting: AtomicBool,
+    wake: Mutex<Option<FrameWaker>>,
+}
+
+/// Asks the window for a frame from a Metal completion thread.
+type FrameWaker = Box<dyn Fn() + Send + Sync>;
+
+impl FramePacing {
+    /// Counts a frame off the GPU and asks for the frame a skipped display tick held back.
+    fn frame_done(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if self.waiting.swap(false, Ordering::SeqCst)
+            && let Some(wake) = self.wake.lock().as_ref()
+        {
+            wake();
+        }
+    }
 }
 
 #[repr(C)]
@@ -580,6 +615,8 @@ impl MetalRenderer {
             path_targets: None,
             path_sample_count: PATH_SAMPLE_COUNT,
             filter_targets: FilterTargets::default(),
+            frame_pacing: Arc::default(),
+            committed_at: Instant::now(),
             frame_time: Instant::now(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
@@ -790,6 +827,15 @@ impl MetalRenderer {
             }
         };
 
+        self.frame_pacing.in_flight.fetch_add(1, Ordering::SeqCst);
+        let pacing = self.frame_pacing.clone();
+        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| pacing.frame_done());
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+        unsafe {
+            command_buffer.add_completed_handler(&*RcBlock::as_ptr(&block).cast());
+        }
+        self.committed_at = Instant::now();
+
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -798,6 +844,30 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+    }
+
+    /// Whether the GPU is still running the last frame `draw` committed. Drawing another one now
+    /// would queue it behind that frame and block in `next_drawable` once the drawables run out,
+    /// which holds input back by every frame in the queue. A `true` arms the waker set with
+    /// `set_frame_waker`, so the window draws as soon as the GPU is done rather than a whole
+    /// display tick later.
+    pub fn gpu_behind(&self) -> bool {
+        if self.committed_at.elapsed() >= FRAME_STALL {
+            return false;
+        }
+        let pacing = &self.frame_pacing;
+        pacing.waiting.store(true, Ordering::SeqCst);
+        if pacing.in_flight.load(Ordering::SeqCst) == 0 {
+            pacing.waiting.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// Sets what asks the window for a frame once a frame `gpu_behind` held back has finished on
+    /// the GPU. It runs on a Metal completion thread.
+    pub fn set_frame_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self.frame_pacing.wake.lock() = Some(Box::new(wake));
     }
 
     fn render_frame(
