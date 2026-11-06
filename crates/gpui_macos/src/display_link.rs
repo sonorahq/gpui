@@ -337,11 +337,31 @@ impl WindowFrameSource {
         self.signal.take()
     }
 
+    /// Returns a handle that asks for a frame from any thread, the way a vsync tick does. Asking
+    /// after the source is gone does nothing.
+    pub fn waker(&self) -> FrameWaker {
+        FrameWaker(self.frame_requests.clone())
+    }
+
     pub fn stop(&mut self) {
         if let Some((display_id, subscriber_id)) = self.registration.take() {
             unsubscribe(display_id, subscriber_id);
         }
         self.signal.take();
+    }
+}
+
+/// Asks a window for a frame from any thread. See [`WindowFrameSource::waker`].
+pub struct FrameWaker(DispatchRetained<DispatchSource>);
+
+// SAFETY: dispatch sources are thread safe, and `dispatch_source_merge_data` may be called from
+// any thread. A cancelled source drops the merge.
+unsafe impl Send for FrameWaker {}
+unsafe impl Sync for FrameWaker {}
+
+impl FrameWaker {
+    pub fn wake(&self) {
+        self.0.merge_data(1);
     }
 }
 
