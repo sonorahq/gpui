@@ -1024,6 +1024,135 @@ impl TouchGestureRecognizer {
     }
 }
 
+/// How a touchpad coast decelerates. It stops far sooner than a touch fling, which glides the
+/// way a finger on glass expects but reads as lag under a pointer.
+const TOUCHPAD_PHYSICS: ScrollPhysics = ScrollPhysics::Exponential { decay_per_ms: 0.99 };
+
+/// The release speed, in pixels per second, a touchpad scroll needs to coast at all. Below it the
+/// view stops with the fingers, so only a deliberate flick carries on.
+const TOUCHPAD_MIN_FLING_VELOCITY: f32 = 800.;
+
+/// Coasts a touchpad scroll on after the fingers lift, decelerating by [`TOUCHPAD_PHYSICS`].
+/// Only platforms that report the lift but send no momentum of their own need it, which is why
+/// the window consults [`Platform::coasts_scrolls`](crate::Platform) first.
+pub(crate) struct ScrollCoast {
+    /// How far the fingers have scrolled since they landed, sampled for the release velocity.
+    /// `None` while no fingers are down.
+    tracking: Option<(Point<Pixels>, VelocityTracker)>,
+    momentum: Option<Momentum>,
+    /// Whether the window has a frame callback queued to advance the coast.
+    pub(crate) ticking: bool,
+}
+
+impl ScrollCoast {
+    pub(crate) fn new() -> Self {
+        Self {
+            tracking: None,
+            momentum: None,
+            ticking: false,
+        }
+    }
+
+    /// Follows a scroll event from the platform: fingers landing stop a coast, their travel is
+    /// sampled, and lifting them at speed starts one. Any other scroll stops a coast as well.
+    pub(crate) fn observe(&mut self, event: &ScrollWheelEvent) {
+        self.observe_at(event, Instant::now())
+    }
+
+    fn observe_at(&mut self, event: &ScrollWheelEvent, now: Instant) {
+        let ScrollDelta::Pixels(delta) = event.delta else {
+            self.stop();
+            return;
+        };
+        match event.touch_phase {
+            TouchPhase::Started => {
+                self.momentum = None;
+                let mut velocity_tracker = VelocityTracker::default();
+                velocity_tracker.push(now, delta);
+                self.tracking = Some((delta, velocity_tracker));
+            }
+            TouchPhase::Moved => {
+                if let Some((travel, velocity_tracker)) = self.tracking.as_mut() {
+                    *travel += delta;
+                    velocity_tracker.push(now, *travel);
+                }
+            }
+            TouchPhase::Ended => {
+                let Some((_, velocity_tracker)) = self.tracking.take() else {
+                    return;
+                };
+                let fingers_stopped = velocity_tracker
+                    .latest_sample_time()
+                    .is_none_or(|latest| now.duration_since(latest) > VELOCITY_ASSUME_STOPPED_GAP);
+                if fingers_stopped {
+                    return;
+                }
+                let mut velocity = velocity_tracker.velocity();
+                // Scrolls lean to one axis, and a coast that drifts off it reads as a slip.
+                match dominant_axis(point(px(velocity.x), px(velocity.y))) {
+                    Axis::Vertical => velocity.x = 0.,
+                    Axis::Horizontal => velocity.y = 0.,
+                }
+                let speed = (velocity.x.powi(2) + velocity.y.powi(2)).sqrt();
+                if speed < TOUCHPAD_MIN_FLING_VELOCITY {
+                    return;
+                }
+                let direction = point(velocity.x / speed, velocity.y / speed);
+                let speed = speed.min(MAX_FLING_VELOCITY);
+                let duration = TOUCHPAD_PHYSICS.fling_duration(speed);
+                if duration.is_zero() {
+                    return;
+                }
+                self.momentum = Some(Momentum {
+                    position: event.position,
+                    direction,
+                    speed,
+                    started_at: now,
+                    duration,
+                    emitted_distance: 0.,
+                });
+            }
+            TouchPhase::Cancelled => self.stop(),
+        }
+    }
+
+    /// Stops a coast and forgets the fingers, as a click or a wheel does.
+    pub(crate) fn stop(&mut self) {
+        self.tracking = None;
+        self.momentum = None;
+    }
+
+    pub(crate) fn has_momentum(&self) -> bool {
+        self.momentum.is_some()
+    }
+
+    /// Advances the coast by one frame, returning the scroll step to dispatch at `position`, or
+    /// `None` when none is in progress. The final step carries [`TouchPhase::Ended`].
+    pub(crate) fn tick(&mut self, position: Point<Pixels>) -> Option<ScrollWheelEvent> {
+        self.tick_at(position, Instant::now())
+    }
+
+    fn tick_at(&mut self, position: Point<Pixels>, now: Instant) -> Option<ScrollWheelEvent> {
+        let momentum = self.momentum.as_mut()?;
+        let elapsed = now.duration_since(momentum.started_at);
+        let distance = TOUCHPAD_PHYSICS.fling_distance(momentum.speed, elapsed);
+        let step = (distance - momentum.emitted_distance).max(0.);
+        momentum.emitted_distance = momentum.emitted_distance.max(distance);
+        let delta = point(
+            px(momentum.direction.x * step),
+            px(momentum.direction.y * step),
+        );
+        let touch_phase = match elapsed >= momentum.duration {
+            true => {
+                self.momentum = None;
+                TouchPhase::Ended
+            }
+            false => TouchPhase::Moved,
+        };
+        Some(scroll_event(position, delta, touch_phase))
+    }
+}
+
 fn scroll_event(
     position: Point<Pixels>,
     delta: Point<Pixels>,

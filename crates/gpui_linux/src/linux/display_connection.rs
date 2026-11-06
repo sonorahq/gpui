@@ -104,6 +104,16 @@ impl DisplayConnection {
         dispatch!(self, connection => connection.compositor_name(), headless => "headless")
     }
 
+    /// Whether touchpad scrolls need gpui's momentum. Wayland reports the fingers lifting but
+    /// leaves coasting to the client, while X11 reports neither.
+    pub(crate) fn coasts_scrolls(&self) -> bool {
+        match self {
+            #[cfg(feature = "wayland")]
+            DisplayConnection::Wayland(_) => true,
+            _ => false,
+        }
+    }
+
     /// Whether a window is open.
     pub(crate) fn has_windows(&self) -> bool {
         dispatch!(self, connection => connection.has_windows(), headless(connection) => connection.has_windows())
