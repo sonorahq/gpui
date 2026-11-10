@@ -1642,6 +1642,19 @@ impl X11Client {
         Box::new(state.keyboard_layout.clone())
     }
 
+    /// Pointer events are converted with one scale for the whole connection, so every window
+    /// takes the new one.
+    pub(crate) fn set_scale_factor(&self, scale_factor: f32) {
+        let windows: Vec<_> = {
+            let mut state = self.0.borrow_mut();
+            state.scale_factor = scale_factor;
+            state.windows.values().map(|window| window.window.clone()).collect()
+        };
+        for window in windows {
+            window.set_scale_factor(scale_factor);
+        }
+    }
+
     pub(crate) fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         let state = self.0.borrow();
         let setup = state.xcb_connection.setup();
