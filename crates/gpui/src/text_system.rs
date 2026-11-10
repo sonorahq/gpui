@@ -33,7 +33,7 @@ use std::{
     ops::{Deref, DerefMut, Range},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -239,6 +239,7 @@ pub struct TextSystem {
     font_generation: Arc<AtomicUsize>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
     missing_glyph_receiver: Mutex<Option<MissingGlyphReceiver>>,
+    antialiased_only: AtomicBool,
 }
 
 impl TextSystem {
@@ -276,7 +277,15 @@ impl TextSystem {
                 generation: missing_glyph_generation,
                 receiver,
             })),
+            antialiased_only: AtomicBool::new(false),
         }
+    }
+
+    /// Draws glyphs antialiased only, without the stem thickening the platform's font smoothing
+    /// adds to light text, as WebKit's `-webkit-font-smoothing: antialiased` does.
+    pub fn set_antialiased_only(&self, antialiased_only: bool) {
+        self.antialiased_only
+            .store(antialiased_only, Ordering::Relaxed);
     }
 
     /// Get sorted, unique font family names available to the platform text system.
@@ -583,6 +592,9 @@ impl TextSystem {
 
     /// Returns the dilation level to use for a glyph painted in the given color.
     pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+        if self.antialiased_only.load(Ordering::Relaxed) {
+            return 0;
+        }
         self.platform_text_system.glyph_dilation_for_color(color)
     }
 
