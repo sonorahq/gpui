@@ -1647,7 +1647,11 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             false => origin + extent,
         };
         context.width = context.width.max(right_edge);
-        context.runs.push(ShapedRun { font_id, glyphs });
+        context.runs.push(ShapedRun {
+            font_id,
+            glyphs,
+            font_size: None,
+        });
         Ok(())
     }
 
