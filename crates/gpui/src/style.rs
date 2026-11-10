@@ -7,9 +7,9 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, LetterSpacing,
-    Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun,
-    Window, black, phi, point, px, quad, rems, size,
+    FontFallbacks, FontFeatures, FontScale, FontStyle, FontWeight, GridLocation, Hsla, Length,
+    LetterSpacing, Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement,
+    Styled, TextRun, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -547,6 +547,9 @@ pub struct TextStyle {
     /// The space after each character, in ems, like CSS `letter-spacing`
     pub letter_spacing: LetterSpacing,
 
+    /// The size of the characters as a share of `font_size`, like CSS `font-size` in ems
+    pub font_scale: FontScale,
+
     /// The background color of the text
     pub background_color: Option<Hsla>,
 
@@ -586,6 +589,7 @@ impl Default for TextStyle {
             font_weight: FontWeight::default(),
             font_style: FontStyle::default(),
             letter_spacing: LetterSpacing::default(),
+            font_scale: FontScale::default(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -611,6 +615,10 @@ impl TextStyle {
 
         if let Some(color) = style.color {
             self.color = self.color.blend(color);
+        }
+
+        if let Some(scale) = style.font_scale {
+            self.font_scale = scale;
         }
 
         if let Some(factor) = style.fade_out {
@@ -641,6 +649,7 @@ impl TextStyle {
             weight: self.font_weight,
             style: self.font_style,
             letter_spacing: self.letter_spacing,
+            scale: self.font_scale,
         }
     }
 
@@ -660,6 +669,7 @@ impl TextStyle {
                 weight: self.font_weight,
                 style: self.font_style,
                 letter_spacing: self.letter_spacing,
+                scale: self.font_scale,
             },
             color: self.color,
             background_color: self.background_color,
@@ -693,6 +703,9 @@ pub struct HighlightStyle {
 
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
     pub fade_out: Option<f32>,
+
+    /// The size of the text as a share of the style's, like CSS `font-size` in ems.
+    pub font_scale: Option<FontScale>,
 }
 
 impl Eq for HighlightStyle {}
@@ -705,6 +718,7 @@ impl Hash for HighlightStyle {
         self.background_color.hash(state);
         self.underline.hash(state);
         self.strikethrough.hash(state);
+        self.font_scale.hash(state);
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
         ));
@@ -1045,6 +1059,7 @@ impl From<&TextStyle> for HighlightStyle {
             underline: other.underline,
             strikethrough: other.strikethrough,
             fade_out: None,
+            font_scale: Some(other.font_scale),
         }
     }
 }
@@ -1085,6 +1100,7 @@ impl HighlightStyle {
                         .unwrap_or(source_fade)
                 })
                 .or(self.fade_out),
+            font_scale: other.font_scale.or(self.font_scale),
         }
     }
 }
@@ -1524,6 +1540,7 @@ mod tests {
                 color: Some(blue()),
             }),
             fade_out: Some(0.),
+            font_scale: None,
             font_style: Some(FontStyle::Italic),
             font_weight: Some(FontWeight(300.)),
             background_color: Some(yellow()),
@@ -1556,6 +1573,7 @@ mod tests {
                 color: Some(crate::red()),
             }),
             fade_out: Some(0.),
+            font_scale: None,
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),
@@ -1574,6 +1592,7 @@ mod tests {
             }),
             // TODO this does not seem right
             fade_out: Some(0.),
+            font_scale: None,
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),

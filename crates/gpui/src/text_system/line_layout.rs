@@ -1,6 +1,6 @@
 use crate::{
-    FontId, GlyphId, LetterSpacing, Pixels, PlatformTextSystem, Point, SharedString, Size, point,
-    px,
+    FontId, FontScale, GlyphId, LetterSpacing, Pixels, PlatformTextSystem, Point, SharedString,
+    Size, point, px,
 };
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
@@ -41,6 +41,8 @@ pub struct ShapedRun {
     pub font_id: FontId,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
+    /// The size the run is drawn at, when it is not the line's
+    pub font_size: Option<Pixels>,
 }
 
 /// A single glyph, ready to paint.
@@ -269,6 +271,7 @@ impl LineLayout {
                 left_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: run.glyphs[..split_pos].to_vec(),
+                    font_size: run.font_size,
                 });
             }
 
@@ -285,6 +288,7 @@ impl LineLayout {
                 right_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: right_glyphs,
+                    font_size: run.font_size,
                 });
             }
         }
@@ -846,6 +850,7 @@ impl LineLayoutCache {
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            apply_font_scale(&mut layout, runs);
             apply_letter_spacing(&mut layout, runs);
 
             if let Some(force_width) = force_width {
@@ -998,6 +1003,7 @@ impl LineLayoutCache {
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
+        apply_font_scale(&mut layout, runs);
         apply_letter_spacing(&mut layout, runs);
 
         if let Some(force_width) = force_width {
@@ -1076,6 +1082,67 @@ pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
     pub letter_spacing: LetterSpacing,
+    pub scale: FontScale,
+}
+
+/// Draws each run at its share of the line's font size. Its glyphs grow or
+/// shrink from where the run starts, and the glyphs after it move by the width
+/// it gained or lost, so every text system gives the same result.
+fn apply_font_scale(layout: &mut LineLayout, runs: &[FontRun]) {
+    if runs.iter().all(|run| run.scale == FontScale::default()) {
+        return;
+    }
+    let mut ends = Vec::with_capacity(runs.len());
+    let mut end = 0;
+    for run in runs {
+        end += run.len;
+        ends.push((end, run.scale.0));
+    }
+    let scale_at = |index: usize| {
+        ends.iter()
+            .find(|(end, _)| index < *end)
+            .map_or(1., |(_, scale)| *scale)
+    };
+    let font_size = layout.font_size;
+    let mut split = Vec::with_capacity(layout.runs.len());
+    for run in layout.runs.drain(..) {
+        for glyph in run.glyphs {
+            let scale = scale_at(glyph.index);
+            let size = (scale != 1.).then(|| font_size * scale);
+            match split.last_mut() {
+                Some(ShapedRun {
+                    font_id,
+                    glyphs,
+                    font_size,
+                }) if *font_id == run.font_id && *font_size == size => glyphs.push(glyph),
+                _ => split.push(ShapedRun {
+                    font_id: run.font_id,
+                    glyphs: vec![glyph],
+                    font_size: size,
+                }),
+            }
+        }
+    }
+    layout.runs = split;
+    let mut glyphs: Vec<(f32, &mut ShapedGlyph)> = layout
+        .runs
+        .iter_mut()
+        .flat_map(|run| {
+            let scale = run.font_size.map_or(1., |size| size / font_size);
+            run.glyphs.iter_mut().map(move |glyph| (scale, glyph))
+        })
+        .collect();
+    glyphs.sort_by(|a, b| f32::from(a.1.position.x).total_cmp(&f32::from(b.1.position.x)));
+    let (mut from, mut to, mut scale) = (Pixels::ZERO, Pixels::ZERO, 1.);
+    for (glyph_scale, glyph) in glyphs {
+        if glyph_scale != scale {
+            to += (glyph.position.x - from) * scale;
+            from = glyph.position.x;
+            scale = glyph_scale;
+        }
+        glyph.position.x = to + (glyph.position.x - from) * scale;
+    }
+    layout.width = to + (layout.width - from) * scale;
 }
 
 /// Moves each glyph along by the letter spacing of the characters before it, and
@@ -1365,6 +1432,7 @@ mod tests {
             runs: vec![ShapedRun {
                 font_id: FontId(0),
                 glyphs,
+                font_size: None,
             }],
             len: 0,
         }
@@ -1481,6 +1549,7 @@ mod tests {
             len,
             font_id: FontId(0),
             letter_spacing: LetterSpacing(ems),
+            scale: FontScale::default(),
         }
     }
 
