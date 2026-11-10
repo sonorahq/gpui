@@ -464,6 +464,7 @@ impl TextSystem {
                     font_id,
                     letter_spacing: LetterSpacing::default(),
                     scale: FontScale::default(),
+                    leading: Default::default(),
                 }],
             )
             .width
@@ -766,6 +767,21 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_gaps(text, font_size, runs, &[], wrap_width, line_clamp)
+    }
+
+    /// Shapes the text as [`Self::shape_text`] does, with a space of each width opened before
+    /// its byte index, sorted, for an element to draw something inside the text there. The
+    /// text itself is unchanged, so its indices still mean what they did.
+    pub fn shape_text_with_gaps(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        gaps: &[(usize, Pixels)],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -784,7 +800,16 @@ impl WindowTextSystem {
                     break;
                 };
 
-                let run_len_within_line = cmp::min(line_end - run_start, run.len);
+                let gap_at = |at: usize| gaps.iter().find(|(index, _)| *index == at);
+                let next_gap = gaps
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .find(|index| *index > run_start && *index < line_end);
+                let run_len_within_line = cmp::min(line_end - run_start, run.len)
+                    .min(next_gap.map_or(usize::MAX, |gap| gap - run_start));
+                let leading = gap_at(run_start).map_or(LetterSpacing::default(), |(_, width)| {
+                    LetterSpacing(*width / font_size)
+                });
 
                 let decoration_changed = if let Some(last_run) = decoration_runs.last_mut()
                     && last_run.color == run.color
@@ -811,6 +836,7 @@ impl WindowTextSystem {
                     && run.font.letter_spacing == font_run.letter_spacing
                     && run.font.scale == font_run.scale
                     && !decoration_changed
+                    && leading.0 == 0.
                 {
                     font_run.len += run_len_within_line;
                 } else {
@@ -819,6 +845,7 @@ impl WindowTextSystem {
                         font_id,
                         letter_spacing: run.font.letter_spacing,
                         scale: run.font.scale,
+                        leading,
                     });
                 }
 
@@ -937,6 +964,7 @@ impl WindowTextSystem {
                     font_id,
                     letter_spacing: run.font.letter_spacing,
                     scale: run.font.scale,
+                    leading: Default::default(),
                 });
             }
         }
@@ -966,6 +994,7 @@ impl WindowTextSystem {
                     font_id,
                     letter_spacing: LetterSpacing::default(),
                     scale: FontScale::default(),
+                    leading: Default::default(),
                 }],
                 None,
             )
@@ -1025,6 +1054,7 @@ impl WindowTextSystem {
                     font_id,
                     letter_spacing: run.font.letter_spacing,
                     scale: run.font.scale,
+                    leading: Default::default(),
                 });
             }
         }
@@ -1091,6 +1121,7 @@ impl WindowTextSystem {
                     font_id,
                     letter_spacing: run.font.letter_spacing,
                     scale: run.font.scale,
+                    leading: Default::default(),
                 });
             }
         }
