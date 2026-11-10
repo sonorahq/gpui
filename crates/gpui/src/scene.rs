@@ -494,6 +494,14 @@ pub enum BlurPasses {
 }
 
 impl BlurPasses {
+    /// The source margin needed around a clipped blur, including downsample alignment.
+    pub fn source_margin(self) -> ScaledPixels {
+        ScaledPixels(match self {
+            Self::Gaussian(sigma) => (sigma * GAUSSIAN_REACH).ceil() + 1.,
+            Self::Kawase(kawase) => kawase.reach() + (1u32 << kawase.levels) as f32,
+        })
+    }
+
     /// The blur that spreads a point as far as a gaussian of standard deviation `sigma`, in
     /// scaled pixels.
     pub fn for_sigma(sigma: f32) -> Self {

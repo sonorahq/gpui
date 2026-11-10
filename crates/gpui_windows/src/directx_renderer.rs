@@ -112,6 +112,8 @@ struct Scratch {
 /// One of the offscreen targets filters draw through.
 #[derive(Clone, Copy)]
 enum FilterTarget {
+    /// The accumulated background of all open layers before a backdrop samples it.
+    Backdrop,
     /// The frame itself, drawn offscreen so a backdrop can sample what lies under it.
     Frame,
     /// The target a filtered layer is drawn into, by nesting depth.
@@ -128,7 +130,7 @@ impl FilterTarget {
     fn shrink(self) -> u32 {
         match self {
             Self::Level(level) => 1 << level,
-            Self::Frame | Self::Layer(_) | Self::Scratch => 1,
+            Self::Frame | Self::Layer(_) | Self::Scratch | Self::Backdrop => 1,
         }
     }
 }
@@ -140,6 +142,7 @@ struct FilterTargets {
     width: u32,
     height: u32,
     frame: Option<Scratch>,
+    backdrop: Option<Scratch>,
     layers: [Option<Scratch>; LAYER_DEPTH],
     levels: [Option<Scratch>; KAWASE_LEVELS + 1],
     scratch: Option<Scratch>,
@@ -151,6 +154,7 @@ impl FilterTargets {
             width,
             height,
             frame: None,
+            backdrop: None,
             layers: std::array::from_fn(|_| None),
             levels: std::array::from_fn(|_| None),
             scratch: None,
@@ -159,6 +163,7 @@ impl FilterTargets {
 
     fn slot(&mut self, target: FilterTarget) -> &mut Option<Scratch> {
         match target {
+            FilterTarget::Backdrop => &mut self.backdrop,
             FilterTarget::Frame => &mut self.frame,
             FilterTarget::Layer(depth) => &mut self.layers[depth.min(LAYER_DEPTH - 1)],
             FilterTarget::Level(level) => &mut self.levels[level],
@@ -170,6 +175,7 @@ impl FilterTargets {
     /// opened is by the time it is read.
     fn get(&self, target: FilterTarget) -> Result<&RenderTexture> {
         let slot = match target {
+            FilterTarget::Backdrop => &self.backdrop,
             FilterTarget::Frame => &self.frame,
             FilterTarget::Layer(depth) => &self.layers[depth.min(LAYER_DEPTH - 1)],
             FilterTarget::Level(level) => &self.levels[level],
@@ -205,6 +211,7 @@ impl FilterTargets {
     /// Drops every target no frame has drawn through within `IDLE_RELEASE` of `now`.
     fn release_idle(&mut self, now: Instant) {
         let slots = std::iter::once(&mut self.frame)
+            .chain(std::iter::once(&mut self.backdrop))
             .chain(self.layers.iter_mut())
             .chain(self.levels.iter_mut())
             .chain(std::iter::once(&mut self.scratch));
@@ -761,6 +768,70 @@ impl DirectXRenderer {
         Ok(held)
     }
 
+    /// Flattens open layers in source coordinates without changing their eventual composites.
+    fn backdrop_source(
+        &mut self,
+        depth: usize,
+        clip: Option<Bounds<ScaledPixels>>,
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
+        let frame = self.filter_target(FilterTarget::Frame)?;
+        if depth == 0 {
+            return Ok(frame.source);
+        }
+        let target = self.filter_target(FilterTarget::Backdrop)?;
+        let mut sources = vec![frame.source];
+        for level in 0..depth {
+            sources.push(self.filter_target(FilterTarget::Layer(level))?.source);
+        }
+        let (device, context, sampler, batch_params) = self.pipeline_handles()?;
+        let viewport = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .viewport;
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(viewport.Width), ScaledPixels(viewport.Height)),
+        );
+        let params = [FilterParams {
+            source_bounds: bounds,
+            fade_bounds: bounds,
+            scale: 1.,
+            ..Default::default()
+        }];
+        unsafe {
+            context.OMSetRenderTargets(Some(slice::from_ref(&target.view)), None);
+            context.ClearRenderTargetView(
+                target.view.as_ref().context("missing backdrop target")?,
+                &[0.; 4],
+            );
+            context.RSSetViewports(Some(slice::from_ref(&viewport)));
+        }
+        match clip
+            .map(|clip| self.scissor(clip, 1))
+            .transpose()?
+            .flatten()
+        {
+            Some(within) => self.set_scissor(within),
+            None => self.reset_scissor()?,
+        }
+        self.pipelines
+            .composite_pipeline
+            .update_buffer(&device, &context, &params)?;
+        for source in sources {
+            self.pipelines.composite_pipeline.draw_range_with_texture(
+                &context,
+                None,
+                slice::from_ref(&source),
+                &batch_params,
+                slice::from_ref(&Some(sampler.clone())),
+                0,
+                1,
+            )?;
+        }
+        Ok(target.source)
+    }
+
     /// Blurs the frame within `clip`, the union of the batch's backdrops grown by the kernel
     /// inside `blur_source`, and draws the batch over it. A backdrop samples only within its
     /// own bounds, so nothing outside the union is worth blurring.
@@ -771,13 +842,14 @@ impl DirectXRenderer {
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
         mirrored: bool,
+        stack: &[usize],
     ) -> Result<()> {
-        let frame = {
-            let resources = self.resources.as_ref().context("resources missing")?;
-            resources.filters.get(FilterTarget::Frame)?.source.clone()
-        };
+        let frame = self.backdrop_source(
+            stack.len(),
+            clip.map(|clip| clip.dilate(BlurPasses::for_sigma(sigma).source_margin())),
+        )?;
         let blurred = self.blur_source(frame, None, sigma, clip)?;
-        self.restore_frame(mirrored)?;
+        self.resume_target(stack, mirrored)?;
 
         let (_, device_context, sampler, batch_params) = self.pipeline_handles()?;
 
@@ -1114,7 +1186,7 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Backdrops(range) => {
-                    if stack.is_empty() {
+                    {
                         let backdrops = &scene.backdrops[range.clone()];
                         let sigma = backdrops
                             .iter()
@@ -1123,7 +1195,7 @@ impl DirectXRenderer {
                             .iter()
                             .map(|backdrop| backdrop.bounds)
                             .reduce(|union, bounds| union.union(&bounds));
-                        self.draw_backdrops(range.start, range.len(), sigma, clip, mirrored)?;
+                        self.draw_backdrops(range.start, range.len(), sigma, clip, mirrored, &stack)?;
                     }
                     Ok(())
                 }
@@ -3469,4 +3541,51 @@ fn level_size(viewport: &D3D11_VIEWPORT, shrink: u32) -> (u32, u32) {
         viewport.Width as u32 / shrink,
         viewport.Height as u32 / shrink,
     )
+}
+
+#[cfg(test)]
+#[path = "../../gpui/src/backdrop_test_fixture.rs"]
+mod backdrop_fixture;
+
+#[cfg(test)]
+#[::core::prelude::v1::test]
+fn nested_backdrops_sample_ancestor_layers() -> anyhow::Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::w;
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("backdrop regression"),
+            WS_POPUP,
+            0,
+            0,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )?
+    };
+    let result = (|| {
+        let devices = DirectXDevices::new()?;
+        let mut renderer = DirectXRenderer::new(hwnd, &devices, true)?;
+        renderer.resize(size(DevicePixels(64), DevicePixels(64)))?;
+        for blur in [3., 12.] {
+            for depth in [0, 1, 2] {
+                for inside in [false, true] {
+                    let scene = backdrop_fixture::scene(depth, blur, inside);
+                    let image =
+                        renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+                    backdrop_fixture::check(&image);
+                }
+            }
+        }
+        Ok(())
+    })();
+    unsafe {
+        DestroyWindow(hwnd)?;
+    }
+    result
 }
