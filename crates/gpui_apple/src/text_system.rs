@@ -798,6 +798,7 @@ mod tests {
                 len: 6,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             }],
         );
         assert_eq!(layout.len, 6);
@@ -814,6 +815,7 @@ mod tests {
             len: line.len(),
             letter_spacing: Default::default(),
             scale: Default::default(),
+            leading: Default::default(),
         };
 
         let layout = fonts.layout_line(line, px(16.), &[style]);
@@ -837,12 +839,14 @@ mod tests {
                 font_id,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             },
             FontRun {
                 len: "ab".len(),
                 font_id,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             },
         ];
         let layout = fonts.layout_line(line, px(16.), font_runs);
@@ -866,12 +870,14 @@ mod tests {
                 len: 5,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             }, // "hello"
             FontRun {
                 font_id,
                 len: 6,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             }, // " world"
         ];
 
@@ -897,6 +903,7 @@ mod tests {
                 len: 5,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             }, // "hello"
             // " world"
             FontRun {
@@ -904,6 +911,7 @@ mod tests {
                 len: 6,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             },
         ];
 
@@ -933,6 +941,7 @@ mod tests {
             len: 5,
             letter_spacing: Default::default(),
             scale: Default::default(),
+            leading: Default::default(),
         }];
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, text.len());
@@ -944,18 +953,21 @@ mod tests {
                 len: 1,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             }, // "a"
             FontRun {
                 font_id,
                 len: 1,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             }, // "b"
             FontRun {
                 font_id,
                 len: 1,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             }, // "c"
         ];
         let layout = fonts.layout_line(text, px(16.), font_runs);
