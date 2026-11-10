@@ -179,19 +179,42 @@ impl Scene {
             return false;
         };
         self.push_span(id, span.bounds);
+        // A span pushed by hand can open a layer or a filter it does not close, or close one
+        // it did not open. The replay keeps count, so it never closes the caller's and never
+        // leaves one of its own open.
+        let (mut layers, mut filters) = (0usize, 0usize);
         for operation in &prev_scene.paint_operations[span.operations.clone()] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     self.insert_primitive(primitive.clone().faded(fade))
                 }
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
-                PaintOperation::EndLayer => self.pop_layer(),
-                PaintOperation::StartFilter(bounds, transform_origin, content_mask, filter) => {
-                    self.push_filter(*bounds, *transform_origin, *content_mask, *filter)
+                PaintOperation::StartLayer(bounds) => {
+                    layers += 1;
+                    self.push_layer(*bounds);
                 }
-                PaintOperation::EndFilter => self.pop_filter(),
-                PaintOperation::StartSpan(..) | PaintOperation::EndSpan => {}
+                PaintOperation::EndLayer if layers > 0 => {
+                    layers -= 1;
+                    self.pop_layer();
+                }
+                PaintOperation::StartFilter(bounds, transform_origin, content_mask, filter) => {
+                    filters += 1;
+                    self.push_filter(*bounds, *transform_origin, *content_mask, *filter);
+                }
+                PaintOperation::EndFilter if filters > 0 => {
+                    filters -= 1;
+                    self.pop_filter();
+                }
+                PaintOperation::EndLayer
+                | PaintOperation::EndFilter
+                | PaintOperation::StartSpan(..)
+                | PaintOperation::EndSpan => {}
             }
+        }
+        for _ in 0..filters {
+            self.pop_filter();
+        }
+        for _ in 0..layers {
+            self.pop_layer();
         }
         self.pop_span();
         true

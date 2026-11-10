@@ -4409,14 +4409,16 @@ impl Window {
         self.with_absolute_element_offset(abs_offset, f)
     }
 
-    /// Lays a subtree out at exactly the offset it was given, and paints its quads, shadows,
-    /// images and icons at exactly the bounds they were given, instead of rounding either to the
-    /// device pixel grid. An element that animates its own position wants this: rounding turns a
-    /// smooth path into whole-pixel steps, so a decelerating one either sits on its last pixel for
-    /// several frames or stops while it is still visibly moving. Text is placed at subpixel
-    /// positions either way; only an edge that falls between pixels softens. Elements styled with
-    /// [`Styled::pixel_snap`](crate::Styled::pixel_snap) set this for themselves. This method
-    /// should only be called during the prepaint or paint phase of element drawing.
+    /// Lays a subtree out at exactly the offset it was given, and paints its quads, images and
+    /// icons at exactly the bounds they were given, instead of rounding either to the device
+    /// pixel grid. Shadows still grow to cover whole device pixels, so a shadow's extent steps
+    /// a pixel at a time under a quad that glides. An element that animates its own position
+    /// wants this: rounding turns a smooth path into whole-pixel steps, so a decelerating one
+    /// either sits on its last pixel for several frames or stops while it is still visibly
+    /// moving. Text is placed at subpixel positions either way; only an edge that falls between
+    /// pixels softens. Elements styled with [`Styled::pixel_snap`](crate::Styled::pixel_snap)
+    /// set this for themselves. This method should only be called during the prepaint or paint
+    /// phase of element drawing.
     pub fn with_pixel_snapping<R>(&mut self, snap: bool, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
 

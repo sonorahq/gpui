@@ -903,7 +903,9 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+    // The distance field knows nothing of how much of the pixel the quad covers, so a quad
+    // thinner than a pixel would come out stronger than the share of the pixel it fills.
+    return color * float4(1.0, 1.0, 1.0, min(coverage, saturate(antialias_threshold - outer_sdf)));
 }
 
 /*

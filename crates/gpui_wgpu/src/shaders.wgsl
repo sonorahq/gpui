@@ -947,7 +947,9 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+    // The distance field knows nothing of how much of the pixel the quad covers, so a quad
+    // thinner than a pixel would come out stronger than the share of the pixel it fills.
+    return blend_color(color, min(coverage, saturate(antialias_threshold - outer_sdf)));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
