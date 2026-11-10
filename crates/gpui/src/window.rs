@@ -17,7 +17,7 @@ use crate::{
     PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shader,
-    ShaderInstance, ShaderQuad, Shadow, SharedString, Size, StrikethroughStyle, Style,
+    ShaderInstance, ShaderQuad, Shadow, SharedString, Size, SpanId, StrikethroughStyle, Style,
     SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
     TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
@@ -4985,6 +4985,48 @@ impl Window {
         let result = f(self);
         self.next_frame.scene.pop_filter();
         result
+    }
+
+    /// Names what `f` paints, so that [`Window::replay_span`] can paint it again on a later
+    /// frame once the element that drew it is gone. `bounds` comes back from
+    /// [`Window::rendered_span`]. A span survives a cached view replaying its paint.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_paint_span<R>(
+        &mut self,
+        id: SpanId,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame.scene.push_span(id, bounds);
+        let result = f(self);
+        self.next_frame.scene.pop_span();
+        result
+    }
+
+    /// Whether the frame being painted already holds a span named `id`.
+    pub fn span_painted(&self, id: SpanId) -> bool {
+        self.next_frame.scene.span(id).is_some()
+    }
+
+    /// The bounds of the span named `id` in the last frame drawn, when it held one.
+    pub fn rendered_span(&self, id: SpanId) -> Option<Bounds<Pixels>> {
+        self.rendered_frame.scene.span(id)
+    }
+
+    /// Paints what the last frame painted in its span `id` again, under the same name, with
+    /// the alpha of every colour scaled by `fade`. Only the pixels come back: nothing in the
+    /// span answers the pointer or the keyboard. Returns whether the last frame held the span.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn replay_span(&mut self, id: SpanId, fade: f32) -> bool {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame
+            .scene
+            .replay_span(id, &self.rendered_frame.scene, fade)
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
