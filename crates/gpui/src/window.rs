@@ -1270,6 +1270,8 @@ pub struct Window {
     last_text_input_configuration: Option<TextInputConfiguration>,
     focused_text_input: Option<FocusId>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
+    /// The picture each atlas tile was painted from, by texture and tile.
+    image_tiles: FxHashMap<(crate::AtlasTextureId, u32), crate::ImageId>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
     next_hitbox_id: HitboxId,
@@ -2252,6 +2254,7 @@ impl Window {
             prompt: None,
             client_inset: None,
             image_cache_stack: Vec::new(),
+            image_tiles: FxHashMap::default(),
             captured_hitbox: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
@@ -3659,6 +3662,8 @@ impl Window {
                 .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
             self.debug_frame_overlay.record_frame(draw_duration);
         }
+
+        cx.trim_decoded_images(self);
 
         // Exit the scope to obtain the arena-clear token this draw owes; the
         // scope's teardown itself happens in `ElementArenaScope::drop`.
@@ -5463,6 +5468,8 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
+        self.image_tiles
+            .insert((tile.texture_id, tile.tile_id.0), data.id);
 
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
@@ -5558,8 +5565,23 @@ impl Window {
 
             self.sprite_atlas.remove(&params.clone().into());
         }
+        self.image_tiles.retain(|_, image| *image != data.id);
 
         Ok(())
+    }
+
+    /// The pictures whose tiles the frame on screen draws, painted this frame or kept from one before.
+    pub(crate) fn shown_images(&self) -> FxHashSet<crate::ImageId> {
+        self.rendered_frame
+            .scene
+            .polychrome_sprites
+            .iter()
+            .filter_map(|sprite| {
+                self.image_tiles
+                    .get(&(sprite.tile.texture_id, sprite.tile.tile_id.0))
+                    .copied()
+            })
+            .collect()
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.

@@ -18,6 +18,7 @@ mod color;
 pub mod colors;
 #[cfg(feature = "profiler")]
 mod debug_overlay;
+mod decoded_images;
 mod element;
 mod elements;
 mod executor;
