@@ -1231,6 +1231,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
     fn modifiers(&self) -> Modifiers;
+    /// Which side each held modifier is on, as the last key or modifier event said.
+    fn modifier_sides(&self) -> ModifierSides {
+        ModifierSides::default()
+    }
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;

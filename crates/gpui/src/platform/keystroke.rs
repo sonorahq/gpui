@@ -443,6 +443,16 @@ impl std::fmt::Display for KeybindingKeystroke {
     }
 }
 
+/// Which side of the keyboard each held modifier key is on. A platform that cannot tell
+/// the sides apart reports neither, so a held modifier may show in [`Modifiers`] alone.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default, Hash)]
+pub struct ModifierSides {
+    /// The modifiers held on the left of the keyboard
+    pub left: Modifiers,
+    /// The modifiers held on the right of the keyboard
+    pub right: Modifiers,
+}
+
 /// The state of the modifier keys at some point in time
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize, Hash, JsonSchema)]
 pub struct Modifiers {
