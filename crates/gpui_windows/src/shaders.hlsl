@@ -117,6 +117,25 @@ float4 distance_from_clip_rect_impl(float2 position, Bounds clip_bounds) {
     return float4(tl.x, br.x, tl.y, br.y);
 }
 
+// The device pixels `bounds` reach into: the bounds grown out to whole pixels, so an edge that
+// falls between pixels still draws the pixel it partly covers. Bounds on the pixel grid stay as
+// they are.
+Bounds pixel_cover(Bounds bounds) {
+    Bounds cover;
+    cover.origin = floor(bounds.origin);
+    cover.size = ceil(bounds.origin + bounds.size) - cover.origin;
+    return cover;
+}
+
+// How much of the pixel centred on `position` the bounds cover: 1 inside them, and the share
+// left where an edge falls through the pixel.
+float pixel_coverage(float2 position, Bounds bounds) {
+    float2 near_edge = max(position - 0.5, bounds.origin);
+    float2 far_edge = min(position + 0.5, bounds.origin + bounds.size);
+    float2 overlap = saturate(far_edge - near_edge);
+    return overlap.x * overlap.y;
+}
+
 float4 distance_from_clip_rect(float2 unit_vertex, Bounds bounds, Bounds clip_bounds) {
     float2 position = unit_vertex * bounds.size + bounds.origin;
     return distance_from_clip_rect_impl(position, clip_bounds);
@@ -566,7 +585,8 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
     uint quad_id = batch_start_index + instance_id;
     Quad quad = quads[quad_id];
-    float4 device_position = to_device_position(unit_vertex, quad.bounds);
+    Bounds cover = pixel_cover(quad.bounds);
+    float4 device_position = to_device_position(unit_vertex, cover);
 
     GradientColor gradient = prepare_gradient_color(
         quad.background.tag,
@@ -574,7 +594,7 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
         quad.background.solid,
         quad.background.colors
     );
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, cover, quad.content_mask);
     float4 border_color = hsla_to_rgba(quad.border_color);
 
     QuadVertexOutput output;
@@ -598,13 +618,17 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         quad.corner_radii.bottom_left == 0.0 &&
         quad.corner_radii.bottom_right == 0.0;
 
+    // A quad off the pixel grid partly covers the pixels its edges fall through. On the grid
+    // this is 1 for every pixel drawn.
+    float coverage = pixel_coverage(input.position.xy, quad.bounds);
+
     // Fast path when the quad is not rounded and doesn't have any border
     if (quad.border_widths.top == 0.0 &&
         quad.border_widths.left == 0.0 &&
         quad.border_widths.right == 0.0 &&
         quad.border_widths.bottom == 0.0 &&
         unrounded) {
-        return background_color;
+        return background_color * float4(1.0, 1.0, 1.0, coverage);
     }
 
     float2 size = quad.bounds.size;
@@ -665,7 +689,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path for points that must be part of the background
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return background_color;
+        return background_color * float4(1.0, 1.0, 1.0, coverage);
     }
 
     // Signed distance of the point to the outside edge of the quad's border

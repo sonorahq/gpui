@@ -198,6 +198,25 @@ fn distance_from_clip_rect_impl(position: vec2<f32>, clip_bounds: Bounds) -> vec
     return vec4<f32>(tl.x, br.x, tl.y, br.y);
 }
 
+// The device pixels `bounds` reach into: the bounds grown out to whole pixels, so an edge that
+// falls between pixels still draws the pixel it partly covers. Bounds on the pixel grid stay as
+// they are.
+fn pixel_cover(bounds: Bounds) -> Bounds {
+    var cover: Bounds;
+    cover.origin = floor(bounds.origin);
+    cover.size = ceil(bounds.origin + bounds.size) - cover.origin;
+    return cover;
+}
+
+// How much of the pixel centred on `position` the bounds cover: 1 inside them, and the share
+// left where an edge falls through the pixel.
+fn pixel_coverage(position: vec2<f32>, bounds: Bounds) -> f32 {
+    let near = max(position - 0.5, bounds.origin);
+    let far = min(position + 0.5, bounds.origin + bounds.size);
+    let overlap = clamp(far - near, vec2<f32>(0.0), vec2<f32>(1.0));
+    return overlap.x * overlap.y;
+}
+
 fn distance_from_clip_rect(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: Bounds) -> vec4<f32> {
     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
     return distance_from_clip_rect_impl(position, clip_bounds);
@@ -573,9 +592,10 @@ struct QuadVarying {
 fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> QuadVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let quad = load_quad(instance_id);
+    let cover = pixel_cover(quad.bounds);
 
     var out = QuadVarying();
-    out.position = to_device_position(unit_vertex, quad.bounds);
+    out.position = to_device_position(unit_vertex, cover);
 
     let gradient = prepare_gradient_color(
         quad.background.tag,
@@ -588,7 +608,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_color1 = gradient.color1;
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, cover, quad.content_mask);
     return out;
 }
 
@@ -609,13 +629,17 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         quad.corner_radii.top_right == 0.0 &&
         quad.corner_radii.bottom_right == 0.0;
 
+    // A quad off the pixel grid partly covers the pixels its edges fall through. On the grid
+    // this is 1 for every pixel drawn.
+    let coverage = pixel_coverage(input.position.xy, quad.bounds);
+
     // Fast path when the quad is not rounded and doesn't have any border
     if (quad.border_widths.top == 0.0 &&
             quad.border_widths.left == 0.0 &&
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, coverage);
     }
 
     let size = quad.bounds.size;
@@ -683,7 +707,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, coverage);
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
