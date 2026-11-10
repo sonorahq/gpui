@@ -2,7 +2,8 @@ use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
     Attrs, AttrsList, Ellipsize, Family, Font as CosmicTextFont,
-    FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine, Stretch, Style, Weight as CosmicWeight,
+    FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine, Stretch, Style,
+    Weight as CosmicWeight,
 };
 use gpui::{
     Bounds, DevicePixels, FallbackFontClass, Font, FontFallbacks, FontFeatures, FontId,

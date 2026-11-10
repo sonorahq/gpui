@@ -2449,7 +2449,7 @@ impl WgpuRendererCore {
                         )?;
                     }
                     PrimitiveBatch::Backdrops(range) => {
-                        if !filtered || !stack.is_empty() {
+                        if !filtered {
                             continue;
                         }
                         let backdrops = &scene.backdrops[range.clone()];
@@ -2467,7 +2467,7 @@ impl WgpuRendererCore {
                         drop(pass);
                         let blurred = self.blur_source(
                             &mut encoder,
-                            &main_view,
+                            &target,
                             false,
                             sigma,
                             clip,
