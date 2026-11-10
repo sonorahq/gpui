@@ -1332,6 +1332,19 @@ impl X11WindowStatePtr {
         Ok(())
     }
 
+    /// Keeps the window's size in device pixels, so only its logical size changes.
+    pub(crate) fn set_scale_factor(&self, scale_factor: f32) {
+        let mut state = self.state.borrow_mut();
+        let previous = state.scale_factor;
+        state.bounds = state
+            .bounds
+            .map(|value| px((f32::from(value) * previous).round() / scale_factor));
+        state.scale_factor = scale_factor;
+        if let Ok(display) = X11Display::new(&self.xcb, scale_factor, state.x_screen_index) {
+            state.display = Rc::new(display);
+        }
+    }
+
     pub fn set_active(&self, focus: bool) {
         let callback = self.callbacks.borrow_mut().active_status_change.take();
         if let Some(mut fun) = callback {
@@ -1462,6 +1475,13 @@ impl PlatformWindow for X11Window {
 
     fn scale_factor(&self) -> f32 {
         self.0.state.borrow().scale_factor
+    }
+
+    fn set_scale_factor(&self, scale_factor: f32) {
+        let client = self.0.state.borrow().client.get_client();
+        if let Some(client) = client {
+            client.set_scale_factor(scale_factor);
+        }
     }
 
     fn appearance(&self) -> WindowAppearance {
