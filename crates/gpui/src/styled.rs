@@ -838,6 +838,20 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Lays this element and its subtree out and paints them off the device pixel grid with
+    /// `false`, or back on it inside such a subtree with `true`.
+    ///
+    /// An element whose size or position animates through layout wants this: rounding turns a
+    /// smooth path into whole-pixel steps, so a decelerating one sits on its last pixel for
+    /// several frames. Off the grid, this element's own authored lengths keep their fractions,
+    /// and the edges of everything inside it are placed where layout puts them, shifted as one
+    /// so the element's origin still lands on a pixel. A subtree whose lengths are whole device
+    /// pixels therefore draws exactly as it would on the grid, and only what moves softens.
+    fn pixel_snap(mut self, snap: bool) -> Self {
+        self.style().pixel_snap = Some(snap);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {

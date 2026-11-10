@@ -311,6 +311,11 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// Whether this element and its subtree are laid out and painted on the device pixel grid.
+    /// `Some(false)` takes the subtree off the grid, `Some(true)` puts it back inside such a
+    /// subtree, and `None` follows the parent.
+    pub pixel_snap: Option<bool>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -942,6 +947,7 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            pixel_snap: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

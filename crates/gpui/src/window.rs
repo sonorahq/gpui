@@ -1260,7 +1260,8 @@ pub struct Window {
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
-    pub(crate) snap_offsets: bool,
+    /// Whether element offsets and painted primitives land on the device pixel grid.
+    pub(crate) pixel_snapping: bool,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -2199,7 +2200,7 @@ impl Window {
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
-            snap_offsets: true,
+            pixel_snapping: true,
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -3354,6 +3355,9 @@ impl Window {
     #[inline]
     fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
+        if !self.pixel_snapping {
+            return bounds.scale(scale_factor);
+        }
         let left = round_to_device_pixel(bounds.left().0, scale_factor);
         let top = round_to_device_pixel(bounds.top().0, scale_factor);
         let right = round_to_device_pixel(bounds.right().0, scale_factor).max(left);
@@ -4405,18 +4409,20 @@ impl Window {
         self.with_absolute_element_offset(abs_offset, f)
     }
 
-    /// Lays a subtree out at exactly the offset it was given, instead of rounding that offset to
-    /// the device pixel grid. An element that animates its own position wants this: rounding turns
-    /// a smooth path into whole-pixel steps, so a decelerating one either sits on its last pixel
-    /// for several frames or stops while it is still visibly moving. Text is placed at subpixel
-    /// positions either way; only a quad edge softens. This method should only be called during the
-    /// prepaint phase of element drawing.
+    /// Lays a subtree out at exactly the offset it was given, and paints its quads, shadows,
+    /// images and icons at exactly the bounds they were given, instead of rounding either to the
+    /// device pixel grid. An element that animates its own position wants this: rounding turns a
+    /// smooth path into whole-pixel steps, so a decelerating one either sits on its last pixel for
+    /// several frames or stops while it is still visibly moving. Text is placed at subpixel
+    /// positions either way; only an edge that falls between pixels softens. Elements styled with
+    /// [`Styled::pixel_snap`](crate::Styled::pixel_snap) set this for themselves. This method
+    /// should only be called during the prepaint or paint phase of element drawing.
     pub fn with_pixel_snapping<R>(&mut self, snap: bool, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.invalidator.debug_assert_prepaint();
+        self.invalidator.debug_assert_paint_or_prepaint();
 
-        let was = std::mem::replace(&mut self.snap_offsets, snap);
+        let was = std::mem::replace(&mut self.pixel_snapping, snap);
         let result = f(self);
-        self.snap_offsets = was;
+        self.pixel_snapping = was;
         result
     }
 
@@ -5403,7 +5409,10 @@ impl Window {
                 .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
         };
         let final_bounds = svg_bounds
-            .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
+            .map_origin(|value| match self.pixel_snapping {
+                true => ScaledPixels(round_half_toward_zero(value.0)),
+                false => value,
+            })
             .map_size(|size| size.ceil());
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -5662,7 +5671,7 @@ impl Window {
             .layout_bounds(layout_id, scale_factor)
             .map(Into::into);
         let offset = self.element_offset();
-        bounds.origin += match self.snap_offsets {
+        bounds.origin += match self.pixel_snapping {
             true => self.pixel_snap_point(offset),
             false => offset,
         };
