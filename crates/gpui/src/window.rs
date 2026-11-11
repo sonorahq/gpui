@@ -3128,6 +3128,19 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Whether a `Blurred` background blurs what is behind the window. On Wayland it depends on
+    /// the compositor and can change while the app runs, which fires the window's appearance
+    /// observers.
+    pub fn is_background_blur_supported(&self) -> bool {
+        self.platform_window.is_background_blur_supported()
+    }
+
+    /// Tells the platform the radius the app draws the window's corners with, so the background
+    /// blur stays inside the rounded shape. Only Wayland uses it.
+    pub fn set_window_corner_radius(&self, radius: Pixels) {
+        self.platform_window.set_window_corner_radius(radius);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

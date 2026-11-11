@@ -16,8 +16,9 @@ use wayland_backend::client::ObjectId;
 use wayland_client::WEnum;
 use wayland_client::{
     Proxy,
-    protocol::{wl_callback, wl_output, wl_seat, wl_surface},
+    protocol::{wl_callback, wl_output, wl_region, wl_seat, wl_surface},
 };
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_popup;
@@ -109,6 +110,10 @@ pub struct WaylandWindowState {
     app_id: Option<String>,
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
+    /// The radius the client rounds the window's corners with, so the blur behind it can
+    /// leave the cut corners clear.
+    corner_radius: Pixels,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -614,6 +619,8 @@ impl WaylandWindowState {
             surface,
             app_id: options.app_id,
             blur: None,
+            background_effect: None,
+            corner_radius: Pixels::ZERO,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -818,6 +825,9 @@ impl Drop for WaylandWindow {
         // Destroy blur first, this has no dependencies.
         if let Some(blur) = &state.blur {
             blur.release();
+        }
+        if let Some(effect) = &state.background_effect {
+            effect.destroy();
         }
 
         // Decorations must be destroyed before the xdg state.
@@ -1180,7 +1190,10 @@ impl WaylandWindowStatePtr {
                     let got_unmaximized = state.maximized && !configure.maximized;
                     state.fullscreen = configure.fullscreen;
                     state.maximized = configure.maximized;
-                    state.tiling = configure.tiling;
+                    if state.tiling != configure.tiling {
+                        state.tiling = configure.tiling;
+                        update_blur(&mut state);
+                    }
                     let visibility_changed = state.visibility != configure.visibility;
                     state.visibility = configure.visibility;
                     // Limit interactive resizes to once per vblank
@@ -1586,8 +1599,12 @@ impl WaylandWindowStatePtr {
             if size == state.bounds.size && scale == state.scale {
                 return;
             }
+            let resized = size != state.bounds.size;
             state.bounds.size = size;
             state.scale = scale;
+            if resized {
+                update_blur(&mut state);
+            }
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             if let Some(renderer) = &mut state.renderer {
                 renderer.update_drawable_size(device_bounds.size);
@@ -1717,6 +1734,18 @@ impl WaylandWindowStatePtr {
             callback(visibility);
             self.callbacks.borrow_mut().visibility_change = Some(callback);
         }
+    }
+
+    /// Reapplies the window's blur after the compositor changed whether it can blur, and tells
+    /// the app through the appearance callback so it can offer or hide the effect.
+    pub fn background_blur_changed(&self) {
+        update_window(self.state.borrow_mut());
+        let callback = self.callbacks.borrow_mut().appearance_changed.take();
+        if let Some(mut fun) = callback {
+            fun();
+            self.callbacks.borrow_mut().appearance_changed = Some(fun);
+        }
+        self.request_redraw();
     }
 
     pub fn set_appearance(&mut self, appearance: WindowAppearance) {
@@ -1984,6 +2013,22 @@ impl PlatformWindow for WaylandWindow {
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.borrow().background_appearance
+    }
+
+    fn is_background_blur_supported(&self) -> bool {
+        let state = self.borrow();
+        state.globals.background_blur.get() || state.globals.blur_manager.is_some()
+    }
+
+    fn set_window_corner_radius(&self, radius: Pixels) {
+        let mut state = self.borrow_mut();
+        if state.corner_radius == radius {
+            return;
+        }
+        state.corner_radius = radius;
+        update_blur(&mut state);
+        drop(state);
+        self.0.request_redraw();
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -2412,23 +2457,89 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
-    if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
-            if state.blur.is_none() {
-                let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
-                state.blur = Some(blur);
+    region.destroy();
+    update_blur(&mut state);
+}
+
+/// Asks the compositor to blur behind a `Blurred` window and to stop for any other appearance.
+/// `ext_background_effect_v1` is used while the compositor says it can blur, and KDE's own
+/// protocol otherwise. The change lands with the surface's next commit.
+fn update_blur(state: &mut WaylandWindowState) {
+    let blurred = state.background_appearance == WindowBackgroundAppearance::Blurred;
+    let effect_manager = state
+        .globals
+        .background_effect_manager
+        .clone()
+        .filter(|_| state.globals.background_blur.get());
+
+    if let Some(manager) = effect_manager {
+        if let Some(blur) = state.blur.take() {
+            if let Some(blur_manager) = &state.globals.blur_manager {
+                blur_manager.unset(&state.surface);
             }
-            state.blur.as_ref().unwrap().commit();
-        } else {
-            // It probably doesn't hurt to clear the blur for opaque windows
+            blur.release();
+        }
+        let region = blurred.then(|| blur_region(state));
+        let effect = state.background_effect.get_or_insert_with(|| {
+            manager.get_background_effect(&state.surface, &state.globals.qh, ())
+        });
+        effect.set_blur_region(region.as_ref());
+        if let Some(region) = region {
+            region.destroy();
+        }
+        return;
+    }
+
+    if let Some(effect) = &state.background_effect {
+        effect.set_blur_region(None);
+    }
+    let Some(blur_manager) = state.globals.blur_manager.clone() else {
+        return;
+    };
+    match blurred {
+        true => {
+            let region = blur_region(state);
+            let blur = state
+                .blur
+                .get_or_insert_with(|| blur_manager.create(&state.surface, &state.globals.qh, ()));
+            blur.set_region(Some(&region));
+            blur.commit();
+            region.destroy();
+        }
+        false => {
             blur_manager.unset(&state.surface);
-            if let Some(b) = state.blur.take() {
-                b.release()
+            if let Some(blur) = state.blur.take() {
+                blur.release();
             }
         }
     }
+}
 
-    region.destroy();
+/// The part of the surface the compositor blurs behind: the window inside its client-side
+/// shadow, with each corner cut in one pixel rows to follow the window's corner radius.
+fn blur_region(state: &WaylandWindowState) -> wl_region::WlRegion {
+    let window = inset_by_tiling(
+        Bounds::new(Point::default(), state.bounds.size),
+        state.inset(),
+        state.tiling,
+    )
+    .map(|value| f32::from(value) as i32);
+    let (x, y) = (window.origin.x, window.origin.y);
+    let (width, height) = (window.size.width.max(0), window.size.height.max(0));
+    let radius = (f32::from(state.corner_radius).round() as i32).clamp(0, width.min(height) / 2);
+
+    let region = state
+        .globals
+        .compositor
+        .create_region(&state.globals.qh, ());
+    region.add(x, y + radius, width, height - 2 * radius);
+    for row in 0..radius {
+        let rise = (radius - row) as f32 - 0.5;
+        let cut = radius - ((radius * radius) as f32 - rise * rise).sqrt().round() as i32;
+        region.add(x + cut, y + row, width - 2 * cut, 1);
+        region.add(x + cut, y + height - 1 - row, width - 2 * cut, 1);
+    }
+    region
 }
 
 pub(crate) trait WindowDecorationsExt {

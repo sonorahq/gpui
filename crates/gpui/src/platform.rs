@@ -1257,6 +1257,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Whether a `Blurred` background actually blurs what is behind the window.
+    fn is_background_blur_supported(&self) -> bool {
+        false
+    }
+    /// The radius the app rounds the window's corners with, so an effect the compositor draws
+    /// behind the window can follow its shape.
+    fn set_window_corner_radius(&self, _radius: Pixels) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
