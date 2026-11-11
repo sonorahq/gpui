@@ -1,5 +1,5 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     hash::Hash,
     os::{
         fd::{AsRawFd, BorrowedFd, FromRawFd as _, RawFd},
@@ -256,9 +256,14 @@ pub struct Globals {
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
-    pub kde_blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
-    pub background_effects_manager:
+    /// KDE's own blur manager. KWin adds and removes this global as its blur effect is switched
+    /// on and off, so the registry handler swaps it while the app runs.
+    pub blur_manager: Rc<RefCell<Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>>>,
+    pub background_effect_manager:
         Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
+    /// Whether `background_effect_manager` last reported that it can blur. The capability
+    /// arrives as an event some time after binding and can change while the app runs.
+    pub background_blur: Rc<Cell<bool>>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
@@ -309,8 +314,9 @@ impl Globals {
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
-            kde_blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
-            background_effects_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            blur_manager: Rc::new(RefCell::new(globals.bind(&qh, 1..=1, ()).ok())),
+            background_effect_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            background_blur: Rc::default(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
@@ -387,6 +393,8 @@ pub(crate) struct WaylandClientState {
     wl_outputs: HashMap<ObjectId, wl_output::WlOutput>,
     // Registry global names of the outputs, for `global_remove`.
     output_globals: HashMap<u32, ObjectId>,
+    // Registry global name of KDE's blur manager, for `global_remove`.
+    blur_manager_global: Option<u32>,
     keyboard_layout: LinuxKeyboardLayout,
     keymap_state: Option<xkb::State>,
     compose_state: Option<xkb::compose::State>,
@@ -403,6 +411,11 @@ pub(crate) struct WaylandClientState {
     vertical_modifier: f32,
     horizontal_modifier: f32,
     scroll_event_received: bool,
+    /// Whether fingers are scrolling on a touchpad, between the first axis event they send and
+    /// the `axis_stop` that says they lifted.
+    finger_scroll: bool,
+    /// Whether the frame being gathered carries the `axis_stop` that ends a finger scroll.
+    finger_scroll_stopped: bool,
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
@@ -598,6 +611,21 @@ impl WaylandClientStatePtr {
                 .callbacks
                 .displays_changed
                 .get_or_insert(callback);
+        }
+    }
+
+    /// Reapplies blur on every window and tells the app, after the compositor gained or lost a
+    /// way to blur. The client state must not be borrowed.
+    fn background_blur_changed(&self) {
+        let client = self.get_client();
+        let windows = client
+            .borrow()
+            .windows
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for window in windows {
+            window.background_blur_changed();
         }
     }
 
@@ -1009,6 +1037,7 @@ impl WaylandConnection {
         let mut wl_outputs: HashMap<ObjectId, wl_output::WlOutput> = HashMap::default();
         #[allow(clippy::mutable_key_type)]
         let mut output_globals: HashMap<u32, ObjectId> = HashMap::default();
+        let mut blur_manager_global = None;
         globals.contents().with_list(|list| -> anyhow::Result<()> {
             for global in list {
                 match &global.interface[..] {
@@ -1031,6 +1060,7 @@ impl WaylandConnection {
                         output_globals.insert(global.name, output.id());
                         wl_outputs.insert(output.id(), output);
                     }
+                    "org_kde_kwin_blur_manager" => blur_manager_global = Some(global.name),
                     _ => {}
                 }
             }
@@ -1087,6 +1117,7 @@ impl WaylandConnection {
             outputs: HashMap::default(),
             in_progress_outputs,
             output_globals,
+            blur_manager_global,
             wl_outputs,
             windows: HashMap::default(),
             fast_composition_input_surfaces:
@@ -1123,6 +1154,8 @@ impl WaylandConnection {
             },
             capslock: Capslock { on: false },
             scroll_event_received: false,
+            finger_scroll: false,
+            finger_scroll_stopped: false,
             axis_source: AxisSource::Wheel,
             mouse_location: None,
             continuous_scroll_delta: None,
@@ -1637,9 +1670,23 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     state.output_globals.insert(name, output.id());
                     state.wl_outputs.insert(output.id(), output);
                 }
+                "org_kde_kwin_blur_manager" => {
+                    let manager = registry.bind(name, 1, qh, ());
+                    state.globals.blur_manager.replace(Some(manager));
+                    state.blur_manager_global = Some(name);
+                    drop(state);
+                    this.background_blur_changed();
+                }
                 _ => {}
             },
             wl_registry::Event::GlobalRemove { name } => {
+                if state.blur_manager_global == Some(name) {
+                    state.blur_manager_global = None;
+                    state.globals.blur_manager.take();
+                    drop(state);
+                    this.background_blur_changed();
+                    return;
+                }
                 let Some(id) = state.output_globals.remove(&name) else {
                     return;
                 };
@@ -1676,10 +1723,38 @@ delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDec
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WaylandClientStatePtr: ignore xdg_positioner::XdgPositioner);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
-delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1);
-delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1);
 delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
+delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1);
+
+impl Dispatch<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, ()>
+    for WaylandClientStatePtr
+{
+    fn event(
+        this: &mut Self,
+        _: &ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1,
+        event: ext_background_effect_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let ext_background_effect_manager_v1::Event::Capabilities { flags } = event else {
+            return;
+        };
+        // A capability this binding does not know arrives as `WEnum::Unknown`, so the blur bit is
+        // read from the raw value.
+        let blur = ext_background_effect_manager_v1::Capability::from_bits_retain(flags.into())
+            .contains(ext_background_effect_manager_v1::Capability::Blur);
+        let changed = {
+            let client = this.get_client();
+            let state = client.borrow();
+            state.globals.background_blur.replace(blur) != blur
+        };
+        if changed {
+            this.background_blur_changed();
+        }
+    }
+}
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
 
@@ -2468,6 +2543,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     state.mouse_location = None;
                     state.button_pressed = None;
                     state.cursor_hidden_window = None;
+                    state.finger_scroll = false;
+                    state.finger_scroll_stopped = false;
 
                     drop(state);
                     focused_window.handle_input(input);
@@ -2632,6 +2709,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 axis_source: WEnum::Value(axis_source),
             } => {
                 state.axis_source = axis_source;
+                if axis_source != AxisSource::Finger {
+                    state.finger_scroll = false;
+                }
             }
             wl_pointer::Event::Axis {
                 axis: WEnum::Value(axis),
@@ -2721,34 +2801,64 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     _ => unreachable!(),
                 }
             }
+            wl_pointer::Event::AxisStop { .. } => {
+                if state.finger_scroll {
+                    state.scroll_event_received = true;
+                    state.finger_scroll_stopped = true;
+                }
+            }
             wl_pointer::Event::Frame => {
                 if state.scroll_event_received {
                     state.scroll_event_received = false;
                     let continuous = state.continuous_scroll_delta.take();
                     let discrete = state.discrete_scroll_delta.take();
+                    let stopped = std::mem::take(&mut state.finger_scroll_stopped);
+                    let Some(window) = state.mouse_focused_window.clone() else {
+                        state.finger_scroll = false;
+                        return;
+                    };
+                    let position = state.mouse_location.unwrap();
+                    let modifiers = state.modifiers;
+                    let mut inputs = Vec::with_capacity(2);
                     if let Some(continuous) = continuous {
-                        if let Some(window) = state.mouse_focused_window.clone() {
-                            let input = PlatformInput::Scroll(ScrollEvent {
-                                position: state.mouse_location.unwrap(),
-                                delta: ScrollDelta::Pixels(continuous),
-                                modifiers: state.modifiers,
-                                touch_phase: TouchPhase::Moved,
-                                source: ScrollSource::Pointer,
-                            });
-                            drop(state);
-                            window.handle_input(input);
-                        }
-                    } else if let Some(discrete) = discrete
-                        && let Some(window) = state.mouse_focused_window.clone()
-                    {
-                        let input = PlatformInput::Scroll(ScrollEvent {
-                            position: state.mouse_location.unwrap(),
+                        // A touchpad reports when the fingers land and lift, so its scrolls
+                        // carry phases the way they do on macOS and Windows.
+                        let touch_phase =
+                            match state.axis_source == AxisSource::Finger && !state.finger_scroll {
+                                true => {
+                                    state.finger_scroll = true;
+                                    TouchPhase::Started
+                                }
+                                false => TouchPhase::Moved,
+                            };
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
+                            position,
+                            delta: ScrollDelta::Pixels(continuous),
+                            modifiers,
+                            touch_phase,
+                            source: ScrollSource::Pointer,
+                        }));
+                    } else if let Some(discrete) = discrete {
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
+                            position,
                             delta: ScrollDelta::Lines(discrete),
-                            modifiers: state.modifiers,
+                            modifiers,
                             touch_phase: TouchPhase::Moved,
                             source: ScrollSource::Pointer,
-                        });
-                        drop(state);
+                        }));
+                    }
+                    if stopped && state.finger_scroll {
+                        state.finger_scroll = false;
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
+                            position,
+                            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+                            modifiers,
+                            touch_phase: TouchPhase::Ended,
+                            source: ScrollSource::Pointer,
+                        }));
+                    }
+                    drop(state);
+                    for input in inputs {
                         window.handle_input(input);
                     }
                 }

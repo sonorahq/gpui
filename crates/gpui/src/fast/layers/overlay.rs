@@ -57,6 +57,8 @@ fn rank(primitive: &Primitive) -> u8 {
         Primitive::SubpixelSprite(_) => 5,
         Primitive::PolychromeSprite(_) => 6,
         Primitive::Surface(_) => 7,
+        Primitive::Backdrop(_) => 8,
+        Primitive::Shader(_) => 9,
     }
 }
 
@@ -119,6 +121,12 @@ pub(crate) fn split(
             PaintOperation::StartLayer(bounds) => PaintOperation::StartLayer(*bounds),
             PaintOperation::EndLayer => PaintOperation::EndLayer,
             PaintOperation::FastRoundedClip(clip) => PaintOperation::FastRoundedClip(*clip),
+            PaintOperation::StartFilter(bounds, origin, mask, filter) => {
+                PaintOperation::StartFilter(*bounds, *origin, *mask, *filter)
+            }
+            PaintOperation::EndFilter => PaintOperation::EndFilter,
+            PaintOperation::StartSpan(id, bounds) => PaintOperation::StartSpan(*id, *bounds),
+            PaintOperation::EndSpan => PaintOperation::EndSpan,
         })
         .collect();
     Some((tiles, overlay))
@@ -139,6 +147,12 @@ pub(crate) fn lift(content: Scene) -> (Scene, Rc<[Primitive]>) {
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(&mut rest, clip)
             }
+            PaintOperation::StartFilter(bounds, origin, mask, filter) => {
+                rest.push_filter(bounds, origin, mask, filter)
+            }
+            PaintOperation::EndFilter => rest.pop_filter(),
+            PaintOperation::StartSpan(id, bounds) => rest.push_span(id, bounds),
+            PaintOperation::EndSpan => rest.pop_span(),
         }
     }
     rest.finish();

@@ -1636,6 +1636,12 @@ fn drawn_alike(a: &Row, b: &Row) -> bool {
                     size: bounds.size,
                 }),
                 PaintOperation::EndLayer => PaintOperation::EndLayer,
+                PaintOperation::StartFilter(..)
+                | PaintOperation::EndFilter
+                | PaintOperation::StartSpan(..)
+                | PaintOperation::EndSpan => {
+                    crate::fast::layers::scene::translate_operation(operation, to_row)
+                }
                 PaintOperation::FastRoundedClip(clip) => {
                     PaintOperation::FastRoundedClip(clip.translated(to_row))
                 }
@@ -2847,6 +2853,12 @@ pub(crate) fn end_paint_rows(window: &mut Window, cx: &mut App, id: Option<&Glob
                 PaintOperation::StartLayer(bounds) => bounds.origin = bounds.origin + to_content,
                 PaintOperation::EndLayer => {}
                 PaintOperation::FastRoundedClip(clip) => *clip = clip.translated(to_content),
+                PaintOperation::StartFilter(..)
+                | PaintOperation::EndFilter
+                | PaintOperation::StartSpan(..)
+                | PaintOperation::EndSpan => {
+                    *operation = crate::fast::layers::scene::translate_operation(operation, to_content)
+                }
             }
         }
         let (row_operations, overlay, whole) =

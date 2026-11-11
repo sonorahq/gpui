@@ -696,6 +696,10 @@ impl Platform for LinuxPlatform {
         self.connection.borrow().compositor_name()
     }
 
+    fn coasts_scrolls(&self) -> bool {
+        self.connection.borrow().coasts_scrolls()
+    }
+
     fn graphical_environment(&self) -> Option<GraphicalEnvironment> {
         self.connection.borrow().graphical_environment()
     }

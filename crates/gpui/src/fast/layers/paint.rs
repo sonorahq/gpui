@@ -667,6 +667,12 @@ pub(crate) fn draw_into_frame<'a>(
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(scene, clip.translated(delta))
             }
+            PaintOperation::StartFilter(..)
+            | PaintOperation::EndFilter
+            | PaintOperation::StartSpan(..)
+            | PaintOperation::EndSpan => {
+                crate::fast::layers::scene::replay_translated(scene, operation, delta)
+            }
         }
     }
 }
@@ -696,6 +702,8 @@ fn clip_primitive(primitive: &mut Primitive, viewports: Viewports) {
         Primitive::SubpixelSprite(p) => clip(&mut p.content_mask),
         Primitive::PolychromeSprite(p) => clip(&mut p.content_mask),
         Primitive::Surface(p) => clip(&mut p.content_mask),
+        Primitive::Backdrop(p) => clip(&mut p.content_mask),
+        Primitive::Shader(p) => clip(&mut p.content_mask),
     }
 }
 
@@ -750,11 +758,25 @@ fn repaint(
         origin: region.origin + to_content,
         size: region.size,
     };
-    let (content, overlay) = crate::fast::layers::overlay::lift(content);
-    let has_paths = content
-        .paint_operations
-        .iter()
-        .any(|operation| matches!(operation, PaintOperation::Primitive(Primitive::Path(_))));
+    // Filtered layers, backdrops and shaders cannot be rasterized into tiles, so content holding
+    // any of them is drawn into the frame whole, as content with paths is.
+    let has_effects = content.paint_operations.iter().any(|operation| {
+        matches!(
+            operation,
+            PaintOperation::StartFilter(..)
+                | PaintOperation::StartSpan(..)
+                | PaintOperation::Primitive(Primitive::Backdrop(_) | Primitive::Shader(_))
+        )
+    });
+    let (content, overlay) = match has_effects {
+        true => (content, Rc::from([])),
+        false => crate::fast::layers::overlay::lift(content),
+    };
+    let has_paths = has_effects
+        || content
+            .paint_operations
+            .iter()
+            .any(|operation| matches!(operation, PaintOperation::Primitive(Primitive::Path(_))));
     let mut visible = painting.viewport.scale(scale_factor);
     visible.origin += to_content;
     let mut rendered_work = 0;
@@ -923,6 +945,12 @@ fn translated_scene(scene: &Scene, delta: Point<ScaledPixels>) -> Scene {
             PaintOperation::EndLayer => translated.pop_layer(),
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(&mut translated, clip.translated(delta))
+            }
+            PaintOperation::StartFilter(..)
+            | PaintOperation::EndFilter
+            | PaintOperation::StartSpan(..)
+            | PaintOperation::EndSpan => {
+                crate::fast::layers::scene::replay_translated(&mut translated, operation, delta)
             }
         }
     }

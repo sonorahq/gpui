@@ -4,7 +4,7 @@
 //! the bounds tree replays.
 
 use crate::{
-    DrawOrder, MonochromeSprite, PaintSurface, Path, PolychromeSprite, Quad, ScaledPixels, Scene,
+    Backdrop, DrawOrder, MonochromeSprite, PaintSurface, Path, PolychromeSprite, Quad, ScaledPixels, Scene,
     Shadow, SubpixelSprite, Underline,
 };
 use std::mem;
@@ -15,6 +15,7 @@ use std::mem;
 pub(crate) struct SortScratch {
     permutation: Permutation,
     shadows: Vec<Shadow>,
+    backdrops: Vec<Backdrop>,
     quads: Vec<Quad>,
     paths: Vec<Path<ScaledPixels>>,
     underlines: Vec<Underline>,
@@ -187,6 +188,11 @@ impl Scene {
                     lines.push(format!("rounded clip {clip:?}"))
                 }
                 crate::PaintOperation::Primitive(..) => {}
+                crate::PaintOperation::StartFilter(bounds, _, _, filter) => {
+                    lines.push(format!("filter {bounds:?} {filter:?}"))
+                }
+                crate::PaintOperation::EndFilter => lines.push("end filter".into()),
+                crate::PaintOperation::StartSpan(..) | crate::PaintOperation::EndSpan => {}
             }
         }
         lines.extend(self.shadows.iter().map(|shadow| format!("{shadow:?}")));
@@ -258,6 +264,7 @@ pub(crate) fn sort_in_drawing_order(scene: &mut Scene) {
         };
     }
     sort!(shadows, |shadow: &Shadow| shadow.order);
+    sort!(backdrops, |backdrop: &Backdrop| backdrop.order);
     sort!(quads, |quad: &Quad| quad.order);
     sort!(paths, |path: &Path<ScaledPixels>| path.order);
     sort!(underlines, |underline: &Underline| underline.order);
@@ -265,6 +272,7 @@ pub(crate) fn sort_in_drawing_order(scene: &mut Scene) {
     sort_sprites!(subpixel_sprites);
     sort_sprites!(polychrome_sprites);
     sort!(surfaces, |surface: &PaintSurface| surface.order);
+    scene.shaders.sort_by_key(|shader| (shader.order, shader.shader));
 }
 
 #[cfg(test)]

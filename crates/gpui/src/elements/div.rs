@@ -2461,25 +2461,39 @@ impl Interactivity {
                     }
                 }
 
-                window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
-                        style.overflow_mask(bounds, window.rem_size()),
-                        |window| {
-                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-                            } else {
-                                None
-                            };
+                let snap = style.pixel_snap.unwrap_or(window.pixel_snapping);
+                let body = |window: &mut Window| {
+                    window.with_pixel_snapping(snap, |window| {
+                        window.with_text_style(style.text_style().cloned(), |window| {
+                            window.with_content_mask(
+                                style.overflow_mask(bounds, window.rem_size()),
+                                |window| {
+                                    let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                                        Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                                    } else {
+                                        None
+                                    };
 
-                            let scroll_offset =
-                                self.clamp_scroll_position(bounds, &style, window, cx);
-                            let result = window.with_element_opacity(style.opacity, |window| {
-                                f(&style, scroll_offset, hitbox, window, cx)
-                            });
-                            (result, element_state)
-                        },
-                    )
-                })
+                                    let scroll_offset =
+                                        self.clamp_scroll_position(bounds, &style, window, cx);
+                                    let result = window.with_element_opacity(style.opacity, |window| {
+                                        f(&style, scroll_offset, hitbox, window, cx)
+                                    });
+                                    (result, element_state)
+                                },
+                            )
+                        })
+                    })
+                };
+                // A subtree leaving the grid keeps the offset its own bounds were placed with, so
+                // its children move with it rather than half a pixel apart.
+                match window.pixel_snapping && !snap {
+                    true => {
+                        let offset = window.pixel_snap_point(window.element_offset());
+                        window.with_absolute_element_offset(offset, body)
+                    }
+                    false => body(window),
+                }
             },
         )
     }
@@ -2622,94 +2636,104 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
 
-                window.with_element_opacity(style.opacity, |window| {
-                    style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
-                        window.with_text_style(style.text_style().cloned(), |window| {
-                            window.with_content_mask(
-                                style.overflow_mask(bounds, window.rem_size()),
-                                |window| {
-                                    window.with_tab_group(tab_group, |window| {
-                                        // Register the container's own focus handle *inside* its
-                                        // tab group, so that focusing the container and then
-                                        // calling `focus_next` descends into this group's first
-                                        // item. Inserting it before `with_tab_group` would give the
-                                        // container a shallower tab path than its children; with
-                                        // sibling groups every container would then sort ahead of
-                                        // every item, and `focus_next` from a container would jump
-                                        // to the first item in the whole window instead of its own.
-                                        if let Some(focus_handle) = &self.tracked_focus_handle {
-                                            window.next_frame.tab_stops.insert(focus_handle);
-                                        }
-                                        if let Some(hitbox) = hitbox {
-                                            #[cfg(debug_assertions)]
-                                            self.paint_debug_info(
-                                                global_id, hitbox, &style, window, cx,
-                                            );
-
-                                            if let Some(drag) = cx.active_drag.as_ref() {
-                                                if let Some(mouse_cursor) = drag.cursor_style {
-                                                    window.set_window_cursor_style(mouse_cursor);
-                                                }
-                                            } else {
-                                                if let Some(mouse_cursor) = style.mouse_cursor {
-                                                    window.set_cursor_style(mouse_cursor, hitbox);
-                                                }
+                let snap = style.pixel_snap.unwrap_or(window.pixel_snapping);
+                window.with_pixel_snapping(snap, |window| {
+                    window.with_element_opacity(style.opacity, |window| {
+                        style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                            window.with_text_style(style.text_style().cloned(), |window| {
+                                window.with_content_mask(
+                                    style.overflow_mask(bounds, window.rem_size()),
+                                    |window| {
+                                        window.with_tab_group(tab_group, |window| {
+                                            // Register the container's own focus handle *inside* its
+                                            // tab group, so that focusing the container and then
+                                            // calling `focus_next` descends into this group's first
+                                            // item. Inserting it before `with_tab_group` would give the
+                                            // container a shallower tab path than its children; with
+                                            // sibling groups every container would then sort ahead of
+                                            // every item, and `focus_next` from a container would jump
+                                            // to the first item in the whole window instead of its own.
+                                            if let Some(focus_handle) = &self.tracked_focus_handle {
+                                                window.next_frame.tab_stops.insert(focus_handle);
                                             }
+                                            if let Some(hitbox) = hitbox {
+                                                #[cfg(debug_assertions)]
+                                                self.paint_debug_info(
+                                                    global_id, hitbox, &style, window, cx,
+                                                );
 
-                                            if let Some(group) = self.group.clone() {
-                                                GroupHitboxes::push(group, hitbox.id, cx);
-                                            }
+                                                if let Some(drag) = cx.active_drag.as_ref() {
+                                                    if let Some(mouse_cursor) = drag.cursor_style {
+                                                        window
+                                                            .set_window_cursor_style(mouse_cursor);
+                                                    }
+                                                } else {
+                                                    if let Some(mouse_cursor) = style.mouse_cursor {
+                                                        window
+                                                            .set_cursor_style(mouse_cursor, hitbox);
+                                                    }
+                                                }
 
-                                            if let Some(area) = self.window_control {
-                                                window.insert_window_control_hitbox(
-                                                    area,
-                                                    hitbox.clone(),
+                                                if let Some(group) = self.group.clone() {
+                                                    GroupHitboxes::push(group, hitbox.id, cx);
+                                                }
+
+                                                if let Some(area) = self.window_control {
+                                                    window.insert_window_control_hitbox(
+                                                        area,
+                                                        hitbox.clone(),
+                                                    );
+                                                }
+
+                                                self.paint_mouse_listeners(
+                                                    hitbox,
+                                                    element_state.as_mut(),
+                                                    window,
+                                                    cx,
+                                                );
+                                                self.paint_scroll_listener(
+                                                    hitbox, &style, window, cx,
                                                 );
                                             }
 
-                                            self.paint_mouse_listeners(
-                                                hitbox,
-                                                element_state.as_mut(),
-                                                window,
-                                                cx,
-                                            );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
-                                        }
+                                            self.paint_keyboard_listeners(window, cx);
 
-                                        self.paint_keyboard_listeners(window, cx);
-
-                                        if window.a11y.is_active() {
-                                            if let Some(global_id) = global_id {
-                                                if !self.a11y_action_listeners.is_empty() {
-                                                    let node_id = global_id.accesskit_node_id();
-                                                    for (action, listener) in
-                                                        self.a11y_action_listeners.drain(..)
-                                                    {
-                                                        window.on_a11y_action(
-                                                            node_id, action, listener,
-                                                        );
+                                            if window.a11y.is_active() {
+                                                if let Some(global_id) = global_id {
+                                                    if !self.a11y_action_listeners.is_empty() {
+                                                        let node_id = global_id.accesskit_node_id();
+                                                        for (action, listener) in
+                                                            self.a11y_action_listeners.drain(..)
+                                                        {
+                                                            window.on_a11y_action(
+                                                                node_id, action, listener,
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
 
-                                        f(&style, window, cx);
+                                            f(&style, window, cx);
 
-                                        if let Some(_hitbox) = hitbox {
-                                            #[cfg(any(feature = "inspector", debug_assertions))]
-                                            window.insert_inspector_hitbox(
-                                                _hitbox.id,
-                                                _inspector_id,
-                                                cx,
-                                            );
+                                            if let Some(_hitbox) = hitbox {
+                                                #[cfg(any(
+                                                    feature = "inspector",
+                                                    debug_assertions
+                                                ))]
+                                                window.insert_inspector_hitbox(
+                                                    _hitbox.id,
+                                                    _inspector_id,
+                                                    cx,
+                                                );
 
-                                            if let Some(group) = self.group.as_ref() {
-                                                GroupHitboxes::pop(group, cx);
+                                                if let Some(group) = self.group.as_ref() {
+                                                    GroupHitboxes::pop(group, cx);
+                                                }
                                             }
-                                        }
-                                    })
-                                },
-                            );
+                                        })
+                                    },
+                                );
+                            });
                         });
                     });
                 });
@@ -5861,5 +5885,103 @@ mod tests {
         assert_eq!(bounds("cell-0").origin.x, px(0.));
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
+    }
+
+    #[gpui::test]
+    fn layer_scale_does_not_change_layout_bounds(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let element = |scale| {
+            div()
+                .debug_selector(|| "scaled-root".into())
+                .flex()
+                .w(px(240.0))
+                .h(px(120.0))
+                .layer_scale(scale)
+                .child(
+                    div()
+                        .debug_selector(|| "fixed-child".into())
+                        .w(px(80.0))
+                        .h_full()
+                        .child("This text keeps the same wrapping width"),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "flex-child".into())
+                        .flex_1()
+                        .h_full(),
+                )
+        };
+
+        window.draw(
+            point(px(10.0), px(20.0)),
+            size(px(400.0), px(300.0)),
+            |_, _| element(1.0),
+        );
+        let (unscaled_bounds, unscaled_effects) = window.update(|window, _| {
+            (
+                window.rendered_frame.debug_bounds.clone(),
+                window.rendered_frame.scene.effects.len(),
+            )
+        });
+
+        window.draw(
+            point(px(10.0), px(20.0)),
+            size(px(400.0), px(300.0)),
+            |_, _| element(0.9973),
+        );
+        let (scaled_bounds, scaled_effects) = window.update(|window, _| {
+            (
+                window.rendered_frame.debug_bounds.clone(),
+                window.rendered_frame.scene.effects.len(),
+            )
+        });
+
+        assert_eq!(unscaled_bounds, scaled_bounds);
+        assert_eq!(unscaled_effects, 0);
+        assert_eq!(scaled_effects, 1);
+    }
+
+    #[gpui::test]
+    fn unsnapped_subtree_keeps_fractional_layout(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let element = |snap: Option<bool>| {
+            let row = div().debug_selector(|| "row".into()).flex();
+            let grown = div()
+                .debug_selector(|| "grown".into())
+                .w(px(40.2))
+                .h(px(10.0));
+            let (row, grown) = match snap {
+                Some(snap) => (row.pixel_snap(snap), grown.pixel_snap(snap)),
+                None => (row, grown),
+            };
+            row.child(grown).child(
+                div()
+                    .debug_selector(|| "after".into())
+                    .w(px(20.0))
+                    .h(px(10.0)),
+            )
+        };
+        let bounds = |window: &mut crate::VisualTestContext, snap| {
+            window.draw(
+                point(px(10.2), px(20.0)),
+                size(px(400.0), px(300.0)),
+                move |_, _| element(snap),
+            );
+            window.update(|window, _| {
+                let bounds = &window.rendered_frame.debug_bounds;
+                (bounds["row"], bounds["grown"], bounds["after"])
+            })
+        };
+
+        let (row, grown, after) = bounds(window, None);
+        assert_eq!(row.origin.x, px(10.0));
+        assert_eq!(grown.size.width, px(40.0));
+        assert_eq!(after.origin.x, px(50.0));
+
+        let (row, grown, after) = bounds(window, Some(false));
+        assert_eq!(row.origin.x, px(10.0));
+        assert!((grown.size.width - px(40.2)).abs() < px(0.001));
+        assert!((after.origin.x - px(50.2)).abs() < px(0.001));
+        assert_eq!(after.size.width, px(20.0));
     }
 }

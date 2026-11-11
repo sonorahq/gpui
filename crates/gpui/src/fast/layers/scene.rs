@@ -128,6 +128,12 @@ impl LayerFrame {
                 PaintOperation::FastRoundedClip(clip) => {
                     crate::fast::rounded_clip::record(&mut scene, clip.translated(delta))
                 }
+                PaintOperation::StartFilter(..)
+                | PaintOperation::EndFilter
+                | PaintOperation::StartSpan(..)
+                | PaintOperation::EndSpan => {
+                    replay_translated(&mut scene, operation, delta)
+                }
             }
         }
         scene.finish();
@@ -358,6 +364,62 @@ pub(crate) fn move_primitive(primitive: &mut Primitive, delta: Point<ScaledPixel
             mv(&mut surface.bounds);
             mv(&mut surface.content_mask.bounds);
         }
+        Primitive::Backdrop(backdrop) => {
+            mv(&mut backdrop.bounds);
+            mv(&mut backdrop.content_mask.bounds);
+        }
+        Primitive::Shader(shader) => {
+            mv(&mut shader.bounds);
+            mv(&mut shader.content_mask.bounds);
+        }
+    }
+}
+
+/// `operation` moved by `delta`, for the operations that are neither primitives, stacking
+/// layers nor rounded clips. A span keeps its bounds, which are in logical pixels and name
+/// the span rather than place anything.
+pub(crate) fn translate_operation(
+    operation: &PaintOperation,
+    delta: Point<ScaledPixels>,
+) -> PaintOperation {
+    match operation {
+        PaintOperation::Primitive(primitive) => {
+            PaintOperation::Primitive(translate_primitive(primitive, delta))
+        }
+        PaintOperation::StartLayer(bounds) => {
+            PaintOperation::StartLayer(translate_bounds(*bounds, delta))
+        }
+        PaintOperation::EndLayer => PaintOperation::EndLayer,
+        PaintOperation::FastRoundedClip(clip) => PaintOperation::FastRoundedClip(clip.translated(delta)),
+        PaintOperation::StartFilter(bounds, origin, mask, filter) => PaintOperation::StartFilter(
+            translate_bounds(*bounds, delta),
+            *origin + delta,
+            translate_bounds(*mask, delta),
+            *filter,
+        ),
+        PaintOperation::EndFilter => PaintOperation::EndFilter,
+        PaintOperation::StartSpan(id, bounds) => PaintOperation::StartSpan(*id, *bounds),
+        PaintOperation::EndSpan => PaintOperation::EndSpan,
+    }
+}
+
+/// Records a filter or span operation into `scene`, moved by `delta`.
+pub(crate) fn replay_translated(
+    scene: &mut Scene,
+    operation: &PaintOperation,
+    delta: Point<ScaledPixels>,
+) {
+    match translate_operation(operation, delta) {
+        PaintOperation::StartFilter(bounds, origin, mask, filter) => {
+            scene.push_filter(bounds, origin, mask, filter)
+        }
+        PaintOperation::EndFilter => scene.pop_filter(),
+        PaintOperation::StartSpan(id, bounds) => scene.push_span(id, bounds),
+        PaintOperation::EndSpan => scene.pop_span(),
+        PaintOperation::Primitive(primitive) => scene.insert_primitive(primitive),
+        PaintOperation::StartLayer(bounds) => scene.push_layer(bounds),
+        PaintOperation::EndLayer => scene.pop_layer(),
+        PaintOperation::FastRoundedClip(clip) => crate::fast::rounded_clip::record(scene, clip),
     }
 }
 

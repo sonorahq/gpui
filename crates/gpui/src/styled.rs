@@ -2,7 +2,7 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
+    Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow, TextShadow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
@@ -502,6 +502,20 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Smooths the element's rounded corners from circular arcs towards a squircle. 0 keeps them
+    /// round and 1 makes them close to the continuous corners of iOS, which start further along
+    /// each edge and ease into it without a visible seam. The radius set with `rounded` stays the
+    /// size of the corner, and a corner that already fills half the element stays round.
+    fn corner_smoothing(mut self, smoothing: f32) -> Self {
+        self.style().corner_smoothing = Some(smoothing.clamp(0., 1.));
+        self
+    }
+
+    /// Fully smooths the element's rounded corners. See [`Self::corner_smoothing`].
+    fn squircle(self) -> Self {
+        self.corner_smoothing(1.)
+    }
+
     /// Returns a mutable reference to the text style that has been configured on this element.
     fn text_style(&mut self) -> &mut TextStyleRefinement {
         let style: &mut StyleRefinement = self.style();
@@ -513,6 +527,82 @@ pub trait Styled: Sized {
     /// This value cascades to its child elements.
     fn text_color(mut self, color: impl Into<Hsla>) -> Self {
         self.text_style().color = Some(color.into());
+        self
+    }
+
+    /// Sets the shadows painted under the text of this element, the first one on top.
+    ///
+    /// This value cascades to its child elements.
+    fn text_shadow(mut self, shadows: impl IntoIterator<Item = TextShadow>) -> Self {
+        self.text_style().shadows = Some(shadows.into_iter().collect());
+        self
+    }
+
+    /// Blurs this element together with everything inside it.
+    fn blur(mut self, blur: Pixels) -> Self {
+        self.style().filter.get_or_insert_default().blur = Some(blur);
+        self
+    }
+
+    /// Fades this element and its subtree out towards its top and bottom edges.
+    fn fade_edges(mut self, top: Pixels, bottom: Pixels) -> Self {
+        let filter = self.style().filter.get_or_insert_default();
+        filter.fade_top = Some(top);
+        filter.fade_bottom = Some(bottom);
+        self
+    }
+
+    /// Fades this element and its subtree out towards its left and right edges.
+    fn fade_sides(mut self, left: Pixels, right: Pixels) -> Self {
+        let filter = self.style().filter.get_or_insert_default();
+        filter.fade_left = Some(left);
+        filter.fade_right = Some(right);
+        self
+    }
+
+    /// Uniformly scales this element and its subtree as one composited image around the center of
+    /// the element's original bounds.
+    ///
+    /// This is a paint-only effect. It does not change layout bounds, available space, text
+    /// wrapping, child sizes, or hitboxes. The scale must be finite and greater than zero.
+    /// The current WebGL renderer does not composite layer filters.
+    fn layer_scale(mut self, scale: f32) -> Self {
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "layer scale must be finite and greater than zero"
+        );
+        self.style().filter.get_or_insert_default().scale = Some(scale);
+        self
+    }
+
+    /// Translates this element and its subtree as one composited image without changing layout or
+    /// hitboxes. Fractional values are preserved by the compositor, making this suitable for the
+    /// presentation position of a spring animation.
+    ///
+    /// Only the pixels the layer already painted move. Nothing is pulled in from beyond its
+    /// bounds, so a translation of `n` pixels leaves an `n` pixel gap at the leading edge. It
+    /// suits settling a spring rather than carrying a whole scroll distance.
+    /// The current WebGL renderer does not composite layer filters.
+    fn layer_translate(mut self, translation: crate::Point<Pixels>) -> Self {
+        assert!(
+            translation.x.0.is_finite() && translation.y.0.is_finite(),
+            "layer translation must be finite"
+        );
+        self.style().filter.get_or_insert_default().translate = Some(translation);
+        self
+    }
+
+    /// Sets where [`Self::layer_scale`] grows from, as a fraction of this
+    /// element's bounds: `(0., 0.5)` scales out from the middle of its left
+    /// edge. Without this a scale grows from the centre.
+    fn layer_scale_origin(mut self, origin: crate::Point<f32>) -> Self {
+        self.style().filter.get_or_insert_default().scale_origin = Some(origin);
+        self
+    }
+
+    /// Blurs whatever is painted behind this element.
+    fn backdrop_blur(mut self, blur: Pixels) -> Self {
+        self.style().backdrop_blur = Some(blur);
         self
     }
 
@@ -745,6 +835,20 @@ pub trait Styled: Sized {
     /// Sets the opacity of this element and its children.
     fn opacity(mut self, opacity: f32) -> Self {
         self.style().opacity = Some(opacity);
+        self
+    }
+
+    /// Lays this element and its subtree out and paints them off the device pixel grid with
+    /// `false`, or back on it inside such a subtree with `true`.
+    ///
+    /// An element whose size or position animates through layout wants this: rounding turns a
+    /// smooth path into whole-pixel steps, so a decelerating one sits on its last pixel for
+    /// several frames. Off the grid, this element's own authored lengths keep their fractions,
+    /// and the edges of everything inside it are placed where layout puts them, shifted as one
+    /// so the element's origin still lands on a pixel. A subtree whose lengths are whole device
+    /// pixels therefore draws exactly as it would on the grid, and only what moves softens.
+    fn pixel_snap(mut self, snap: bool) -> Self {
+        self.style().pixel_snap = Some(snap);
         self
     }
 

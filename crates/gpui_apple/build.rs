@@ -67,6 +67,10 @@ mod apple_build {
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
             "TransformationMatrix".into(),
+            "Backdrop".into(),
+            "BlurParams".into(),
+            "MaskParams".into(),
+            "FilterInputIndex".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;

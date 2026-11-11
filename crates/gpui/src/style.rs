@@ -288,8 +288,18 @@ pub struct Style {
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
 
+    /// How far the corners are smoothed from circular arcs towards a squircle, from 0 for round
+    /// corners to 1 for corners close to the continuous ones of iOS.
+    pub corner_smoothing: f32,
+
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
+
+    /// Blur whatever is painted behind this element
+    pub backdrop_blur: Option<Pixels>,
+
+    /// Draw this element and its subtree offscreen, and put the result through these effects
+    pub filter: LayerFilter,
 
     /// The text style of this element
     #[refineable]
@@ -300,6 +310,11 @@ pub struct Style {
 
     /// The opacity of this element
     pub opacity: Option<f32>,
+
+    /// Whether this element and its subtree are laid out and painted on the device pixel grid.
+    /// `Some(false)` takes the subtree off the grid, `Some(true)` puts it back inside such a
+    /// subtree, and `None` follows the parent.
+    pub pixel_snap: Option<bool>,
 
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
@@ -432,6 +447,80 @@ pub enum TextAlign {
     Right,
 }
 
+/// A shadow painted under text, like one entry of the CSS `text-shadow` property. It follows
+/// the glyphs and any underline or strikethrough, but not emoji, which keep their own colours.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TextShadow {
+    /// The colour the shadow copy of the text is painted in.
+    pub color: Hsla,
+    /// How far the shadow sits from the text.
+    pub offset: Point<Pixels>,
+    /// How far the shadow blurs, with the same radius as [`LayerFilter::blur`].
+    pub blur: Pixels,
+}
+
+impl TextShadow {
+    /// Creates a shadow straight under the text with no blur.
+    pub fn new(color: impl Into<Hsla>) -> Self {
+        Self {
+            color: color.into(),
+            offset: Point::default(),
+            blur: px(0.),
+        }
+    }
+
+    /// Moves the shadow away from the text.
+    pub fn offset(mut self, x: Pixels, y: Pixels) -> Self {
+        self.offset = point(x, y);
+        self
+    }
+
+    /// Sets how far the shadow blurs.
+    pub fn blur(mut self, blur: Pixels) -> Self {
+        self.blur = blur;
+        self
+    }
+}
+
+/// Effects applied to an element and its subtree as a whole, the way CSS filters work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct LayerFilter {
+    /// Blur the layer by this radius.
+    pub blur: Option<Pixels>,
+    /// Fade the layer out over this distance from its top edge.
+    pub fade_top: Option<Pixels>,
+    /// Fade the layer out over this distance from its bottom edge.
+    pub fade_bottom: Option<Pixels>,
+    /// Fade the layer out over this distance from its left edge.
+    pub fade_left: Option<Pixels>,
+    /// Fade the layer out over this distance from its right edge.
+    pub fade_right: Option<Pixels>,
+    /// Uniformly scale the composited layer without affecting layout. Values must be finite and
+    /// greater than zero.
+    pub scale: Option<f32>,
+    /// Translate the composited layer without affecting layout or hitboxes.
+    pub translate: Option<Point<Pixels>>,
+    /// Where the scale grows from, as a fraction of the layer's own bounds:
+    /// `(0, 0)` is its top left corner, `(1, 1)` its bottom right. Defaults to
+    /// the centre.
+    pub scale_origin: Option<Point<f32>>,
+}
+
+impl LayerFilter {
+    /// Whether the layer would leave its contents untouched.
+    pub fn is_none(&self) -> bool {
+        self.blur.is_none()
+            && self.fade_top.is_none()
+            && self.fade_bottom.is_none()
+            && self.fade_left.is_none()
+            && self.fade_right.is_none()
+            && self.scale.is_none_or(|scale| scale == 1.0)
+            && self
+                .translate
+                .is_none_or(|translate| translate == Point::default())
+    }
+}
+
 /// The properties that can be used to style text in GPUI
 #[derive(Refineable, Clone, Debug, PartialEq)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -480,6 +569,10 @@ pub struct TextStyle {
 
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
+
+    /// Shadows painted under the text, like the CSS `text-shadow` property. The first one
+    /// lands on top.
+    pub shadows: Vec<TextShadow>,
 }
 
 impl Default for TextStyle {
@@ -501,6 +594,7 @@ impl Default for TextStyle {
             text_overflow: None,
             text_align: TextAlign::default(),
             line_clamp: None,
+            shadows: Vec::new(),
         }
     }
 }
@@ -692,6 +786,36 @@ impl Style {
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
     ) {
+        if self.filter.is_none() {
+            return self.paint_sharp(bounds, window, cx, continuation);
+        }
+
+        window.with_filter(bounds, self.filter, self.shadow_reach(), |window| {
+            self.paint_sharp(bounds, window, cx, continuation)
+        });
+    }
+
+    /// How far this element's drop shadows reach past its bounds, the gaussian tail included,
+    /// which is the room a layer opened for its filter has to keep.
+    fn shadow_reach(&self) -> Pixels {
+        self.box_shadow
+            .iter()
+            .filter(|shadow| !shadow.inset)
+            .map(|shadow| {
+                shadow.offset.x.abs().max(shadow.offset.y.abs())
+                    + shadow.spread_radius
+                    + shadow.blur_radius * 3.
+            })
+            .fold(Pixels::ZERO, Pixels::max)
+    }
+
+    fn paint_sharp(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
         #[cfg(debug_assertions)]
         if self.debug_below {
             cx.set_global(DebugBelow)
@@ -707,8 +831,13 @@ impl Style {
             .corner_radii
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
+        let smoothing = self.corner_smoothing.clamp(0., 1.);
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_drop_shadows(bounds, corner_radii, smoothing, &self.box_shadow);
+
+        if let Some(blur) = self.backdrop_blur {
+            window.paint_backdrop(bounds, corner_radii, smoothing, blur);
+        }
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
@@ -727,17 +856,20 @@ impl Style {
                 None => Hsla::default(),
             };
             border_color.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background_color.unwrap_or_default(),
-                Edges::default(),
-                border_color,
-                self.border_style,
-            ));
+            window.paint_quad(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background_color.unwrap_or_default(),
+                    Edges::default(),
+                    border_color,
+                    self.border_style,
+                )
+                .corner_smoothing(smoothing),
+            );
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_inset_shadows(bounds, corner_radii, smoothing, &self.box_shadow);
 
         crate::fast::rounded_clip::paint_children(self, bounds, window, cx, continuation);
 
@@ -745,14 +877,17 @@ impl Style {
             let border_widths = self.border_widths.to_pixels(rem_size);
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+            window.paint_quad(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background,
+                    border_widths,
+                    self.border_color.unwrap_or_default(),
+                    self.border_style,
+                )
+                .corner_smoothing(smoothing),
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -805,10 +940,14 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
+            corner_smoothing: 0.,
             box_shadow: Default::default(),
+            backdrop_blur: None,
+            filter: LayerFilter::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            pixel_snap: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
@@ -1330,11 +1469,42 @@ impl From<Position> for taffy::style::Position {
 
 #[cfg(test)]
 mod tests {
-    use crate::{blue, green, px, red, yellow};
+    use crate::{blue, green, point, px, red, yellow};
 
     use super::*;
 
     use util_macros::perf;
+
+    #[test]
+    fn layer_filter_scale_participates_in_none_detection() {
+        let mut filter = LayerFilter::default();
+        assert!(filter.is_none());
+
+        filter.scale = Some(1.0);
+        assert!(filter.is_none());
+
+        filter.scale = Some(0.99);
+        assert!(!filter.is_none());
+    }
+
+    #[test]
+    fn layer_scale_builder_sets_a_paint_filter() {
+        let refinement = StyleRefinement::default().layer_scale(0.9973);
+        assert_eq!(refinement.filter.unwrap().scale, Some(0.9973));
+    }
+
+    #[test]
+    fn layer_translate_builder_sets_a_paint_filter() {
+        let translation = point(px(0.25), px(-0.75));
+        let refinement = StyleRefinement::default().layer_translate(translation);
+        assert_eq!(refinement.filter.unwrap().translate, Some(translation));
+    }
+
+    #[test]
+    #[should_panic(expected = "layer scale must be finite and greater than zero")]
+    fn layer_scale_builder_rejects_invalid_values() {
+        let _ = StyleRefinement::default().layer_scale(f32::NAN);
+    }
 
     #[perf]
     fn test_basic_highlight_style_combination() {

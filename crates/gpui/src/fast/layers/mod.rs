@@ -70,8 +70,10 @@ impl Default for WindowLayers {
         Self {
             layers: FxHashMap::default(),
             next_key: 0,
+            // Opt in: a frame holding filtered layers, backdrops or shaders is drawn by the
+            // renderer's own pass loop, which does not composite layer tiles.
             enabled: COMPILED
-                && std::env::var("GPUI_SCROLL_LAYERS").map_or(true, |value| value != "0"),
+                && std::env::var("GPUI_SCROLL_LAYERS").is_ok_and(|value| value == "1"),
             scrolls: invalidate::ScrollLog::default(),
             painting: None,
             #[cfg(any(test, feature = "test-support"))]

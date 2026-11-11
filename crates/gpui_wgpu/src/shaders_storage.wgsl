@@ -12,6 +12,9 @@
 @group(1) @binding(0) var<storage, read> b_underlines: array<Underline>;
 @group(1) @binding(0) var<storage, read> b_mono_sprites: array<MonochromeSprite>;
 @group(1) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSprite>;
+@group(1) @binding(0) var<storage, read> b_backdrops: array<Backdrop>;
+@group(1) @binding(0) var<storage, read> b_blurs: array<Blur>;
+@group(1) @binding(0) var<storage, read> b_masks: array<Mask>;
 
 fn load_quad(instance_id: u32) -> Quad {
     return b_quads[instance_id];
@@ -39,4 +42,17 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     return b_poly_sprites[instance_id];
+}
+
+fn load_backdrop(instance_id: u32) -> Backdrop {
+    return b_backdrops[instance_id];
+}
+
+fn load_blur(instance_id: u32) -> Blur {
+    return b_blurs[instance_id];
+}
+
+
+fn load_mask(instance_id: u32) -> Mask {
+    return b_masks[instance_id];
 }

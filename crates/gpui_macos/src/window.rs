@@ -1934,6 +1934,10 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().background_appearance
     }
 
+    fn is_background_blur_supported(&self) -> bool {
+        true
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         false
     }
@@ -2189,6 +2193,12 @@ impl PlatformWindow for MacWindow {
                 metal_frames.wake();
             }
         }))
+    fn can_release_idle_gpu_memory(&self) -> bool {
+        true
+    }
+
+    fn release_idle_gpu_memory(&self) {
+        self.0.lock().renderer.release_idle_targets();
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -3435,6 +3445,11 @@ extern "C" fn step(view: *mut c_void) {
     let view = view as *mut AnyObject;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    // A frame still on the GPU means this tick would only queue behind it. The next tick asks
+    // again, and the window stays dirty until then.
+    if lock.renderer.gpu_behind() {
+        return;
+    }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         let signal = match &lock.frame_source {

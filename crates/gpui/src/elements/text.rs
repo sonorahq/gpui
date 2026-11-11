@@ -1,9 +1,9 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextRun,
-    TextStyle, TooltipId, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
-    set_tooltip_on_window,
+    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayerFilter, LayoutId,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
+    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
+    WrappedLineLayout, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -677,32 +677,53 @@ impl TextLayout {
             .context("prepaint has not been performed")?;
 
         let line_height = element_state.line_height;
-        let mut line_origin = bounds.origin;
         let text_style = crate::fast::text_style::text_paint_style(window);
-        for line in &element_state.lines {
-            if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
-                line.paint_background(
-                    line_origin,
-                    line_height,
-                    text_style.text_align,
-                    Some(bounds),
-                    window,
-                    cx,
-                )
-                .log_err();
+        let align = text_style.text_align;
+        let origins = element_state
+            .lines
+            .iter()
+            .scan(bounds.origin, |origin, line| {
+                let this = *origin;
+                origin.y += line.size(line_height).height;
+                Some(this)
+            });
+        let lines = || element_state.lines.iter().zip(origins.clone());
+
+        if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
+            for (line, origin) in lines() {
+                line.paint_background(origin, line_height, align, Some(bounds), window, cx)
+                    .log_err();
             }
-            if matches!(pass, TextPaintPass::All | TextPaintPass::Foreground) {
-                line.paint(
-                    line_origin,
-                    line_height,
-                    text_style.text_align,
-                    Some(bounds),
-                    window,
-                    cx,
-                )
+        }
+        if !matches!(pass, TextPaintPass::All | TextPaintPass::Foreground) {
+            return Ok(());
+        }
+        // Painted bottom first, so the first shadow lands on top as it does in CSS.
+        for shadow in text_style.shadows.iter().rev() {
+            let filter = LayerFilter {
+                blur: (shadow.blur > px(0.)).then_some(shadow.blur),
+                ..LayerFilter::default()
+            };
+            let reach = shadow.offset.x.abs().max(shadow.offset.y.abs());
+            window.with_filter(bounds, filter, reach, |window| {
+                for (line, origin) in lines() {
+                    let origin = origin + shadow.offset;
+                    line.paint_tinted(
+                        origin,
+                        line_height,
+                        align,
+                        Some(bounds),
+                        shadow.color,
+                        window,
+                        cx,
+                    )
+                    .log_err();
+                }
+            });
+        }
+        for (line, origin) in lines() {
+            line.paint(origin, line_height, align, Some(bounds), window, cx)
                 .log_err();
-            }
-            line_origin.y += line.size(line_height).height;
         }
         Ok(())
     }

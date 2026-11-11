@@ -1809,6 +1809,16 @@ impl PlatformWindow for X11Window {
         crate::fast::composition::x11::set_composition_order(self, fast_surfaces)
     }
 
+    fn can_release_idle_gpu_memory(&self) -> bool {
+        true
+    }
+
+    fn release_idle_gpu_memory(&self) {
+        if let Some(renderer) = self.0.state.borrow_mut().renderer.as_mut() {
+            renderer.release_idle_targets();
+        }
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0
             .state

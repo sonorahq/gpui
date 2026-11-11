@@ -1420,6 +1420,12 @@ impl App {
         self.platform.is_cursor_visible()
     }
 
+    /// Hides the OS cursor until the mouse next moves. Fullscreen stages call
+    /// this as their chrome fades out; any pointer motion brings it back.
+    pub fn hide_cursor(&self) {
+        self.platform.hide_cursor_until_mouse_moves();
+    }
+
     /// Returns whether non-essential animations (e.g. loading spinners) should
     /// be rendered in a static state instead of animating.
     pub fn reduce_motion(&self) -> bool {
@@ -2497,6 +2503,16 @@ impl App {
     /// Accessor for the text system.
     pub fn text_system(&self) -> &Arc<TextSystem> {
         &self.text_system
+    }
+
+    /// Validates a custom shader and registers it for painting with
+    /// [`Window::paint_shader`]. Registering the same source again is cheap and returns the
+    /// same shader. An invalid source is logged and returned as an error.
+    pub fn register_shader(
+        &mut self,
+        source: crate::ShaderSource,
+    ) -> Result<crate::Shader, crate::ShaderError> {
+        crate::Shader::new(source)
     }
 
     /// Invokes a callback with grapheme clusters that exhausted font fallback.

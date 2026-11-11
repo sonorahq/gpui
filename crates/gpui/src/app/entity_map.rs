@@ -59,6 +59,8 @@ pub(crate) struct EntityMap {
     accessed_entities: RefCell<AccessedEntities>,
     pub(crate) access_log: crate::fast::dependencies::EntityAccessLog,
     pub(crate) ref_counts: Arc<RwLock<EntityRefCounts>>,
+    #[cfg(feature = "profiler")]
+    names: SecondaryMap<EntityId, &'static str>,
 }
 
 /// The entities accessed during the current draw. An access is recorded only
@@ -104,6 +106,8 @@ impl EntityMap {
                 scopes: Vec::new(),
             }),
             access_log: crate::fast::dependencies::EntityAccessLog::default(),
+            #[cfg(feature = "profiler")]
+            names: SecondaryMap::new(),
             ref_counts: Arc::new(RwLock::new(EntityRefCounts {
                 counts: SlotMap::with_key(),
                 dropped_entity_ids: Vec::new(),
@@ -160,8 +164,16 @@ impl EntityMap {
         crate::fast::dependencies::note_access(self, slot.entity_id);
 
         let handle = slot.0;
+        #[cfg(feature = "profiler")]
+        self.names.insert(handle.entity_id, type_name::<T>());
         self.entities.insert(handle.entity_id, Box::new(entity));
         handle
+    }
+
+    /// The type an entity was created as, for profiler readouts.
+    #[cfg(feature = "profiler")]
+    pub fn name(&self, id: EntityId) -> &'static str {
+        self.names.get(id).copied().unwrap_or("?")
     }
 
     /// Move an entity to the stack.

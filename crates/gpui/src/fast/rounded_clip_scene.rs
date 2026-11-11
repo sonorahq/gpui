@@ -25,6 +25,11 @@ pub(crate) fn compile(scene: &mut Scene) {
     if scene.fast_rounded_clip.scopes.is_empty() || scene.fast_rounded_clip.compiled {
         return;
     }
+    // Filtered layers, backdrops and shaders are drawn only by the renderers' own pass loops,
+    // which know nothing of clip groups, so such a scene keeps its rectangular clips.
+    if !scene.effects.is_empty() || !scene.backdrops.is_empty() || !scene.shaders.is_empty() {
+        return;
+    }
     let operations = mem::take(&mut scene.paint_operations);
     let layers: Vec<LayerFrame> = scene
         .layers
@@ -99,6 +104,15 @@ pub(crate) fn compile(scene: &mut Scene) {
                 .insert_primitive(primitive.clone()),
             PaintOperation::StartLayer(bounds) => stack.last_mut().unwrap().push_layer(*bounds),
             PaintOperation::EndLayer => stack.last_mut().unwrap().pop_layer(),
+            PaintOperation::StartFilter(bounds, origin, mask, filter) => stack
+                .last_mut()
+                .unwrap()
+                .push_filter(*bounds, *origin, *mask, *filter),
+            PaintOperation::EndFilter => stack.last_mut().unwrap().pop_filter(),
+            PaintOperation::StartSpan(id, bounds) => {
+                stack.last_mut().unwrap().push_span(*id, *bounds)
+            }
+            PaintOperation::EndSpan => stack.last_mut().unwrap().pop_span(),
         }
     }
     assert!(

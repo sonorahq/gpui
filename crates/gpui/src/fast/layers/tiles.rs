@@ -66,6 +66,26 @@ pub(crate) fn tile_hashes(
                     });
                 }
             }
+            PaintOperation::StartFilter(bounds, _, _, filter) => {
+                for_tiles(&mut hashers, *bounds, tile_size, |hasher, origin| {
+                    hasher.write_u8(3);
+                    hash_clipped(
+                        &Bounds {
+                            origin: bounds.origin + origin,
+                            size: bounds.size,
+                        },
+                        &tile,
+                        hasher,
+                    );
+                    hasher.write(format!("{filter:?}").as_bytes());
+                });
+            }
+            PaintOperation::EndFilter => {
+                for hasher in hashers.values_mut() {
+                    hasher.write_u8(4);
+                }
+            }
+            PaintOperation::StartSpan(..) | PaintOperation::EndSpan => {}
             PaintOperation::FastRoundedClip(clip) => {
                 for (coord, hasher) in &mut hashers {
                     let delta = point(
@@ -115,6 +135,13 @@ pub(crate) fn part_tile_hashes(
             PaintOperation::StartLayer(_) => hasher.write_u8(1),
             PaintOperation::EndLayer => hasher.write_u8(2),
             PaintOperation::FastRoundedClip(clip) => clip.hash(&mut hasher),
+            PaintOperation::StartFilter(bounds, _, _, filter) => {
+                hasher.write_u8(3);
+                hash_bounds(bounds, &mut hasher);
+                hasher.write(format!("{filter:?}").as_bytes());
+            }
+            PaintOperation::EndFilter => hasher.write_u8(4),
+            PaintOperation::StartSpan(..) | PaintOperation::EndSpan => {}
         }
     }
     let hash = hasher.finish();
@@ -300,6 +327,22 @@ fn hash_primitive(primitive: &Primitive, tile: &Bounds<ScaledPixels>, hasher: &m
             hasher.write_u8(7);
             hash_bounds(&surface.bounds, hasher);
             hash_mask(&surface.content_mask, tile, hasher);
+        }
+        // Content holding a backdrop or a shader is drawn into the frame rather than into
+        // tiles, so these only need to hash apart.
+        Primitive::Backdrop(backdrop) => {
+            hasher.write_u8(8);
+            hash_bounds(&backdrop.bounds, hasher);
+            hash_mask(&backdrop.content_mask, tile, hasher);
+            hash_f32(backdrop.blur, hasher);
+            hash_f32(backdrop.opacity, hasher);
+        }
+        Primitive::Shader(shader) => {
+            hasher.write_u8(9);
+            hash_bounds(&shader.bounds, hasher);
+            hash_mask(&shader.content_mask, tile, hasher);
+            hash_f32(shader.time, hasher);
+            hash_f32(shader.opacity, hasher);
         }
     }
 }

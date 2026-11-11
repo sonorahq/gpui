@@ -33,16 +33,25 @@ mod shader_compilation {
         // Check if fxc.exe is available
         let fxc_path = find_fxc_compiler();
 
-        // Define all modules
+        // Define all modules, and whether each has a vertex entry point of its own. One that
+        // does not is drawn from another module's, so only its fragment half is compiled.
         let modules = [
-            "quad",
-            "shadow",
-            "path_rasterization",
-            "path_sprite",
-            "underline",
-            "monochrome_sprite",
-            "subpixel_sprite",
-            "polychrome_sprite",
+            ("backdrop", true),
+            ("backdrop_punch", false),
+            ("gaussian", true),
+            ("kawase_down", true),
+            ("kawase_up", false),
+            ("blit", true),
+            ("mask", true),
+            ("quad", true),
+            ("shadow", true),
+            ("path_rasterization", true),
+            ("path_sprite", true),
+            ("underline", true),
+            ("monochrome_sprite", true),
+            ("subpixel_sprite", true),
+            ("subpixel_sprite_layered", false),
+            ("polychrome_sprite", true),
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);
@@ -50,9 +59,10 @@ mod shader_compilation {
             fs::remove_file(&rust_binding_path)
                 .expect("Failed to remove existing Rust binding file");
         }
-        for module in modules {
+        for (module, has_vertex) in modules {
             compile_shader_for_module(
                 module,
+                has_vertex,
                 &out_dir,
                 &fxc_path,
                 shader_path.to_str().unwrap(),
@@ -133,23 +143,26 @@ mod shader_compilation {
 
     fn compile_shader_for_module(
         module: &str,
+        has_vertex: bool,
         out_dir: &str,
         fxc_path: &str,
         shader_path: &str,
         rust_binding_path: &str,
     ) {
         // Compile vertex shader
-        let output_file = format!("{}/{}_vs.h", out_dir, module);
-        let const_name = format!("{}_VERTEX_BYTES", module.to_uppercase());
-        compile_shader_impl(
-            fxc_path,
-            &format!("{module}_vertex"),
-            &output_file,
-            &const_name,
-            shader_path,
-            "vs_4_1",
-        );
-        generate_rust_binding(&const_name, &output_file, rust_binding_path);
+        if has_vertex {
+            let output_file = format!("{}/{}_vs.h", out_dir, module);
+            let const_name = format!("{}_VERTEX_BYTES", module.to_uppercase());
+            compile_shader_impl(
+                fxc_path,
+                &format!("{module}_vertex"),
+                &output_file,
+                &const_name,
+                shader_path,
+                "vs_4_1",
+            );
+            generate_rust_binding(&const_name, &output_file, rust_binding_path);
+        }
 
         // Compile fragment shader
         let output_file = format!("{}/{}_ps.h", out_dir, module);

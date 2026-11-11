@@ -37,6 +37,8 @@ mod element;
 mod elements;
 mod executor;
 mod fast;
+/// Frame timing written to a file when `GPUI_FRAME_STATS` is set.
+pub mod frame_stats;
 mod geometry;
 mod gestures;
 mod global;
@@ -87,6 +89,7 @@ pub mod randomized_element_tree;
 mod bench;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod seeds;
+mod shader;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub use seeds::calculate_seeds;
 
@@ -155,6 +158,7 @@ pub use platform::*;
 pub use profiler::*;
 pub use refineable::*;
 pub use scene::*;
+pub use shader::*;
 pub use shared_uri::*;
 pub use spring::*;
 pub use style::*;

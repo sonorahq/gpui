@@ -13,8 +13,6 @@ use gpui::{
     SharedString, SharedUri, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     img, prelude::*, px, rgb, size,
 };
-#[cfg(not(target_family = "wasm"))]
-use reqwest_client::ReqwestClient;
 
 struct Assets {
     base: PathBuf,

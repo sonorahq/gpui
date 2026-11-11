@@ -1,9 +1,15 @@
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
+<<<<<<< HEAD
+=======
+use collections::FxHashMap;
+use core_graphics::geometry::CGSize;
+>>>>>>> sonorahq/master
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
+    KAWASE_LEVELS, Kawase, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
+    Scene, ShaderId, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -31,7 +37,23 @@ use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
 
+<<<<<<< HEAD
 use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+=======
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+>>>>>>> sonorahq/master
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -46,6 +68,18 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+const INITIAL_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// How long the instance buffer pool watches its peak use before deciding whether to shrink.
+const INSTANCE_BUFFER_SETTLE: Duration = Duration::from_secs(5);
+/// How long an offscreen target may go unused before its memory is given back. A frame with a
+/// blur, layer or path on screen touches its targets every time, so only targets that nothing
+/// on screen draws through are released.
+const IDLE_RELEASE: Duration = Duration::from_secs(2);
+/// How deeply filtered layers can nest before the innermost ones stop being filtered.
+const LAYER_DEPTH: usize = 4;
+/// How long a frame may stay on the GPU before the window draws again without waiting for it, so a
+/// completion that never arrives cannot freeze the window.
+const FRAME_STALL: Duration = Duration::from_millis(250);
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -64,14 +98,23 @@ pub fn new_overlay_renderer(context: self::Context, base: &Renderer) -> Result<R
 
 pub struct InstanceBufferPool {
     buffer_size: usize,
+<<<<<<< HEAD
     buffers: Vec<InstanceBuffer>,
+=======
+    buffers: Vec<metal::Buffer>,
+    /// The most any frame has written since `window` began.
+    peak: usize,
+    window: Instant,
+>>>>>>> sonorahq/master
 }
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: INITIAL_INSTANCE_BUFFER_SIZE,
             buffers: Vec::new(),
+            peak: 0,
+            window: Instant::now(),
         }
     }
 }
@@ -120,6 +163,29 @@ impl InstanceBufferPool {
             self.buffers.push(buffer)
         }
     }
+
+    /// Shrinks the buffers once every frame over the last `INSTANCE_BUFFER_SETTLE` has needed
+    /// under a quarter of one. `used` is what the frame just encoded wrote, and the new size keeps
+    /// twice the peak so the next busy frame does not grow it straight back. Buffers still in
+    /// flight are dropped when they come back, since their size no longer matches.
+    pub(crate) fn settle(&mut self, used: usize) {
+        self.peak = self.peak.max(used);
+        let now = Instant::now();
+        if now.duration_since(self.window) < INSTANCE_BUFFER_SETTLE {
+            return;
+        }
+        let peak = mem::take(&mut self.peak);
+        self.window = now;
+
+        let buffer_size = (peak * 2)
+            .next_power_of_two()
+            .clamp(INITIAL_INSTANCE_BUFFER_SIZE, MAX_INSTANCE_BUFFER_SIZE);
+        if peak * 4 > self.buffer_size || buffer_size >= self.buffer_size {
+            return;
+        }
+        log::info!("decreased instance buffer size to {buffer_size}");
+        self.reset(buffer_size);
+    }
 }
 
 enum DisplayLinkMode {
@@ -137,6 +203,7 @@ pub struct MetalRenderer {
     presents_with_transaction: bool,
     display_link_mode: DisplayLinkMode,
     /// For headless rendering, tracks whether output should be opaque
+<<<<<<< HEAD
     pub(crate) opaque: bool,
     pub(crate) command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pub(crate) paths_rasterization_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
@@ -153,12 +220,73 @@ pub struct MetalRenderer {
     core_video_texture_cache: CFRetained<CVMetalTextureCache>,
     pub(crate) path_intermediate_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     pub(crate) path_intermediate_msaa_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+=======
+    opaque: bool,
+    command_queue: CommandQueue,
+    paths_rasterization_pipeline_state: metal::RenderPipelineState,
+    path_sprites_pipeline_state: metal::RenderPipelineState,
+    shadows_pipeline_state: metal::RenderPipelineState,
+    quads_pipeline_state: metal::RenderPipelineState,
+    underlines_pipeline_state: metal::RenderPipelineState,
+    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
+    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    surfaces_pipeline_state: metal::RenderPipelineState,
+    backdrops_pipeline_state: metal::RenderPipelineState,
+    backdrop_punch_pipeline_state: metal::RenderPipelineState,
+    gaussian_pipeline_state: metal::RenderPipelineState,
+    kawase_down_pipeline_state: metal::RenderPipelineState,
+    kawase_up_pipeline_state: metal::RenderPipelineState,
+    blit_pipeline_state: metal::RenderPipelineState,
+    composite_pipeline_state: metal::RenderPipelineState,
+    masked_pipeline_state: metal::RenderPipelineState,
+    /// A pipeline per custom shader, built from its MSL translation the first time a frame draws
+    /// it. A shader that failed to build is kept as `None`, so it is not built again every frame.
+    custom_pipeline_states: FxHashMap<ShaderId, Option<metal::RenderPipelineState>>,
+    unit_vertices: metal::Buffer,
+    #[allow(clippy::arc_with_non_send_sync)]
+    instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+    sprite_atlas: Arc<MetalAtlas>,
+    core_video_texture_cache: CFRetained<CVMetalTextureCache>,
+    path_targets: Option<PathTargets>,
+>>>>>>> sonorahq/master
     path_sample_count: u32,
+    filter_targets: FilterTargets,
+    /// Frames `draw` has committed that the GPU has not finished yet, and what wakes the window
+    /// once they are done.
+    frame_pacing: Arc<FramePacing>,
+    /// When `draw` last committed a frame.
+    committed_at: Instant,
+    /// When the frame being encoded started, which stamps every offscreen target it touches.
+    frame_time: Instant,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     pub(crate) fast_layers: crate::fast::layers::TileCache,
+}
+
+/// Frames on the GPU and the window's request for one more. The window skips a display tick
+/// while a frame is still running, and the frame that finishes asks for the one it held back.
+#[derive(Default)]
+struct FramePacing {
+    in_flight: AtomicUsize,
+    waiting: AtomicBool,
+    wake: Mutex<Option<FrameWaker>>,
+}
+
+/// Asks the window for a frame from a Metal completion thread.
+type FrameWaker = Box<dyn Fn() + Send + Sync>;
+
+impl FramePacing {
+    /// Counts a frame off the GPU and asks for the frame a skipped display tick held back.
+    fn frame_done(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if self.waiting.swap(false, Ordering::SeqCst)
+            && let Some(wake) = self.wake.lock().as_ref()
+        {
+            wake();
+        }
+    }
 }
 
 #[repr(C)]
@@ -399,7 +527,87 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         )?;
 
+<<<<<<< HEAD
         let command_queue = crate::fast::dynamic_textures::command_queue(&device)?;
+=======
+        // A backdrop mixes the blurred copy into what it covers rather than laying it over:
+        // the punch scales the destination by `1 - k`, the draw after it adds `blurred * k`.
+        // Laying it over cost a see-through window its transparency.
+        let backdrops_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "backdrops",
+            "backdrop_vertex",
+            "backdrop_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Add,
+        );
+        let backdrop_punch_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "backdrop_punch",
+            "backdrop_vertex",
+            "backdrop_punch_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Punch,
+        );
+        let gaussian_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "gaussian",
+            "filter_vertex",
+            "gaussian_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Replace,
+        );
+        let kawase_down_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "kawase_down",
+            "filter_vertex",
+            "kawase_down_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Replace,
+        );
+        let kawase_up_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "kawase_up",
+            "filter_vertex",
+            "kawase_up_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Replace,
+        );
+        let blit_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "blit",
+            "filter_vertex",
+            "blit_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Replace,
+        );
+        let composite_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "composite",
+            "filter_vertex",
+            "mask_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Over,
+        );
+        let masked_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "masked",
+            "filter_vertex",
+            "mask_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Over,
+        );
+
+        let command_queue = device.new_command_queue();
+>>>>>>> sonorahq/master
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
         #[expect(
             clippy::arc_with_non_send_sync,
@@ -437,13 +645,25 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            backdrops_pipeline_state,
+            backdrop_punch_pipeline_state,
+            gaussian_pipeline_state,
+            kawase_down_pipeline_state,
+            kawase_up_pipeline_state,
+            blit_pipeline_state,
+            composite_pipeline_state,
+            masked_pipeline_state,
+            custom_pipeline_states: FxHashMap::default(),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
-            path_intermediate_texture: None,
-            path_intermediate_msaa_texture: None,
+            path_targets: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            filter_targets: FilterTargets::default(),
+            frame_pacing: Arc::default(),
+            committed_at: Instant::now(),
+            frame_time: Instant::now(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
             fast_layers: crate::fast::layers::TileCache::default(),
@@ -516,6 +736,7 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.setDrawableSize(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
+<<<<<<< HEAD
         if let Err(error) = self.update_path_intermediate_textures(size) {
             log::error!("failed to resize path textures: {error:#}");
         }
@@ -523,10 +744,34 @@ impl MetalRenderer {
     }
 
     pub(crate) fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) -> Result<()> {
+=======
+        // Targets made for the old size are freed now rather than held until the next frame
+        // that draws a path or a filter rebuilds them.
+        if self
+            .path_targets
+            .as_ref()
+            .is_some_and(|targets| targets.size != size)
+        {
+            self.path_targets = None;
+        }
+        if self.filter_targets.size != size {
+            self.filter_targets = FilterTargets::default();
+        }
+    }
+
+    /// The textures paths are rasterized through at `size`, created if no frame has drawn a
+    /// path at that size since they were last released. None for an empty drawable, which
+    /// happens before the first layout and cannot back a texture.
+    fn path_targets(
+        &mut self,
+        size: Size<DevicePixels>,
+    ) -> Option<(metal::Texture, Option<metal::Texture>)> {
+>>>>>>> sonorahq/master
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
+<<<<<<< HEAD
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
             return Ok(());
@@ -566,8 +811,93 @@ impl MetalRenderer {
                 MTLStorageMode::Memoryless
             } else {
                 MTLStorageMode::Private
-            };
+=======
+            return None;
+        }
 
+        if self
+            .path_targets
+            .as_ref()
+            .is_none_or(|targets| targets.size != size)
+        {
+            let texture_descriptor = metal::TextureDescriptor::new();
+            texture_descriptor.set_width(size.width.0 as u64);
+            texture_descriptor.set_height(size.height.0 as u64);
+            texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            texture_descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            let intermediate = self.device.new_texture(&texture_descriptor);
+
+            let msaa = (self.path_sample_count > 1).then(|| {
+                // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
+                // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
+                let storage_mode = if self.is_apple_gpu {
+                    metal::MTLStorageMode::Memoryless
+                } else {
+                    metal::MTLStorageMode::Private
+                };
+
+                let msaa_descriptor = texture_descriptor;
+                msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
+                msaa_descriptor.set_storage_mode(storage_mode);
+                msaa_descriptor.set_sample_count(self.path_sample_count as _);
+                self.device.new_texture(&msaa_descriptor)
+            });
+
+            self.path_targets = Some(PathTargets {
+                size,
+                intermediate,
+                msaa,
+                used: self.frame_time,
+            });
+        }
+
+        let targets = self.path_targets.as_mut()?;
+        targets.used = self.frame_time;
+        Some((targets.intermediate.clone(), targets.msaa.clone()))
+    }
+
+    /// One filter target for a drawable of `viewport_size`, created if no frame has drawn
+    /// through it at that size since it was last released.
+    fn filter_texture(
+        &mut self,
+        target: FilterTarget,
+        viewport_size: Size<DevicePixels>,
+    ) -> metal::Texture {
+        if self.filter_targets.size != viewport_size {
+            self.filter_targets = FilterTargets {
+                size: viewport_size,
+                ..FilterTargets::default()
+>>>>>>> sonorahq/master
+            };
+        }
+        let shrink = target.shrink() as u64;
+        let width = (i32::from(viewport_size.width).max(1) as u64 / shrink).max(1);
+        let height = (i32::from(viewport_size.height).max(1) as u64 / shrink).max(1);
+        let now = self.frame_time;
+        let device = &self.device;
+        let scratch = self.filter_targets.slot(target).get_or_insert_with(|| {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_texture_type(metal::MTLTextureType::D2);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_width(width);
+            descriptor.set_height(height);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            Scratch {
+                texture: device.new_texture(&descriptor),
+                used: now,
+            }
+        });
+        scratch.used = now;
+        scratch.texture.clone()
+    }
+
+<<<<<<< HEAD
             let msaa_descriptor = texture_descriptor;
             msaa_descriptor.setTextureType(MTLTextureType::Type2DMultisample);
             msaa_descriptor.setStorageMode(storage_mode);
@@ -586,6 +916,31 @@ impl MetalRenderer {
         self.path_intermediate_texture = Some(intermediate_texture);
         self.path_intermediate_msaa_texture = msaa_texture;
         Ok(())
+=======
+    /// Frees offscreen targets that no frame has drawn through for `IDLE_RELEASE`. Every frame
+    /// checks this itself, so a caller only needs it for a window that has stopped drawing.
+    pub fn release_idle_targets(&mut self) {
+        self.release_targets_idle_at(Instant::now());
+    }
+
+    /// Drops every offscreen target that no frame has drawn through within `IDLE_RELEASE` of
+    /// `now`. A command buffer retains what it encodes, so a target an earlier frame still uses
+    /// on the GPU stays alive until that frame completes.
+    fn release_targets_idle_at(&mut self, now: Instant) {
+        let idle = |used: Instant| now.duration_since(used) >= IDLE_RELEASE;
+        if self
+            .path_targets
+            .as_ref()
+            .is_some_and(|targets| idle(targets.used))
+        {
+            self.path_targets = None;
+        }
+        for slot in self.filter_targets.slots() {
+            if slot.as_ref().is_some_and(|scratch| idle(scratch.used)) {
+                *slot = None;
+            }
+        }
+>>>>>>> sonorahq/master
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -644,6 +999,15 @@ impl MetalRenderer {
             }
         };
 
+        self.frame_pacing.in_flight.fetch_add(1, Ordering::SeqCst);
+        let pacing = self.frame_pacing.clone();
+        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| pacing.frame_done());
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+        unsafe {
+            command_buffer.add_completed_handler(&*RcBlock::as_ptr(&block).cast());
+        }
+        self.committed_at = Instant::now();
+
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.waitUntilScheduled();
@@ -654,7 +1018,35 @@ impl MetalRenderer {
         }
     }
 
+<<<<<<< HEAD
     pub(crate) fn render_frame(
+=======
+    /// Whether the GPU is still running the last frame `draw` committed. Drawing another one now
+    /// would queue it behind that frame and block in `next_drawable` once the drawables run out,
+    /// which holds input back by every frame in the queue. A `true` arms the waker set with
+    /// `set_frame_waker`, so the window draws as soon as the GPU is done rather than a whole
+    /// display tick later.
+    pub fn gpu_behind(&self) -> bool {
+        if self.committed_at.elapsed() >= FRAME_STALL {
+            return false;
+        }
+        let pacing = &self.frame_pacing;
+        pacing.waiting.store(true, Ordering::SeqCst);
+        if pacing.in_flight.load(Ordering::SeqCst) == 0 {
+            pacing.waiting.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// Sets what asks the window for a frame once a frame `gpu_behind` held back has finished on
+    /// the GPU. It runs on a Metal completion thread.
+    pub fn set_frame_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self.frame_pacing.wake.lock() = Some(Box::new(wake));
+    }
+
+    fn render_frame(
+>>>>>>> sonorahq/master
         &mut self,
         scene: &Scene,
         texture: &ProtocolObject<dyn MTLTexture>,
@@ -692,6 +1084,7 @@ impl MetalRenderer {
         )?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
+<<<<<<< HEAD
         let frame_resources = Cell::new(Some((writer.finish(), surface_textures)));
         let block = RcBlock::new(
             move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
@@ -702,6 +1095,17 @@ impl MetalRenderer {
         );
         // SAFETY: Metal copies the live block and invokes it once after this frame completes.
         // Its captures own the frame resources and use the pool mutex when returning the buffer.
+=======
+        let used = writer.offset;
+        let instance_buffer = Cell::new(Some(writer.finish()));
+        instance_buffer_pool.lock().settle(used);
+        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+            if let Some(instance_buffer) = instance_buffer.take() {
+                instance_buffer_pool.lock().release(instance_buffer);
+            }
+        });
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+>>>>>>> sonorahq/master
         unsafe {
             command_buffer.addCompletedHandler(RcBlock::as_ptr(&block));
         }
@@ -747,8 +1151,46 @@ impl MetalRenderer {
         // Headless callers do not have a Cocoa event-loop pool to release
         // autoreleased command buffers and render-pass descriptors.
         objc2::rc::autoreleasepool(|_| {
+<<<<<<< HEAD
             self.update_path_intermediate_textures(size)?;
             self.render_offscreen(scene, size)
+=======
+            // Update path intermediate textures for this size
+            // Create an offscreen texture as render target
+            let texture_descriptor = metal::TextureDescriptor::new();
+            texture_descriptor.set_width(size.width.0 as u64);
+            texture_descriptor.set_height(size.height.0 as u64);
+            texture_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            texture_descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            // Like the atlas, only Apple GPUs can create shared textures on macOS;
+            // Intel Macs cannot, even with unified memory. iOS has no managed storage.
+            let uses_shared_storage = cfg!(target_os = "ios") || self.is_apple_gpu;
+            texture_descriptor.set_storage_mode(if uses_shared_storage {
+                metal::MTLStorageMode::Shared
+            } else {
+                metal::MTLStorageMode::Managed
+            });
+            let target_texture = self.device.new_texture(&texture_descriptor);
+
+            let command_buffer = self.render_frame(scene, &target_texture, size)?;
+
+            // Managed textures require an explicit blit synchronize before the CPU
+            // can read back the rendered data. Without this, get_bytes returns
+            // stale zeros.
+            if !uses_shared_storage {
+                let blit = command_buffer.new_blit_command_encoder();
+                blit.synchronize_resource(&target_texture);
+                blit.end_encoding();
+            }
+
+            // Commit and wait for completion
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+
+            read_texture_to_image(&target_texture)
+>>>>>>> sonorahq/master
         })
     }
 
@@ -814,8 +1256,11 @@ impl MetalRenderer {
         }
 
         objc2::rc::autoreleasepool(|_| {
+<<<<<<< HEAD
             self.update_path_intermediate_textures(size)?;
 
+=======
+>>>>>>> sonorahq/master
             let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
                 texture.width() != size.width.0 as usize
                     || texture.height() != size.height.0 as usize
@@ -857,6 +1302,7 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         texture: &ProtocolObject<dyn MTLTexture>,
         viewport_size: Size<DevicePixels>,
+<<<<<<< HEAD
         surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         if let Some(command_buffer) = crate::fast::paths::draw_primitives_to_texture(
@@ -870,16 +1316,34 @@ impl MetalRenderer {
         )? {
             return Ok(command_buffer);
         }
+=======
+    ) -> Result<metal::CommandBuffer> {
+        self.frame_time = Instant::now();
+>>>>>>> sonorahq/master
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue
             .commandBuffer()
             .context("creating command buffer")?;
         crate::fast::dynamic_textures::encode_uploads(&command_buffer);
         let alpha = if self.opaque { 1. } else { 0. };
+        let filtered =
+            filters_enabled() && (!scene.effects.is_empty() || !scene.backdrops.is_empty());
+        // Backdrops read what the frame has drawn so far, which a drawable cannot be sampled from,
+        // so a frame carrying them is drawn offscreen and blitted back at the end.
+        let mirrored = filtered && !scene.backdrops.is_empty();
+        let main_texture = match mirrored {
+            true => self.filter_texture(FilterTarget::Frame, viewport_size),
+            false => texture.to_owned(),
+        };
 
         let mut command_encoder = new_command_encoder_for_texture(
+<<<<<<< HEAD
             &command_buffer,
             texture,
+=======
+            command_buffer,
+            &main_texture,
+>>>>>>> sonorahq/master
             viewport_size,
             Some(MTLClearColor {
                 red: 0.,
@@ -889,7 +1353,76 @@ impl MetalRenderer {
             }),
         )?;
 
+        let mut stack: Vec<usize> = Vec::new();
+        // What each open layer will be composited through: neighbours that ask for the same filter
+        // share one target, so a list of separately blurred rows costs one pass, not one per row.
+        let mut spans: Vec<Bounds<ScaledPixels>> = Vec::new();
+
         for batch in scene.batches() {
+            let wanted = filtered
+                .then(|| scene.filtered(scene.batch_order(&batch)))
+                .flatten()
+                .map(|index| scene.filter_chain(index))
+                .unwrap_or_default();
+            let shared = stack
+                .iter()
+                .zip(wanted.iter())
+                .take_while(|(open, next)| open == next)
+                .count();
+
+            let mut merged = false;
+            while stack.len() > shared {
+                if stack.len() == shared + 1
+                    && wanted.len() == stack.len()
+                    && let Some(open) = stack.last_mut()
+                    && let Some(span) = spans.last_mut()
+                {
+                    let next = scene.effects[wanted[shared]];
+                    let layer = scene.effects[*open];
+                    if layer.can_merge_with(&next) {
+                        *open = wanted[shared];
+                        *span = span.union(&next.destination_clip());
+                        merged = true;
+                        break;
+                    }
+                }
+
+                let index = stack.pop().expect("the stack is not empty");
+                let layer = scene.effects[index];
+                let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
+
+                command_encoder.end_encoding();
+                let onto = self.close_layer(
+                    command_buffer,
+                    layer,
+                    clip,
+                    stack.len(),
+                    &main_texture,
+                    viewport_size,
+                );
+                command_encoder =
+                    new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
+            }
+
+            for index in wanted.iter().skip(shared + usize::from(merged)) {
+                if stack.len() >= LAYER_DEPTH {
+                    break;
+                }
+                let layer = scene.effects[*index];
+                let depth = stack.len();
+
+                command_encoder.end_encoding();
+                let target = self.filter_texture(FilterTarget::Layer(depth), viewport_size);
+                command_encoder = new_command_encoder_for_texture(
+                    command_buffer,
+                    &target,
+                    viewport_size,
+                    Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+                );
+                stack.push(*index);
+                spans.push(layer.destination_clip());
+            }
+
             match batch {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, viewport_size, &command_encoder)
@@ -897,8 +1430,20 @@ impl MetalRenderer {
                 PrimitiveBatch::Quads(range) => {
                     self.draw_quads(range, instance_bindings, viewport_size, &command_encoder)
                 }
+                PrimitiveBatch::Shaders { shader, range } => {
+                    if let Some(pipeline) = self.custom_pipeline_state(shader) {
+                        self.draw_custom_shaders(
+                            &pipeline,
+                            range,
+                            instance_bindings,
+                            viewport_size,
+                            command_encoder,
+                        );
+                    }
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
+<<<<<<< HEAD
                     command_encoder.endEncoding();
 
                     let did_draw = self.draw_paths_to_intermediate(
@@ -914,17 +1459,57 @@ impl MetalRenderer {
                         viewport_size,
                         None,
                     )?;
+=======
+                    // The texture the frame is drawing into right now: the innermost open
+                    // layer, or the frame itself.
+                    let onto = match stack.len().checked_sub(1) {
+                        Some(depth) => self.filter_texture(
+                            FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)),
+                            viewport_size,
+                        ),
+                        None => main_texture.clone(),
+                    };
+                    command_encoder.end_encoding();
 
-                    if did_draw {
-                        if let Err(error) = self.draw_paths_from_intermediate(
+                    let targets = match paths.is_empty() {
+                        true => None,
+                        false => self.path_targets(viewport_size),
+                    };
+                    let did_draw = match &targets {
+                        Some((intermediate, msaa)) => self.draw_paths_to_intermediate(
                             paths,
                             writer,
                             viewport_size,
+                            command_buffer,
+                            intermediate,
+                            msaa.as_deref(),
+                        )?,
+                        None => false,
+                    };
+
+                    command_encoder =
+                        new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
+>>>>>>> sonorahq/master
+
+                    if let Some((intermediate, _)) = targets.filter(|_| did_draw)
+                        && let Err(error) = self.draw_paths_from_intermediate(
+                            paths,
+                            writer,
+                            viewport_size,
+<<<<<<< HEAD
                             &command_encoder,
                         ) {
                             command_encoder.endEncoding();
                             return Err(error);
                         }
+=======
+                            command_encoder,
+                            &intermediate,
+                        )
+                    {
+                        command_encoder.end_encoding();
+                        return Err(error);
+>>>>>>> sonorahq/master
                     }
                 }
                 PrimitiveBatch::Underlines(range) => {
@@ -946,6 +1531,7 @@ impl MetalRenderer {
                         viewport_size,
                         &command_encoder,
                     ),
+<<<<<<< HEAD
                 PrimitiveBatch::Surfaces(range) => {
                     if let Err(error) = self.draw_surfaces(
                         &scene.surfaces[range.clone()],
@@ -959,29 +1545,518 @@ impl MetalRenderer {
                         return Err(error);
                     }
                 }
+=======
+                PrimitiveBatch::Backdrops(range) => {
+                    if !filtered {
+                        continue;
+                    }
+                    let backdrops = &scene.backdrops[range.clone()];
+                    let sigma = backdrops
+                        .iter()
+                        .fold(0., |widest: f32, backdrop| widest.max(backdrop.blur));
+                    // A backdrop samples the blur only within its own bounds, so the passes
+                    // are scissored to the union of the batch's, grown by the kernel inside
+                    // `blur_source`, rather than run over the whole frame.
+                    let clip = backdrops
+                        .iter()
+                        .map(|backdrop| backdrop.bounds)
+                        .reduce(|union, bounds| union.union(&bounds));
+
+                    command_encoder.end_encoding();
+                    let source = self.backdrop_source(
+                        command_buffer,
+                        &main_texture,
+                        stack.len(),
+                        viewport_size,
+                        clip.map(|clip| clip.dilate(BlurPasses::for_sigma(sigma).source_margin())),
+                    );
+                    let blurred = self.blur_source(
+                        command_buffer,
+                        &source,
+                        false,
+                        sigma,
+                        clip,
+                        viewport_size,
+                    );
+                    let target = match stack.len().checked_sub(1) {
+                        Some(depth) => {
+                            self.filter_texture(FilterTarget::Layer(depth), viewport_size)
+                        }
+                        None => main_texture.clone(),
+                    };
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        &target,
+                        viewport_size,
+                        None,
+                    );
+                    self.draw_backdrops(
+                        range,
+                        instance_bindings,
+                        &blurred,
+                        viewport_size,
+                        command_encoder,
+                    );
+                }
+                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                    &scene.surfaces[range.clone()],
+                    range.start,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
+>>>>>>> sonorahq/master
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
 
+<<<<<<< HEAD
         command_encoder.endEncoding();
 
         Ok(command_buffer)
     }
 
     pub(crate) fn draw_paths_to_intermediate(
+=======
+        while let Some(index) = stack.pop() {
+            let layer = scene.effects[index];
+            let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
+
+            command_encoder.end_encoding();
+            let onto = self.close_layer(
+                command_buffer,
+                layer,
+                clip,
+                stack.len(),
+                &main_texture,
+                viewport_size,
+            );
+            command_encoder =
+                new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
+        }
+
+        command_encoder.end_encoding();
+
+        if mirrored {
+            self.filter_pass(
+                command_buffer,
+                &self.blit_pipeline_state,
+                &main_texture,
+                texture,
+                None,
+                None,
+            );
+        }
+
+        self.release_targets_idle_at(self.frame_time);
+
+        Ok(command_buffer.to_owned())
+    }
+
+    /// Blurs a filtered layer that has just closed, when its filter asks for a blur, composites
+    /// it into its parent and returns the parent, so the caller can resume drawing there.
+    /// `depth` is the closed layer's own nesting depth.
+    fn close_layer(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        layer: LayerEffect,
+        clip: Bounds<ScaledPixels>,
+        depth: usize,
+        main_texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> metal::Texture {
+        let source = self.filter_texture(
+            FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)),
+            viewport_size,
+        );
+        let onto = match depth.checked_sub(1) {
+            Some(parent) => self.filter_texture(
+                FilterTarget::Layer(parent.min(LAYER_DEPTH - 1)),
+                viewport_size,
+            ),
+            None => main_texture.to_owned(),
+        };
+        let blurred = match layer.filter.blurs() {
+            true => self.blur_source(
+                command_buffer,
+                &source,
+                true,
+                layer.filter.blur,
+                Some(layer.blur_bounds(clip)),
+                viewport_size,
+            ),
+            false => source,
+        };
+        self.composite_layer(command_buffer, &blurred, &onto, layer, clip, viewport_size);
+        onto
+    }
+
+    /// Clamps a region to the target it is drawn into, shrunk to the blur step it runs at.
+    fn scissor(
+        bounds: Bounds<ScaledPixels>,
+        viewport_size: Size<DevicePixels>,
+        shrink: u32,
+    ) -> Option<metal::MTLScissorRect> {
+        let shrink = shrink as f32;
+        let width = (i32::from(viewport_size.width) as f32 / shrink).floor();
+        let height = (i32::from(viewport_size.height) as f32 / shrink).floor();
+        let left = (bounds.origin.x.0 / shrink).floor().clamp(0., width);
+        let top = (bounds.origin.y.0 / shrink).floor().clamp(0., height);
+        let right = ((bounds.origin.x.0 + bounds.size.width.0) / shrink)
+            .ceil()
+            .clamp(left, width);
+        let bottom = ((bounds.origin.y.0 + bounds.size.height.0) / shrink)
+            .ceil()
+            .clamp(top, height);
+        if right <= left || bottom <= top {
+            return None;
+        }
+
+        Some(metal::MTLScissorRect {
+            x: left as u64,
+            y: top as u64,
+            width: (right - left) as u64,
+            height: (bottom - top) as u64,
+        })
+    }
+
+    /// Draws one full-screen pass of a filter from `source` into `target`.
+    fn filter_pass(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        pipeline: &metal::RenderPipelineState,
+        source: &metal::TextureRef,
+        target: &metal::TextureRef,
+        params: Option<&BlurParams>,
+        within: Option<metal::MTLScissorRect>,
+    ) {
+        let size = size(
+            DevicePixels(target.width() as i32),
+            DevicePixels(target.height() as i32),
+        );
+        // A scissored pass leaves the rest of its target alone, and the passes after it read only
+        // what the passes before them wrote. Clearing the whole target first is a full write of a
+        // window-sized texture, which on a tiled GPU costs more than a narrow blur itself.
+        let encoder = match within {
+            Some(_) => new_discarding_command_encoder(command_buffer, target, size),
+            None => new_command_encoder_for_texture(
+                command_buffer,
+                target,
+                size,
+                Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+            ),
+        };
+        encoder.set_render_pipeline_state(pipeline);
+        encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(source));
+        if let Some(params) = params {
+            encoder.set_fragment_bytes(
+                FilterInputIndex::Params as u64,
+                mem::size_of::<BlurParams>() as u64,
+                params as *const BlurParams as *const _,
+            );
+        }
+        if let Some(within) = within {
+            encoder.set_scissor_rect(within);
+        }
+        encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+        encoder.end_encoding();
+    }
+
+    /// Blurs a source and returns the target holding the result. A narrow blur comes back at
+    /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
+    /// stretches it back up. A `spare` source is a layer nothing reads again, so a gaussian
+    /// writes its result back into it rather than into a full-size target of its own.
+    fn blur_source(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        spare: bool,
+        sigma: f32,
+        clip: Option<Bounds<ScaledPixels>>,
+        viewport_size: Size<DevicePixels>,
+    ) -> metal::Texture {
+        match BlurPasses::for_sigma(sigma) {
+            BlurPasses::Gaussian(sigma) => {
+                self.gaussian_blur(command_buffer, source, spare, sigma, clip, viewport_size)
+            }
+            BlurPasses::Kawase(kawase) => {
+                self.kawase_blur(command_buffer, source, kawase, clip, viewport_size)
+            }
+        }
+    }
+
+    /// Blurs a source across into the scratch target and down into level zero, or back into a
+    /// `spare` source, both at full size. The pass across covers the clip grown by the kernel,
+    /// since the pass down reads that far above and below it.
+    fn gaussian_blur(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        spare: bool,
+        sigma: f32,
+        clip: Option<Bounds<ScaledPixels>>,
+        viewport_size: Size<DevicePixels>,
+    ) -> metal::Texture {
+        let across = BlurParams {
+            direction: [1., 0.],
+            radius: sigma,
+            pad: 0.,
+        };
+        let down = BlurParams {
+            direction: [0., 1.],
+            radius: sigma,
+            pad: 0.,
+        };
+        let scratch = self.filter_texture(FilterTarget::Scratch, viewport_size);
+        let settled = match spare {
+            true => source.to_owned(),
+            false => self.filter_texture(FilterTarget::Level(0), viewport_size),
+        };
+        let within = |margin: f32| {
+            clip.and_then(|clip| Self::scissor(clip.dilate(ScaledPixels(margin)), viewport_size, 1))
+        };
+        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
+
+        self.filter_pass(
+            command_buffer,
+            &self.gaussian_pipeline_state,
+            source,
+            &scratch,
+            Some(&across),
+            within(reach),
+        );
+        self.filter_pass(
+            command_buffer,
+            &self.gaussian_pipeline_state,
+            &scratch,
+            &settled,
+            Some(&down),
+            within(1.),
+        );
+        settled
+    }
+
+    /// Blurs a source with a dual Kawase blur and returns the level it settled at.
+    fn kawase_blur(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        kawase: Kawase,
+        clip: Option<Bounds<ScaledPixels>>,
+        viewport_size: Size<DevicePixels>,
+    ) -> metal::Texture {
+        let params = BlurParams {
+            direction: [0., 0.],
+            radius: kawase.offset,
+            pad: 0.,
+        };
+        let levels: Vec<metal::Texture> = (1..=kawase.levels)
+            .map(|level| self.filter_texture(FilterTarget::Level(level), viewport_size))
+            .collect();
+        // Every pass covers the clip grown by what all the passes together read, which is at
+        // least what the ones after it still need. A texel more keeps the bilinear taps on the
+        // clip's own edge off texels nothing has written.
+        let reach = kawase.reach();
+        let within = |level: usize| {
+            let shrink = 1u32 << level;
+            let grown = ScaledPixels(reach + shrink as f32);
+            clip.and_then(|clip| Self::scissor(clip.dilate(grown), viewport_size, shrink))
+        };
+
+        let mut from: &metal::TextureRef = source;
+        for (level, to) in (1..).zip(&levels) {
+            self.filter_pass(
+                command_buffer,
+                &self.kawase_down_pipeline_state,
+                from,
+                to,
+                Some(&params),
+                within(level),
+            );
+            from = to;
+        }
+        let settled = &levels[kawase.settled - 1];
+        self.filter_pass(
+            command_buffer,
+            &self.kawase_up_pipeline_state,
+            from,
+            settled,
+            Some(&params),
+            within(kawase.settled),
+        );
+        settled.clone()
+    }
+
+    /// Draws a filtered layer back into its parent, clipped to the layer's bounds.
+    fn composite_layer(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        onto: &metal::TextureRef,
+        layer: LayerEffect,
+        clip: Bounds<ScaledPixels>,
+        viewport_size: Size<DevicePixels>,
+    ) {
+        let Some(within) = Self::scissor(layer.destination_scissor_bounds(clip), viewport_size, 1)
+        else {
+            return;
+        };
+        let masked = layer.filter.fades();
+        let encoder = new_command_encoder_for_texture(command_buffer, onto, viewport_size, None);
+        encoder.set_render_pipeline_state(match masked {
+            true => &self.masked_pipeline_state,
+            false => &self.composite_pipeline_state,
+        });
+        encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(source));
+        encoder.set_fragment_bytes(
+            FilterInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        let params = mask_params(layer, clip);
+        encoder.set_fragment_bytes(
+            FilterInputIndex::Params as u64,
+            mem::size_of::<MaskParams>() as u64,
+            &params as *const MaskParams as *const _,
+        );
+        encoder.set_scissor_rect(within);
+        encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+        encoder.end_encoding();
+    }
+
+    /// Flattens open layers in source coordinates without changing their eventual composites.
+    fn backdrop_source(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        frame: &metal::TextureRef,
+        depth: usize,
+        viewport_size: Size<DevicePixels>,
+        clip: Option<Bounds<ScaledPixels>>,
+    ) -> metal::Texture {
+        if depth == 0 {
+            return frame.to_owned();
+        }
+        let target = self.filter_texture(FilterTarget::Backdrop, viewport_size);
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(
+                ScaledPixels(viewport_size.width.0 as f32),
+                ScaledPixels(viewport_size.height.0 as f32),
+            ),
+        );
+        let params = MaskParams {
+            source_bounds: bounds,
+            fade_bounds: bounds,
+            scale: 1.,
+            ..Default::default()
+        };
+        let mut sources = vec![frame.to_owned()];
+        sources.extend(
+            (0..depth).map(|level| self.filter_texture(FilterTarget::Layer(level), viewport_size)),
+        );
+        let encoder = new_command_encoder_for_texture(
+            command_buffer,
+            &target,
+            viewport_size,
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+        );
+        if let Some(within) = clip.and_then(|clip| Self::scissor(clip, viewport_size, 1)) {
+            encoder.set_scissor_rect(within);
+        }
+        encoder.set_render_pipeline_state(&self.composite_pipeline_state);
+        encoder.set_fragment_bytes(
+            FilterInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const _ as *const _,
+        );
+        encoder.set_fragment_bytes(
+            FilterInputIndex::Params as u64,
+            mem::size_of_val(&params) as u64,
+            &params as *const _ as *const _,
+        );
+        for source in sources {
+            encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(&source));
+            encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+        }
+        encoder.end_encoding();
+        target
+    }
+
+    fn draw_backdrops(
+        &self,
+        backdrops: Range<usize>,
+        instance_bindings: &InstanceBindings,
+        source: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        if backdrops.is_empty() {
+            return;
+        }
+
+        command_encoder.set_render_pipeline_state(&self.backdrop_punch_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            FilterInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            FilterInputIndex::Backdrops as u64,
+            Some(&instance_bindings.backdrops.buffer),
+            instance_bindings.backdrops.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            FilterInputIndex::Backdrops as u64,
+            Some(&instance_bindings.backdrops.buffer),
+            instance_bindings.backdrops.offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            FilterInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            FilterInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(source));
+        // The hole first, the blurred copy into it second: together they are
+        // `dst = mix(dst, blurred, k)`, which leaves a see-through window as clear as it was.
+        command_encoder.draw_primitives_instanced_base_instance(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            backdrops.len() as u64,
+            backdrops.start as u64,
+        );
+        command_encoder.set_render_pipeline_state(&self.backdrops_pipeline_state);
+        command_encoder.draw_primitives_instanced_base_instance(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            backdrops.len() as u64,
+            backdrops.start as u64,
+        );
+    }
+
+    fn draw_paths_to_intermediate(
+>>>>>>> sonorahq/master
         &self,
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
+<<<<<<< HEAD
         command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+=======
+        command_buffer: &metal::CommandBufferRef,
+        intermediate_texture: &metal::TextureRef,
+        msaa_texture: Option<&metal::TextureRef>,
+>>>>>>> sonorahq/master
     ) -> Result<bool> {
         if paths.is_empty() {
             return Ok(false);
         }
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
 
         let mut vertices = Vec::new();
         for path in paths {
@@ -1009,10 +2084,17 @@ impl MetalRenderer {
             alpha: 0.,
         });
 
+<<<<<<< HEAD
         if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
             color_attachment.setTexture(Some(msaa_texture));
             color_attachment.setResolveTexture(Some(intermediate_texture));
             color_attachment.setStoreAction(MTLStoreAction::MultisampleResolve);
+=======
+        if let Some(msaa_texture) = msaa_texture {
+            color_attachment.set_texture(Some(msaa_texture));
+            color_attachment.set_resolve_texture(Some(intermediate_texture));
+            color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
+>>>>>>> sonorahq/master
         } else {
             color_attachment.setTexture(Some(intermediate_texture));
             color_attachment.setStoreAction(MTLStoreAction::Store);
@@ -1142,20 +2224,105 @@ impl MetalRenderer {
         }
     }
 
+<<<<<<< HEAD
     pub(crate) fn draw_paths_from_intermediate(
+=======
+    /// The pipeline of a custom shader, built the first time a frame draws it. `None` means it
+    /// failed to build, which is logged once and leaves its instances undrawn.
+    fn custom_pipeline_state(&mut self, shader: ShaderId) -> Option<metal::RenderPipelineState> {
+        if let Some(pipeline) = self.custom_pipeline_states.get(&shader) {
+            return pipeline.clone();
+        }
+        let pipeline =
+            build_custom_pipeline_state(&self.device, shader, MTLPixelFormat::BGRA8Unorm)
+                .inspect_err(|error| log::error!("{error:#}"))
+                .ok();
+        self.custom_pipeline_states.insert(shader, pipeline.clone());
+        pipeline
+    }
+
+    fn draw_custom_shaders(
+        &self,
+        pipeline: &metal::RenderPipelineStateRef,
+        shaders: Range<usize>,
+        instance_bindings: &InstanceBindings,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        if shaders.is_empty() {
+            return;
+        }
+
+        // Quads blend straight alpha on Metal, so the prelude leaves its colour unpremultiplied.
+        let globals = CustomShaderGlobals {
+            viewport_size: [
+                i32::from(viewport_size.width) as f32,
+                i32::from(viewport_size.height) as f32,
+            ],
+            premultiplied_alpha: 0,
+            pad: 0,
+        };
+        let buffer = &instance_bindings.shaders;
+        // naga reads the length of the instance buffer from here, though nothing it emits for
+        // the prelude bounds checks against it.
+        let length = (buffer.buffer.length() as usize).saturating_sub(buffer.offset) as u32;
+
+        command_encoder.set_render_pipeline_state(pipeline);
+        let globals_size = mem::size_of::<CustomShaderGlobals>() as u64;
+        let globals_bytes = &globals as *const CustomShaderGlobals as *const c_void;
+        let length_size = mem::size_of::<u32>() as u64;
+        let length_bytes = &length as *const u32 as *const c_void;
+        command_encoder.set_vertex_bytes(
+            gpui::MslShader::GLOBALS_BUFFER,
+            globals_size,
+            globals_bytes,
+        );
+        command_encoder.set_fragment_bytes(
+            gpui::MslShader::GLOBALS_BUFFER,
+            globals_size,
+            globals_bytes,
+        );
+        command_encoder.set_vertex_bytes(gpui::MslShader::SIZES_BUFFER, length_size, length_bytes);
+        command_encoder.set_fragment_bytes(
+            gpui::MslShader::SIZES_BUFFER,
+            length_size,
+            length_bytes,
+        );
+        command_encoder.set_vertex_buffer(
+            gpui::MslShader::INSTANCES_BUFFER,
+            Some(&buffer.buffer),
+            buffer.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            gpui::MslShader::INSTANCES_BUFFER,
+            Some(&buffer.buffer),
+            buffer.offset as u64,
+        );
+        command_encoder.draw_primitives_instanced_base_instance(
+            metal::MTLPrimitiveType::TriangleStrip,
+            0,
+            4,
+            shaders.len() as u64,
+            shaders.start as u64,
+        );
+    }
+
+    fn draw_paths_from_intermediate(
+>>>>>>> sonorahq/master
         &self,
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
+<<<<<<< HEAD
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+=======
+        command_encoder: &metal::RenderCommandEncoderRef,
+        intermediate_texture: &metal::TextureRef,
+>>>>>>> sonorahq/master
     ) -> Result<()> {
         let (Some(first_path), Some(last_path)) = (paths.first(), paths.last()) else {
             return Ok(());
         };
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
 
         command_encoder.setRenderPipelineState(&self.path_sprites_pipeline_state);
         // SAFETY: The shader slots match the unit vertices, copied viewport, and retained path texture.
@@ -1517,9 +2684,52 @@ impl MetalRenderer {
     }
 }
 
+<<<<<<< HEAD
 pub(crate) fn new_command_encoder_for_texture(
     command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     texture: &ProtocolObject<dyn MTLTexture>,
+=======
+/// Layer filters can be switched off from the environment to tell a rendering problem from a
+/// compositing one.
+fn filters_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GPUI_FILTERS").as_deref() != Ok("0"))
+}
+
+/// Starts a render pass into `texture`. The pass descriptor retains the texture, so it may be a
+/// temporary the caller drops before the encoder ends.
+/// An encoder on `texture` that keeps nothing it held, for a pass that writes everything it later
+/// reads.
+fn new_discarding_command_encoder<'a>(
+    command_buffer: &'a metal::CommandBufferRef,
+    texture: &metal::TextureRef,
+    viewport_size: Size<DevicePixels>,
+) -> &'a metal::RenderCommandEncoderRef {
+    let render_pass_descriptor = metal::RenderPassDescriptor::new();
+    let color_attachment = render_pass_descriptor
+        .color_attachments()
+        .object_at(0)
+        .unwrap();
+    color_attachment.set_texture(Some(texture));
+    color_attachment.set_load_action(metal::MTLLoadAction::DontCare);
+    color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+    let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+    command_encoder.set_viewport(metal::MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: i32::from(viewport_size.width) as f64,
+        height: i32::from(viewport_size.height) as f64,
+        znear: 0.0,
+        zfar: 1.0,
+    });
+    command_encoder
+}
+
+fn new_command_encoder_for_texture<'a>(
+    command_buffer: &'a metal::CommandBufferRef,
+    texture: &metal::TextureRef,
+>>>>>>> sonorahq/master
     viewport_size: Size<DevicePixels>,
     clear_color: Option<MTLClearColor>,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
@@ -1586,6 +2796,215 @@ fn read_texture_to_image(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Rgb
     RgbaImage::from_raw(width, height, pixels).context("creating RGBA image from pixel data")
 }
 
+/// An offscreen target created the first time a frame needs it and released once it has gone
+/// `IDLE_RELEASE` without use.
+struct Scratch {
+    texture: metal::Texture,
+    used: Instant,
+}
+
+/// One of the offscreen targets filters draw through.
+#[derive(Clone, Copy)]
+enum FilterTarget {
+    /// The accumulated background of all open layers before a backdrop samples it.
+    Backdrop,
+    /// The frame itself, drawn offscreen so a backdrop can sample what lies under it.
+    Frame,
+    /// The target a filtered layer is drawn into, by nesting depth.
+    Layer(usize),
+    /// One blur level, the frame's size halved as many times as its index. Level zero holds a
+    /// finished gaussian.
+    Level(usize),
+    /// Where a gaussian keeps its pass across before the pass down.
+    Scratch,
+}
+
+impl FilterTarget {
+    /// How many times smaller than the frame the target is on each side.
+    fn shrink(self) -> u32 {
+        match self {
+            Self::Level(level) => 1 << level,
+            Self::Frame | Self::Layer(_) | Self::Scratch | Self::Backdrop => 1,
+        }
+    }
+}
+
+/// Offscreen targets a frame needs to blur and mask what it has drawn, all made for one
+/// drawable size. Each one is allocated the first time a frame draws through it, so a frame
+/// with one shallow blur pays for the targets it touches rather than for every depth and level.
+#[derive(Default)]
+struct FilterTargets {
+    size: Size<DevicePixels>,
+    frame: Option<Scratch>,
+    backdrop: Option<Scratch>,
+    layers: [Option<Scratch>; LAYER_DEPTH],
+    levels: [Option<Scratch>; KAWASE_LEVELS + 1],
+    scratch: Option<Scratch>,
+}
+
+impl FilterTargets {
+    fn slot(&mut self, target: FilterTarget) -> &mut Option<Scratch> {
+        match target {
+            FilterTarget::Backdrop => &mut self.backdrop,
+            FilterTarget::Frame => &mut self.frame,
+            FilterTarget::Layer(depth) => &mut self.layers[depth],
+            FilterTarget::Level(level) => &mut self.levels[level],
+            FilterTarget::Scratch => &mut self.scratch,
+        }
+    }
+
+    fn slots(&mut self) -> impl Iterator<Item = &mut Option<Scratch>> {
+        std::iter::once(&mut self.frame)
+            .chain(std::iter::once(&mut self.backdrop))
+            .chain(self.layers.iter_mut())
+            .chain(self.levels.iter_mut())
+            .chain(std::iter::once(&mut self.scratch))
+    }
+}
+
+/// The textures paths are rasterized through, made for one drawable size.
+struct PathTargets {
+    size: Size<DevicePixels>,
+    intermediate: metal::Texture,
+    /// The multisampled target paths are rasterized into and resolved from. Memoryless on
+    /// Apple GPUs, so it only costs memory on Intel Macs.
+    msaa: Option<metal::Texture>,
+    used: Instant,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BlurParams {
+    pub direction: [f32; 2],
+    pub radius: f32,
+    pub pad: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MaskParams {
+    pub source_bounds: Bounds<ScaledPixels>,
+    pub fade_bounds: Bounds<ScaledPixels>,
+    pub transform_origin: [f32; 2],
+    pub translation: [f32; 2],
+    pub scale: f32,
+    pub fade_top: f32,
+    pub fade_bottom: f32,
+    pub fade_left: f32,
+    pub fade_right: f32,
+    pub pad: f32,
+}
+
+const _: () = {
+    assert!(mem::size_of::<MaskParams>() == 18 * mem::size_of::<f32>());
+    assert!(mem::offset_of!(MaskParams, source_bounds) == 0);
+    assert!(mem::offset_of!(MaskParams, fade_bounds) == 16);
+    assert!(mem::offset_of!(MaskParams, transform_origin) == 32);
+    assert!(mem::offset_of!(MaskParams, translation) == 40);
+    assert!(mem::offset_of!(MaskParams, scale) == 48);
+    assert!(mem::offset_of!(MaskParams, fade_top) == 52);
+    assert!(mem::offset_of!(MaskParams, fade_bottom) == 56);
+    assert!(mem::offset_of!(MaskParams, fade_left) == 60);
+    assert!(mem::offset_of!(MaskParams, fade_right) == 64);
+    assert!(mem::offset_of!(MaskParams, pad) == 68);
+};
+
+#[repr(C)]
+pub enum FilterInputIndex {
+    Vertices = 0,
+    Backdrops = 1,
+    ViewportSize = 2,
+    Params = 3,
+    Source = 4,
+}
+
+fn mask_params(layer: LayerEffect, destination_clip: Bounds<ScaledPixels>) -> MaskParams {
+    MaskParams {
+        source_bounds: if layer.filter.transforms() {
+            layer.source_bounds
+        } else {
+            destination_clip
+        },
+        // Preserve the existing Metal fade clip for unscaled layers. A scaled layer must apply
+        // the fade in source coordinates before the final transform.
+        fade_bounds: if layer.filter.transforms() {
+            layer.source_bounds
+        } else {
+            destination_clip
+        },
+        transform_origin: [layer.transform_origin.x.0, layer.transform_origin.y.0],
+        translation: [layer.filter.translate.x.0, layer.filter.translate.y.0],
+        scale: layer.filter.scale,
+        fade_top: layer.filter.fade_top,
+        fade_bottom: layer.filter.fade_bottom,
+        fade_left: layer.filter.fade_left,
+        fade_right: layer.filter.fade_right,
+        pad: 0.0,
+    }
+}
+
+/// How a filter pipeline lands on what it covers.
+#[derive(Clone, Copy, PartialEq)]
+enum FilterBlend {
+    /// Replaces the destination outright.
+    Replace,
+    /// Premultiplied source-over.
+    Over,
+    /// Adds itself to the destination, for the second half of a backdrop's mix.
+    Add,
+    /// Keeps `1 - src.a` of the destination and contributes nothing of its own, for the first
+    /// half of a backdrop's mix.
+    Punch,
+}
+
+fn build_filter_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+    blend: FilterBlend,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(blend != FilterBlend::Replace);
+    if let Some((source, destination)) = match blend {
+        FilterBlend::Replace => None,
+        FilterBlend::Over => Some((
+            metal::MTLBlendFactor::One,
+            metal::MTLBlendFactor::OneMinusSourceAlpha,
+        )),
+        FilterBlend::Add => Some((metal::MTLBlendFactor::One, metal::MTLBlendFactor::One)),
+        FilterBlend::Punch => Some((
+            metal::MTLBlendFactor::Zero,
+            metal::MTLBlendFactor::OneMinusSourceAlpha,
+        )),
+    } {
+        color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+        color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+        color_attachment.set_source_rgb_blend_factor(source);
+        color_attachment.set_source_alpha_blend_factor(source);
+        color_attachment.set_destination_rgb_blend_factor(destination);
+        color_attachment.set_destination_alpha_blend_factor(destination);
+    }
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
 fn build_pipeline_state(
     device: &ProtocolObject<dyn MTLDevice>,
     library: &ProtocolObject<dyn MTLLibrary>,
@@ -1619,6 +3038,54 @@ fn build_pipeline_state(
     device
         .newRenderPipelineStateWithDescriptor_error(&descriptor)
         .with_context(|| format!("creating {label} render pipeline"))
+}
+
+/// The globals the custom shader prelude reads, laid out as its `GpuiShaderGlobals`.
+#[repr(C)]
+struct CustomShaderGlobals {
+    viewport_size: [f32; 2],
+    premultiplied_alpha: u32,
+    pad: u32,
+}
+
+/// Translates a custom shader to MSL, compiles it and builds a pipeline that blends it the way
+/// quads are blended.
+fn build_custom_pipeline_state(
+    device: &metal::DeviceRef,
+    shader: ShaderId,
+    pixel_format: metal::MTLPixelFormat,
+) -> Result<metal::RenderPipelineState> {
+    let program = gpui::shader_program(shader)
+        .with_context(|| format!("custom shader {} was never registered", shader.0))?;
+    let msl = program.to_msl()?;
+    let library = device
+        .new_library_with_source(&msl.source, &metal::CompileOptions::new())
+        .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))?;
+    let function = |name: &str| {
+        library
+            .get_function(name, None)
+            .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))
+    };
+    let vertex_fn = function(&msl.vertex_entry)?;
+    let fragment_fn = function(&msl.fragment_entry)?;
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(&program.label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))
 }
 
 fn build_path_sprite_pipeline_state(
@@ -1702,6 +3169,7 @@ pub(crate) struct InstanceBinding {
     pub(crate) offset: usize,
 }
 
+<<<<<<< HEAD
 pub(crate) struct InstanceBindings {
     pub(crate) quads: InstanceBinding,
     pub(crate) shadows: InstanceBinding,
@@ -1709,11 +3177,24 @@ pub(crate) struct InstanceBindings {
     pub(crate) monochrome_sprites: InstanceBinding,
     pub(crate) polychrome_sprites: InstanceBinding,
     pub(crate) surfaces: InstanceBinding,
+=======
+struct InstanceBindings {
+    backdrops: InstanceBinding,
+    quads: InstanceBinding,
+    shaders: InstanceBinding,
+    shadows: InstanceBinding,
+    underlines: InstanceBinding,
+    monochrome_sprites: InstanceBinding,
+    polychrome_sprites: InstanceBinding,
+    surfaces: InstanceBinding,
+>>>>>>> sonorahq/master
 }
 
 pub(crate) fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
+        backdrops: writer.write(&scene.backdrops)?,
         quads: writer.write(&scene.quads)?,
+        shaders: writer.write(&scene.shaders)?,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
@@ -2177,4 +3658,28 @@ mod tests {
         assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(read_texture_to_image(&target_texture).unwrap(), image);
     }
+}
+
+#[cfg(test)]
+#[path = "../../gpui/src/backdrop_test_fixture.rs"]
+mod backdrop_fixture;
+
+#[cfg(test)]
+#[test]
+fn nested_backdrops_sample_ancestor_layers() -> anyhow::Result<()> {
+    use gpui::PlatformHeadlessRenderer as _;
+    let mut renderer = MetalHeadlessRenderer::new();
+    for blur in [3., 12.] {
+        for depth in [0, 1, 2] {
+            for inside in [false, true] {
+                let scene = backdrop_fixture::scene(depth, blur, inside);
+                let image = renderer.render_scene_to_image(
+                    &scene,
+                    gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)),
+                )?;
+                backdrop_fixture::check(&image);
+            }
+        }
+    }
+    Ok(())
 }

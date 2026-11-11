@@ -16,7 +16,7 @@ use wayland_backend::client::ObjectId;
 use wayland_client::WEnum;
 use wayland_client::{
     Proxy,
-    protocol::{wl_callback, wl_output, wl_seat, wl_surface},
+    protocol::{wl_callback, wl_output, wl_region, wl_seat, wl_surface},
 };
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewport;
@@ -109,8 +109,11 @@ pub struct WaylandWindowState {
     pub surface: wl_surface::WlSurface,
     app_id: Option<String>,
     appearance: WindowAppearance,
-    kde_blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
-    background_effects: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
+    blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
+    /// The radius the client rounds the window's corners with, so the blur behind it can
+    /// leave the cut corners clear.
+    corner_radius: Pixels,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -137,6 +140,9 @@ pub struct WaylandWindowState {
     redraw_requested: bool,
     presentation: PresentationState,
     pending_frame_callback: Option<wl_callback::WlCallback>,
+    /// Set from a commit that asked for a frame callback until that callback fires. A frame
+    /// drawn in that interval is held and presented on the callback.
+    awaiting_frame_callback: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -620,8 +626,9 @@ impl WaylandWindowState {
             children: FxHashMap::default(),
             surface,
             app_id: options.app_id,
-            kde_blur: None,
-            background_effects: None,
+            blur: None,
+            background_effect: None,
+            corner_radius: Pixels::ZERO,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -647,12 +654,28 @@ impl WaylandWindowState {
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
+            awaiting_frame_callback: false,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
             client_corner_radii: Corners::default(),
             accesskit_adapter: None,
         })
+    }
+
+    /// Presents the frame drawn ahead of this tick, asking for a frame callback with the commit.
+    fn present_held_frame(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if !renderer.has_held_frame() {
+            return;
+        }
+        if self.pending_frame_callback.is_none() {
+            self.pending_frame_callback =
+                Some(self.surface.frame(&self.globals.qh, self.surface.id()));
+        }
+        self.awaiting_frame_callback |= renderer.present_held();
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -699,6 +722,18 @@ impl WaylandWindowState {
             WindowDecorations::Server => px(0.0),
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
         }
+    }
+
+    /// Shrinks a toplevel by one logical pixel on any axis whose device size ends in half a
+    /// pixel. An edge on a pixel centre is where a compositor rounds the surface and the blur
+    /// behind it differently, leaving a strip of backdrop along the edge under fractional scaling.
+    /// Doesn't affect fullscreen.
+    fn settled(&self, size: Size<Pixels>, scale: f32) -> Size<Pixels> {
+        let toplevel = matches!(self.surface_state, WaylandSurfaceState::Xdg(_));
+        if !toplevel || self.fullscreen || self.maximized {
+            return size;
+        }
+        size.map(|value| off_half_pixel(value, scale))
     }
 }
 
@@ -766,6 +801,8 @@ enum FrameLoop {
     RescheduleRequested,
     PresentationFailed,
     AwaitingCallback,
+    /// Awaiting a frame callback, with a tick pinged to draw the next frame ahead of it.
+    DrawAhead,
     Scheduled,
     RetryScheduled,
     Parked,
@@ -796,13 +833,11 @@ impl Drop for WaylandWindow {
         state.renderer.take();
 
         // Destroy blur first, this has no dependencies.
-        if let Some(blur) = &state.kde_blur {
+        if let Some(blur) = &state.blur {
             blur.release();
         }
-
-        // Destroy background effects, this has no dependencies.
-        if let Some(background_effects) = &state.background_effects {
-            background_effects.destroy();
+        if let Some(effect) = &state.background_effect {
+            effect.destroy();
         }
 
         // Decorations must be destroyed before the xdg state.
@@ -957,6 +992,7 @@ impl WaylandWindowStatePtr {
         self.frame_loop.set(FrameLoop::Ticking);
         let mut state = self.state.borrow_mut();
         state.resize_throttle = false;
+        state.present_held_frame();
         // GPUI may throttle this tick without calling draw, so leave the request
         // latched until a draw actually reaches the renderer.
         let force_render = state.redraw_requested;
@@ -977,6 +1013,17 @@ impl WaylandWindowStatePtr {
         self.update_ime_enabled();
         drop(callbacks);
 
+        // A commit in this tick, or before it, guarantees the callback that drives the next one.
+        // Demand left over from a tick that drew nothing waits for it, since an immediate tick
+        // could spin against GPUI's frame-rate throttle.
+        if self.state.borrow().awaiting_frame_callback
+            && matches!(
+                self.frame_loop.get(),
+                FrameLoop::Ticking | FrameLoop::RescheduleRequested
+            )
+        {
+            self.frame_loop.set(FrameLoop::AwaitingCallback);
+        }
         self.complete_frame();
     }
 
@@ -984,7 +1031,10 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
 
         let frame_loop = self.frame_loop.get();
-        if frame_loop == FrameLoop::AwaitingCallback {
+        if matches!(
+            frame_loop,
+            FrameLoop::AwaitingCallback | FrameLoop::DrawAhead
+        ) {
             return;
         }
 
@@ -1000,6 +1050,7 @@ impl WaylandWindowStatePtr {
                     state.pending_frame_callback = Some(callback);
                 }
                 state.surface.commit();
+                state.awaiting_frame_callback = true;
                 self.frame_loop.set(FrameLoop::AwaitingCallback);
                 return;
             }
@@ -1027,14 +1078,24 @@ impl WaylandWindowStatePtr {
     pub fn frame_callback_fired(&self, signal_at: Option<Instant>) {
         // Another wl_surface commit may have carried this callback while a retry
         // timer owned the render-loop wakeup.
-        self.state.borrow_mut().pending_frame_callback = None;
-        if self.frame_loop.get() == FrameLoop::AwaitingCallback {
+        {
+            let mut state = self.state.borrow_mut();
+            state.pending_frame_callback = None;
+            state.awaiting_frame_callback = false;
+        }
+        if matches!(
+            self.frame_loop.get(),
+            FrameLoop::AwaitingCallback | FrameLoop::DrawAhead
+        ) {
             self.frame(signal_at, FrameRequestSource::NativeCallback);
         }
     }
 
     pub fn scheduled_frame_fired(&self) {
-        if self.frame_loop.get() == FrameLoop::Scheduled {
+        if matches!(
+            self.frame_loop.get(),
+            FrameLoop::Scheduled | FrameLoop::DrawAhead
+        ) {
             self.frame(
                 self.scheduled_frame_at.take(),
                 FrameRequestSource::LocalSchedule,
@@ -1065,6 +1126,21 @@ impl WaylandWindowStatePtr {
             }
             FrameLoop::Ticking => {
                 self.frame_loop.set(FrameLoop::RescheduleRequested);
+            }
+            // The presented frame is on its way, so draw the next one now and hold it for the
+            // callback instead of starting it only once the callback arrives.
+            FrameLoop::AwaitingCallback if render_ahead_enabled() => {
+                let state = self.state.borrow();
+                let draw_ahead = state.awaiting_frame_callback
+                    && state
+                        .renderer
+                        .as_ref()
+                        .is_some_and(|renderer| !renderer.has_held_frame());
+                drop(state);
+                if draw_ahead {
+                    self.frame_loop.set(FrameLoop::DrawAhead);
+                    self.frame_ping.ping();
+                }
             }
             // A wake is already armed: a ping or retry timer is in flight, or a
             // presented buffer guarantees a compositor frame callback.
@@ -1124,7 +1200,10 @@ impl WaylandWindowStatePtr {
                     let got_unmaximized = state.maximized && !configure.maximized;
                     state.fullscreen = configure.fullscreen;
                     state.maximized = configure.maximized;
-                    state.tiling = configure.tiling;
+                    if state.tiling != configure.tiling {
+                        state.tiling = configure.tiling;
+                        update_blur(&mut state);
+                    }
                     let visibility_changed = state.visibility != configure.visibility;
                     state.visibility = configure.visibility;
                     // Limit interactive resizes to once per vblank
@@ -1525,16 +1604,16 @@ impl WaylandWindowStatePtr {
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
         let (size, scale) = {
             let mut state = self.state.borrow_mut();
-            if size.is_none_or(|size| size == state.bounds.size)
-                && scale.is_none_or(|scale| scale == state.scale)
-            {
+            let scale = scale.unwrap_or(state.scale);
+            let size = state.settled(size.unwrap_or(state.bounds.size), scale);
+            if size == state.bounds.size && scale == state.scale {
                 return;
             }
-            if let Some(size) = size {
-                state.bounds.size = size;
-            }
-            if let Some(scale) = scale {
-                state.scale = scale;
+            let resized = size != state.bounds.size;
+            state.bounds.size = size;
+            state.scale = scale;
+            if resized {
+                update_blur(&mut state);
             }
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             if let Some(renderer) = &mut state.renderer {
@@ -1670,6 +1749,18 @@ impl WaylandWindowStatePtr {
         }
     }
 
+    /// Reapplies the window's blur after the compositor changed whether it can blur, and tells
+    /// the app through the appearance callback so it can offer or hide the effect.
+    pub fn background_blur_changed(&self) {
+        update_window(self.state.borrow_mut());
+        let callback = self.callbacks.borrow_mut().appearance_changed.take();
+        if let Some(mut fun) = callback {
+            fun();
+            self.callbacks.borrow_mut().appearance_changed = Some(fun);
+        }
+        self.request_redraw();
+    }
+
     pub fn set_appearance(&mut self, appearance: WindowAppearance) {
         self.state.borrow_mut().appearance = appearance;
 
@@ -1793,6 +1884,7 @@ impl PlatformWindow for WaylandWindow {
         // Keep window geometry consistent with configure handling. On Wayland, window geometry is
         // surface-local: resizing should not attempt to translate the window; the compositor
         // controls placement. We also account for client-side decoration insets and tiling.
+        let size = state.settled(size, state.scale);
         let window_geometry = inset_by_tiling(
             Bounds {
                 origin: Point::default(),
@@ -1941,6 +2033,22 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().background_appearance
     }
 
+    fn is_background_blur_supported(&self) -> bool {
+        let state = self.borrow();
+        state.globals.background_blur.get() || state.globals.blur_manager.borrow().is_some()
+    }
+
+    fn set_window_corner_radius(&self, radius: Pixels) {
+        let mut state = self.borrow_mut();
+        if state.corner_radius == radius {
+            return;
+        }
+        state.corner_radius = radius;
+        update_blur(&mut state);
+        drop(state);
+        self.0.request_redraw();
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         let client = self.borrow().client.get_client();
         let state = client.borrow();
@@ -2069,11 +2177,19 @@ impl PlatformWindow for WaylandWindow {
 
         // Surface state changed during this GPUI tick is included in this presentation.
         state.redraw_requested = false;
-        if state.pending_frame_callback.is_none() {
-            let callback = state.surface.frame(&state.globals.qh, state.surface.id());
-            state.pending_frame_callback = Some(callback);
-        }
-        if renderer.draw(scene) {
+        let drawn = match state.awaiting_frame_callback && render_ahead_enabled() {
+            true => renderer.draw_held(scene),
+            false => {
+                if state.pending_frame_callback.is_none() {
+                    let callback = state.surface.frame(&state.globals.qh, state.surface.id());
+                    state.pending_frame_callback = Some(callback);
+                }
+                let presented = renderer.draw(scene);
+                state.awaiting_frame_callback |= presented;
+                presented
+            }
+        };
+        if drawn {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
         } else {
@@ -2107,6 +2223,20 @@ impl PlatformWindow for WaylandWindow {
 
     fn schedule_frame(&self) {
         self.0.schedule_frame();
+    }
+
+    fn presents_to_hold_refresh_rate(&self) -> bool {
+        false
+    }
+
+    fn can_release_idle_gpu_memory(&self) -> bool {
+        true
+    }
+
+    fn release_idle_gpu_memory(&self) {
+        if let Some(renderer) = self.borrow_mut().renderer.as_mut() {
+            renderer.release_idle_targets();
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -2512,51 +2642,92 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
-    // Prefer the ext-background-effect protocol, as it is DE agnostic and
-    // replaces the deprecated kde-blur protocol, which is no longer supported
-    // since KDE Plasma 6.7.
-    // https://invent.kde.org/plasma/kwin/-/commit/7f9e0aa1cd2c2ab4fea1097800893b6f780089eb
-    if let Some(ref background_effects_manager) = state.globals.background_effects_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
-            if state.background_effects.is_none() {
-                log::debug!("Using ext-background-effect protocol");
-                let background_effects = background_effects_manager.get_background_effect(
-                    &state.surface,
-                    &state.globals.qh,
-                    (),
-                );
-                state.background_effects = Some(background_effects);
+    region.destroy();
+    update_blur(&mut state);
+}
+
+/// Asks the compositor to blur behind a `Blurred` window and to stop for any other appearance.
+/// `ext_background_effect_v1` is used while the compositor says it can blur, and KDE's own
+/// protocol otherwise. The change lands with the surface's next commit.
+fn update_blur(state: &mut WaylandWindowState) {
+    let blurred = state.background_appearance == WindowBackgroundAppearance::Blurred;
+    let effect_manager = state
+        .globals
+        .background_effect_manager
+        .clone()
+        .filter(|_| state.globals.background_blur.get());
+
+    if let Some(manager) = effect_manager {
+        if let Some(blur) = state.blur.take() {
+            if let Some(blur_manager) = state.globals.blur_manager.borrow().as_ref() {
+                blur_manager.unset(&state.surface);
             }
-
-            add_rounded_rect(area, state.client_corner_radii, |x, y, width, height| {
-                region.add(x, y, width, height);
-            });
-
-            state
-                .background_effects
-                .as_ref()
-                .unwrap()
-                .set_blur_region(Some(&region));
-        } else if let Some(background_effects) = state.background_effects.take() {
-            background_effects.destroy();
+            blur.release();
         }
-    } else if let Some(ref blur_manager) = state.globals.kde_blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
-            if state.kde_blur.is_none() {
-                log::debug!("Using kde-blur protocol");
-                let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
-                state.kde_blur = Some(blur);
-            }
-            state.kde_blur.as_ref().unwrap().commit();
-        } else {
+        let region = blurred.then(|| blur_region(state));
+        let effect = state.background_effect.get_or_insert_with(|| {
+            manager.get_background_effect(&state.surface, &state.globals.qh, ())
+        });
+        effect.set_blur_region(region.as_ref());
+        if let Some(region) = region {
+            region.destroy();
+        }
+        return;
+    }
+
+    if let Some(effect) = &state.background_effect {
+        effect.set_blur_region(None);
+    }
+    let Some(blur_manager) = state.globals.blur_manager.borrow().clone() else {
+        if let Some(blur) = state.blur.take() {
+            blur.release();
+        }
+        return;
+    };
+    match blurred {
+        true => {
+            let region = blur_region(state);
+            let blur = state
+                .blur
+                .get_or_insert_with(|| blur_manager.create(&state.surface, &state.globals.qh, ()));
+            blur.set_region(Some(&region));
+            blur.commit();
+            region.destroy();
+        }
+        false => {
             blur_manager.unset(&state.surface);
-            if let Some(b) = state.kde_blur.take() {
-                b.release()
+            if let Some(blur) = state.blur.take() {
+                blur.release();
             }
         }
     }
+}
 
-    region.destroy();
+/// The part of the surface the compositor blurs behind: the window inside its client-side
+/// shadow, with each corner cut in one pixel rows to follow the window's corner radius.
+fn blur_region(state: &WaylandWindowState) -> wl_region::WlRegion {
+    let window = inset_by_tiling(
+        Bounds::new(Point::default(), state.bounds.size),
+        state.inset(),
+        state.tiling,
+    )
+    .map(|value| f32::from(value) as i32);
+    let (x, y) = (window.origin.x, window.origin.y);
+    let (width, height) = (window.size.width.max(0), window.size.height.max(0));
+    let radius = (f32::from(state.corner_radius).round() as i32).clamp(0, width.min(height) / 2);
+
+    let region = state
+        .globals
+        .compositor
+        .create_region(&state.globals.qh, ());
+    region.add(x, y + radius, width, height - 2 * radius);
+    for row in 0..radius {
+        let rise = (radius - row) as f32 - 0.5;
+        let cut = radius - ((radius * radius) as f32 - rise * rise).sqrt().round() as i32;
+        region.add(x + cut, y + row, width - 2 * cut, 1);
+        region.add(x + cut, y + height - 1 - row, width - 2 * cut, 1);
+    }
+    region
 }
 
 pub(crate) trait WindowDecorationsExt {
@@ -2617,6 +2788,16 @@ fn compute_outer_size(
     })
 }
 
+/// Drops one logical pixel from a length whose device length ends in exactly half a pixel.
+fn off_half_pixel(value: Pixels, scale: f32) -> Pixels {
+    let device = f32::from(value) * scale;
+    let centred = (device.fract() - 0.5).abs() < 1e-3;
+    match centred && value > px(1.0) {
+        true => value - px(1.0),
+        false => value,
+    }
+}
+
 fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) -> Bounds<Pixels> {
     if !tiling.top {
         bounds.origin.y += inset;
@@ -2634,4 +2815,13 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+/// Whether a frame drawn while a frame callback is outstanding is held for that callback. Set
+/// `GPUI_RENDER_AHEAD=0` to present every frame as soon as it is drawn.
+fn render_ahead_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("GPUI_RENDER_AHEAD").is_none_or(|value| value != "0")
+    });
+    *ENABLED
 }

@@ -565,6 +565,12 @@ pub trait Platform: 'static {
     fn compositor_name(&self) -> &'static str {
         ""
     }
+
+    /// Whether gpui coasts touchpad scrolls on after the fingers lift, because the platform says
+    /// when they lift but sends no momentum of its own, as on Wayland.
+    fn coasts_scrolls(&self) -> bool {
+        false
+    }
     /// The environment of the display server a platform that can switch windowing modes is
     /// connected to. See [`App::graphical_environment`].
     fn graphical_environment(&self) -> Option<GraphicalEnvironment> {
@@ -1300,6 +1306,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Whether a `Blurred` background actually blurs what is behind the window.
+    fn is_background_blur_supported(&self) -> bool {
+        false
+    }
+    /// The radius the app rounds the window's corners with, so an effect the compositor draws
+    /// behind the window can follow its shape.
+    fn set_window_corner_radius(&self, _radius: Pixels) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -1345,6 +1358,21 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         crate::fast::composition::unsupported("surface ordering")
     }
     fn schedule_frame(&self) {}
+    /// Whether presenting an unchanged frame keeps the display at its full refresh rate, so the
+    /// window goes on presenting for a moment after high-rate input. A compositor that only
+    /// repaints for new content gains nothing from it.
+    fn presents_to_hold_refresh_rate(&self) -> bool {
+        true
+    }
+    /// Whether the renderer keeps GPU memory that only drawing uses, which the window then frees
+    /// through [`Self::release_idle_gpu_memory`] once it stops presenting.
+    fn can_release_idle_gpu_memory(&self) -> bool {
+        false
+    }
+    /// Frees GPU memory the renderer keeps only while it draws, such as offscreen blur and path
+    /// targets. The window calls this once it has gone a while without presenting, since a
+    /// renderer only notices idle targets in the middle of a frame.
+    fn release_idle_gpu_memory(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

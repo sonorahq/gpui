@@ -509,6 +509,7 @@ impl Scene {
             .context("scene replay range ends past the scene")?;
         let mut active_layers = Vec::new();
         let mut active_clips = Vec::new();
+        let mut active_filters = Vec::new();
         for operation in prefix {
             match operation {
                 PaintOperation::StartLayer(bounds) => active_layers.push(*bounds),
@@ -518,9 +519,17 @@ impl Scene {
                         "source scene closes a layer that is not open"
                     );
                 }
-                PaintOperation::Primitive(_) => {}
+                PaintOperation::Primitive(_)
+                | PaintOperation::StartSpan(..)
+                | PaintOperation::EndSpan => {}
                 PaintOperation::FastRoundedClip(clip) => {
                     crate::fast::rounded_clip::track(*clip, &mut active_clips)?
+                }
+                PaintOperation::StartFilter(bounds, origin, mask, filter) => {
+                    active_filters.push((*bounds, *origin, *mask, *filter))
+                }
+                PaintOperation::EndFilter => {
+                    active_filters.pop();
                 }
             }
         }
@@ -529,6 +538,10 @@ impl Scene {
         for bounds in &active_layers {
             self.push_layer(*bounds);
         }
+        for (bounds, origin, mask, filter) in &active_filters {
+            self.push_filter(*bounds, *origin, *mask, *filter);
+        }
+        let mut open_spans = 0usize;
         for shape in &active_clips {
             crate::fast::rounded_clip::record(
                 self,
@@ -553,7 +566,32 @@ impl Scene {
                     crate::fast::rounded_clip::track(*clip, &mut active_clips)?;
                     crate::fast::rounded_clip::record(self, *clip);
                 }
+                PaintOperation::StartFilter(bounds, origin, mask, filter) => {
+                    active_filters.push((*bounds, *origin, *mask, *filter));
+                    self.push_filter(*bounds, *origin, *mask, *filter);
+                }
+                PaintOperation::EndFilter => {
+                    if active_filters.pop().is_some() {
+                        self.pop_filter();
+                    }
+                }
+                PaintOperation::StartSpan(id, bounds) => {
+                    open_spans += 1;
+                    self.push_span(*id, *bounds);
+                }
+                PaintOperation::EndSpan => {
+                    if open_spans > 0 {
+                        open_spans -= 1;
+                        self.pop_span();
+                    }
+                }
             }
+        }
+        for _ in 0..open_spans {
+            self.pop_span();
+        }
+        for _ in active_filters {
+            self.pop_filter();
         }
         for _ in active_layers {
             self.pop_layer();

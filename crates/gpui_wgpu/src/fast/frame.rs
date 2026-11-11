@@ -149,8 +149,11 @@ impl FrameHost for WgpuRendererCore {
             atlas_sampler: &resources.atlas_sampler,
             globals_bind_group: &resources.globals_bind_group,
             path_globals_bind_group: &resources.path_globals_bind_group,
-            path_intermediate_view: resources.path_intermediate_view.as_ref(),
-            path_msaa_view: resources.path_msaa_view.as_ref(),
+            path_intermediate_view: resources
+                .path_intermediate
+                .as_ref()
+                .map(|scratch| &scratch.view),
+            path_msaa_view: resources.path_msaa.as_ref().map(|scratch| &scratch.view),
             instance_data,
             globals_buffer: &resources.globals_buffer,
             gamma_offset: self.gamma_offset,
@@ -251,7 +254,16 @@ pub(crate) fn record_frame(
     frame_view: &wgpu::TextureView,
     clear_color: wgpu::Color,
 ) -> Result<Option<wgpu::SubmissionIndex>> {
+    if !can_record(scene) {
+        return Ok(None);
+    }
     record_into(renderer, scene, frame_view, clear_color).map(Some)
+}
+
+/// Whether this recorder can draw `scene`. Filtered layers, backdrops and custom shaders are
+/// drawn only by the renderer's own pass loop, so a scene holding any of them is left to it.
+pub(crate) fn can_record(scene: &Scene) -> bool {
+    scene.effects.is_empty() && scene.backdrops.is_empty() && scene.shaders.is_empty()
 }
 
 /// Records `scene` into `frame_view`, cleared to `clear` first, and submits it.
@@ -824,6 +836,8 @@ pub(crate) fn draw_scene(
         pass.set_bind_group(3, clip_binding, &[clip_offset]);
         let batch = step.batch;
         match batch {
+            // `can_record` leaves every scene holding these to the renderer's own pass loop.
+            PrimitiveBatch::Backdrops(_) | PrimitiveBatch::Shaders { .. } => {}
             PrimitiveBatch::Quads(range) => draw_batch(
                 &mut pass,
                 &mut bound,

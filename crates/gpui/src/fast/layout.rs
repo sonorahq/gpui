@@ -616,14 +616,14 @@ impl TaffyLayoutEngine {
                     .unstretched_styles
                     .get(&id)
                     .unwrap_or_else(|| self.taffy.style(id.into()).expect(EXPECT_MESSAGE))
-                    == &style.to_taffy(rem_size, scale_factor),
+                    == &style.to_taffy(rem_size, crate::taffy::Grid::new(scale_factor, style.pixel_snap)),
                 "layout_fingerprint matched a style that converts differently; \
                  it has to read every field to_taffy does"
             );
             return;
         }
         node.style_fingerprint = fingerprint;
-        self.apply_style(id, style.to_taffy(rem_size, scale_factor));
+        self.apply_style(id, style.to_taffy(rem_size, crate::taffy::Grid::new(scale_factor, style.pixel_snap)));
     }
 
     /// Writes `style` to a node, but only if it differs from what the node was
@@ -1036,7 +1036,7 @@ pub(crate) fn request_retained_layout(
     engine.retention.stats.nodes_created += 1;
     engine.retention.layout_changes += 1;
     let style_fingerprint = layout_fingerprint(style, rem_size, scale_factor);
-    let taffy_style = style.to_taffy(rem_size, scale_factor);
+    let taffy_style = style.to_taffy(rem_size, crate::taffy::Grid::new(scale_factor, style.pixel_snap));
     let id: LayoutId = engine
         .taffy
         .new_leaf(taffy_style)
@@ -1126,7 +1126,7 @@ fn request_measured_node(
                 _ => None,
             };
             let style_fingerprint = layout_fingerprint(style, rem_size, scale_factor);
-            let taffy_style = style.to_taffy(rem_size, scale_factor);
+            let taffy_style = style.to_taffy(rem_size, crate::taffy::Grid::new(scale_factor, style.pixel_snap));
             engine.retention.stats.nodes_created += 1;
             engine.retention.layout_changes += 1;
             let id: LayoutId = engine
@@ -1369,6 +1369,7 @@ fn layout_fingerprint(style: &Style, rem_size: Pixels, scale_factor: f32) -> u64
     sizes(hasher, &style.min_size, length);
     sizes(hasher, &style.max_size, length);
     style.aspect_ratio.map(f32::to_bits).hash(hasher);
+    style.pixel_snap.hash(hasher);
     edges(hasher, &style.margin, length);
     edges(hasher, &style.padding, definite);
     edges(hasher, &style.border_widths, absolute);
@@ -1505,12 +1506,12 @@ mod tests {
         ];
 
         let base_fingerprint = layout_fingerprint(&base, rem_size, scale_factor);
-        let base_taffy = base.to_taffy(rem_size, scale_factor);
+        let base_taffy = base.to_taffy(rem_size, crate::taffy::Grid::new(scale_factor, base.pixel_snap));
         for (field, change) in &cases {
             let mut style = base.clone();
             change(&mut style);
             assert_ne!(
-                style.to_taffy(rem_size, scale_factor),
+                style.to_taffy(rem_size, crate::taffy::Grid::new(scale_factor, style.pixel_snap)),
                 base_taffy,
                 "changing {field} should change the Taffy style, or this case tests nothing"
             );

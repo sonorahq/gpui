@@ -130,5 +130,7 @@ pub(crate) fn draw_order(primitive: &Primitive) -> DrawOrder {
         Primitive::SubpixelSprite(sprite) => sprite.order,
         Primitive::PolychromeSprite(sprite) => sprite.order,
         Primitive::Surface(surface) => surface.order,
+        Primitive::Backdrop(backdrop) => backdrop.order,
+        Primitive::Shader(shader) => shader.order,
     }
 }

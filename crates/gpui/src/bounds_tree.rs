@@ -28,6 +28,8 @@ where
     root: Option<usize>,
     /// Index of the leaf with the highest ordering (for fast-path lookups).
     max_leaf: Option<usize>,
+    /// An ordering every insert has to stay above, raised by [`BoundsTree::barrier`].
+    floor: u32,
     /// Reusable stack for tree traversal during insertion.
     insert_path: Vec<usize>,
     /// Reusable stack for search operations.
@@ -109,8 +111,27 @@ where
         self.nodes.clear();
         self.root = None;
         self.max_leaf = None;
+        self.floor = 0;
         self.insert_path.clear();
         self.search_stack.clear();
+    }
+
+    /// Reserves an ordering above everything inserted so far, and holds every later insert above
+    /// it.
+    ///
+    /// A layer that has to be drawn as a whole needs a slot nothing else can share. Inserting a
+    /// screen-sized rectangle would do it, but it would also make every later query intersect that
+    /// rectangle and walk the tree for nothing.
+    pub fn barrier(&mut self) -> u32 {
+        self.floor = self.highest() + 1;
+        self.floor
+    }
+
+    fn highest(&self) -> u32 {
+        self.max_leaf
+            .map(|index| self.nodes[index].max_order)
+            .unwrap_or_default()
+            .max(self.floor)
     }
 
     /// Inserts bounds into the tree and returns its assigned ordering.
@@ -119,7 +140,7 @@ where
     /// existing bounds that intersect with the new bounds.
     pub fn insert(&mut self, new_bounds: Bounds<U>) -> u32 {
         // Find maximum ordering among intersecting bounds
-        let max_intersecting = self.find_max_ordering(&new_bounds);
+        let max_intersecting = self.find_max_ordering(&new_bounds).max(self.floor);
         let ordering = max_intersecting + 1;
 
         // Insert the new leaf
@@ -365,6 +386,7 @@ where
             nodes: Vec::new(),
             root: None,
             max_leaf: None,
+            floor: 0,
             insert_path: Vec::new(),
             search_stack: Vec::new(),
         }

@@ -62,6 +62,16 @@ where
     /// How many more bounds replaying may compare against, over every search
     /// it makes, before the tree is built instead.
     replay_search_budget: usize,
+    /// An ordering every insert has to stay above, raised by [`BoundsTree::barrier`].
+    floor: u32,
+    /// The greatest ordering handed out since the tree was cleared.
+    highest: u32,
+    /// Each barrier raised since the tree was cleared, as how many bounds had been inserted
+    /// before it and the floor it set. Replaying stays valid only while these match the
+    /// previous fill's.
+    barriers: Vec<(usize, u32)>,
+    /// What `barriers` held when the tree was cleared.
+    previous_barriers: Vec<(usize, u32)>,
 }
 
 /// The grid a [`BoundsTree`] keeps its bounds in. Cell `(column, row)`
@@ -435,6 +445,27 @@ where
         self.replaying = true;
         self.changed.clear();
         self.replay_search_budget = REPLAY_SEARCH_BUDGET;
+        self.floor = 0;
+        self.highest = 0;
+        std::mem::swap(&mut self.previous_barriers, &mut self.barriers);
+        self.barriers.clear();
+    }
+
+    /// Reserves an ordering above everything inserted so far, and holds every later insert above
+    /// it.
+    ///
+    /// A layer that has to be drawn as a whole needs a slot nothing else can share. Inserting a
+    /// screen-sized rectangle would do it, but it would also make every later query intersect that
+    /// rectangle and walk the tree for nothing.
+    pub fn barrier(&mut self) -> u32 {
+        self.floor = self.highest.max(self.floor) + 1;
+        let barrier = (self.recorded.len(), self.floor);
+        if self.replaying && self.previous_barriers.get(self.barriers.len()) != Some(&barrier) {
+            self.replaying = false;
+            self.build_from_recorded();
+        }
+        self.barriers.push(barrier);
+        self.floor
     }
 
     /// Clears the tree and forgets what was inserted before, so the next fill
@@ -454,15 +485,17 @@ where
         if self.replaying {
             if let Some(ordering) = self.replay(&new_bounds) {
                 self.recorded.push((new_bounds, ordering));
+                self.highest = self.highest.max(ordering);
                 return ordering;
             }
             self.replaying = false;
             self.build_from_recorded();
         }
 
-        let ordering = self.find_max_ordering(&new_bounds) + 1;
+        let ordering = self.find_max_ordering(&new_bounds).max(self.floor) + 1;
         self.add(&new_bounds, ordering);
         self.recorded.push((new_bounds, ordering));
+        self.highest = self.highest.max(ordering);
         ordering
     }
 
@@ -504,6 +537,7 @@ where
             .map(|(_, ordering)| *ordering)
             .max()
             .unwrap_or(0)
+            .max(self.floor)
             + 1;
         match previous {
             Some((previous_bounds, previous_ordering)) => {
@@ -604,6 +638,10 @@ where
                 unmarked: false,
             },
             replay_search_budget: REPLAY_SEARCH_BUDGET,
+            floor: 0,
+            highest: 0,
+            barriers: Vec::new(),
+            previous_barriers: Vec::new(),
         }
     }
 }

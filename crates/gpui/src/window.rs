@@ -8,27 +8,31 @@ use crate::subscription::SingleSubscriberSet;
 use crate::taffy::TaffyLayoutEngine;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Backdrop, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
-    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
-    prelude::*, px, rems, size, transparent_black,
+    EntityId, EventEmitter, FileDropEvent, Filter, FontId, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent,
+    KeyEvent, Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shader,
+    ShaderInstance, ShaderQuad, Shadow, SharedString, Size, SpanId, StrikethroughStyle, Style,
+    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
+    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
-use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+use crate::gestures::{GestureTuning, RecognizedTouchGesture, ScrollCoast, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
+
+/// A gaussian is cut off after three standard deviations.
+const BLUR_REACH: f32 = 3.;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -89,6 +93,10 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     width: Pixels(900.),
     height: Pixels(750.),
 };
+
+/// How long a window may go without presenting before its renderer frees the GPU memory it
+/// keeps only while drawing.
+const IDLE_GPU_RELEASE: Duration = Duration::from_secs(3);
 
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
@@ -242,6 +250,11 @@ impl WindowInvalidator {
 
     pub fn set_phase(&self, phase: DrawPhase) {
         self.inner.borrow_mut().draw_phase = phase
+    }
+
+    #[cfg(feature = "profiler")]
+    pub fn phase(&self) -> DrawPhase {
+        self.inner.borrow().draw_phase
     }
 
     pub fn update_count(&self) -> usize {
@@ -1265,6 +1278,8 @@ pub struct Window {
     pub(crate) fast_composition: crate::fast::composition::WindowCompositionHandle,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+    /// Whether element offsets and painted primitives land on the device pixel grid.
+    pub(crate) pixel_snapping: bool,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -1300,6 +1315,10 @@ pub struct Window {
         SingleSubscriberSet<Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     pub(crate) hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// When the window last presented, by the executor's clock.
+    last_present: Instant,
+    /// Whether a task is already waiting to free the renderer's idle GPU memory.
+    idle_gpu_release_armed: bool,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1307,6 +1326,8 @@ pub struct Window {
     pub(crate) window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
+    /// Touchpad momentum, on a platform that leaves it to gpui.
+    scroll_coast: Option<ScrollCoast>,
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
@@ -1744,6 +1765,10 @@ impl Window {
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let gesture_tuning = cx
+            .platform
+            .gestures()
+            .map_or_else(GestureTuning::default, |gestures| gestures.tuning());
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1902,6 +1927,7 @@ impl Window {
                 .detach();
             }
         }));
+        let presents_to_hold_refresh_rate = platform_window.presents_to_hold_refresh_rate();
         platform_window.on_request_frame(Box::new({
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
@@ -1912,6 +1938,8 @@ impl Window {
             let mut deferred_force_render = false;
             let mut frame_pacer = FramePacer::default();
             move |request_frame_options| {
+                let _frame_stats_tick =
+                    crate::frame_stats::Tick::begin(request_frame_options.signal_source);
                 #[cfg(feature = "profiler")]
                 let (_foreground_turn, window_id) = {
                     let foreground_turn = profiler::journal::foreground_turn();
@@ -2030,6 +2058,7 @@ impl Window {
 
                 let pending_next_frame_callbacks = next_frame_callbacks.take();
                 if !pending_next_frame_callbacks.is_empty() {
+                    let callbacks_start = crate::frame_stats::start();
                     handle
                         .update(&mut cx, |_, window, cx| {
                             for callback in pending_next_frame_callbacks {
@@ -2043,12 +2072,16 @@ impl Window {
                             )
                         })
                         .log_err();
+                    crate::frame_stats::record(
+                        crate::frame_stats::Phase::Callbacks,
+                        callbacks_start,
+                    );
                 }
 
                 let should_draw = invalidator.is_dirty() || force_render;
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || high_rate_input;
+                    || (presents_to_hold_refresh_rate && high_rate_input);
                 if should_draw {
                     measure("frame duration", || {
                         handle
@@ -2062,8 +2095,15 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
+                                let draw_start = crate::frame_stats::start();
                                 let arena_clear_needed = window.draw(cx);
+                                crate::frame_stats::record(
+                                    crate::frame_stats::Phase::Draw,
+                                    draw_start,
+                                );
+                                crate::frame_stats::mark_drawn();
                                 window.present();
+                                window.arm_idle_gpu_release(cx);
                                 arena_clear_needed.clear(cx);
                             })
                             .with_context(|| {
@@ -2076,7 +2116,10 @@ impl Window {
                     })
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, cx| {
+                            window.present();
+                            window.arm_idle_gpu_release(cx);
+                        })
                         .with_context(|| {
                             format!("presenting frame for window {:?}", handle.window_id())
                         })
@@ -2398,6 +2441,7 @@ impl Window {
             fast_composition: crate::fast::composition::WindowCompositionHandle::default(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
+            pixel_snapping: true,
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -2428,15 +2472,14 @@ impl Window {
             visibility_observers: SingleSubscriberSet::new(),
             hovered,
             needs_present,
+            last_present: cx.background_executor().now(),
+            idle_gpu_release_armed: false,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
-            touch_gestures: TouchGestureRecognizer::new(
-                cx.platform
-                    .gestures()
-                    .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
-            ),
+            touch_gestures: TouchGestureRecognizer::new(gesture_tuning),
+            scroll_coast: cx.platform.coasts_scrolls().then(ScrollCoast::new),
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
@@ -2506,6 +2549,10 @@ impl ContentMask<Pixels> {
 
 impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
+        // The view named here is the one that changed; everything above it is
+        // only dragged along, which is what the repaint wash wants to tell apart.
+        #[cfg(feature = "profiler")]
+        self.debug_frame_overlay.note_notified(view_id);
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
         // should already be dirty.
         for view_id in self
@@ -3323,6 +3370,19 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Whether a `Blurred` background blurs what is behind the window. On Wayland it depends on
+    /// the compositor and can change while the app runs, which fires the window's appearance
+    /// observers.
+    pub fn is_background_blur_supported(&self) -> bool {
+        self.platform_window.is_background_blur_supported()
+    }
+
+    /// Tells the platform the radius the app draws the window's corners with, so the background
+    /// blur stays inside the rounded shape. Only Wayland uses it.
+    pub fn set_window_corner_radius(&self, radius: Pixels) {
+        self.platform_window.set_window_corner_radius(radius);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
@@ -3550,6 +3610,9 @@ impl Window {
     #[inline]
     pub(crate) fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
+        if !self.pixel_snapping {
+            return bounds.scale(scale_factor);
+        }
         let left = round_to_device_pixel(bounds.left().0, scale_factor);
         let top = round_to_device_pixel(bounds.top().0, scale_factor);
         let right = round_to_device_pixel(bounds.right().0, scale_factor).max(left);
@@ -3823,9 +3886,29 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
+        #[cfg(feature = "profiler")]
+        if let Some(tally) = self.debug_frame_overlay.take_tally() {
+            let named = tally
+                .iter()
+                .take(12)
+                .map(|(id, count)| {
+                    let name = cx.entities.name(*id);
+                    let name = name.rsplit("::").next().unwrap_or(name);
+                    format!("{name} {count}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("notifies/s: {named}");
+        }
+
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         crate::fast::layers::hover_freeze::release_unhovered(self, cx);
+        // The wash lives in the scene, so it only clears on a later frame.
+        #[cfg(feature = "profiler")]
+        if self.debug_frame_overlay.wants_frame() {
+            self.invalidator.set_dirty(true);
+        }
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
@@ -3877,7 +3960,9 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        let frame_stats_present = crate::frame_stats::start();
         crate::fast::composition::present(self);
+        crate::frame_stats::record(crate::frame_stats::Phase::Present, frame_stats_present);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3887,6 +3972,37 @@ impl Window {
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Notes that the window just presented and makes sure a task is waiting to free the
+    /// renderer's offscreen targets once it stops. A renderer only notices idle targets while it
+    /// draws, so a window that goes still would otherwise keep whatever its last busy frame
+    /// allocated.
+    fn arm_idle_gpu_release(&mut self, cx: &mut App) {
+        self.last_present = cx.background_executor().now();
+        if self.idle_gpu_release_armed || !self.platform_window.can_release_idle_gpu_memory() {
+            return;
+        }
+        self.idle_gpu_release_armed = true;
+        let handle = self.handle;
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(IDLE_GPU_RELEASE).await;
+                let now = cx.background_executor().now();
+                let released = handle.update(cx, |_, window, _| {
+                    if now.duration_since(window.last_present) < IDLE_GPU_RELEASE {
+                        return false;
+                    }
+                    window.platform_window.release_idle_gpu_memory();
+                    window.idle_gpu_release_armed = false;
+                    true
+                });
+                if released.unwrap_or(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
@@ -3937,8 +4053,71 @@ impl Window {
         self.refresh();
     }
 
+    #[inline]
+    pub(crate) fn note_rendered_view(&mut self) {
+        #[cfg(feature = "profiler")]
+        if self.invalidator.phase() == DrawPhase::Prepaint {
+            self.debug_frame_overlay.note_rendered_view();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn note_view_cache(&mut self, reused: bool) {
+        #[cfg(feature = "profiler")]
+        self.debug_frame_overlay.note_view(reused);
+        #[cfg(not(feature = "profiler"))]
+        let _ = reused;
+    }
+
+    /// Washes this view if a notify named it since the last frame.
+    #[inline]
+    pub(crate) fn note_notified(&mut self, view: EntityId, bounds: Bounds<Pixels>) {
+        #[cfg(feature = "profiler")]
+        if self.debug_frame_overlay.was_notified(view) {
+            self.debug_frame_overlay.note_repaint(view, bounds);
+        }
+        #[cfg(not(feature = "profiler"))]
+        let _ = (view, bounds);
+    }
+
+    #[inline]
+    pub(crate) fn note_repaint(&mut self, view: EntityId, bounds: Bounds<Pixels>) {
+        #[cfg(feature = "profiler")]
+        self.debug_frame_overlay.note_repaint(view, bounds);
+        #[cfg(not(feature = "profiler"))]
+        let _ = (view, bounds);
+    }
+
+    /// Whether re-rendered views are being washed for inspection.
+    #[cfg(feature = "profiler")]
+    pub fn show_repaints(&self) -> bool {
+        self.debug_frame_overlay.show_repaints()
+    }
+
+    /// Washes every view that re-renders, so a frame shows what it rebuilt.
+    #[cfg(feature = "profiler")]
+    pub fn set_show_repaints(&mut self, show: bool) {
+        self.debug_frame_overlay.set_show_repaints(show);
+        self.refresh();
+    }
+
+    /// Turns the repaint wash on or off.
+    #[cfg(feature = "profiler")]
+    pub fn toggle_repaints(&mut self) {
+        self.set_show_repaints(!self.show_repaints());
+    }
+
     fn draw_roots(&mut self, cx: &mut App) {
         crate::fast::retained::begin_frame(self, cx);
+        #[cfg(feature = "profiler")]
+        {
+            self.debug_frame_overlay.begin_frame();
+            let dirty = self.dirty_views.len() as u32;
+            let refreshing = self.refreshing;
+            self.debug_frame_overlay.note_start(dirty, refreshing);
+        }
+        #[cfg(feature = "profiler")]
+        let phase_start = std::time::Instant::now();
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -3971,9 +4150,12 @@ impl Window {
         let scale_factor = self.scale_factor();
         #[cfg(feature = "profiler")]
         let request_layout_start = Instant::now();
+        let frame_stats_render = crate::frame_stats::start();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
         crate::fast::stats::FramePhaseTimes::end_build(&mut self.fast_layout.phase_times);
+        crate::frame_stats::record(crate::frame_stats::Phase::Render, frame_stats_render);
+        let frame_stats_prepaint = crate::frame_stats::start();
         #[cfg(feature = "profiler")]
         let prepaint_start = Instant::now();
         self.layout_engine
@@ -3981,6 +4163,8 @@ impl Window {
             .unwrap()
             .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
         crate::fast::composition::begin_base_prepaint(self);
+        #[cfg(feature = "profiler")]
+        let laid_out = std::time::Instant::now();
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -4018,7 +4202,11 @@ impl Window {
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
+        let prepainted = std::time::Instant::now();
+        #[cfg(feature = "profiler")]
         let paint_start = Instant::now();
+        crate::frame_stats::record(crate::frame_stats::Phase::Prepaint, frame_stats_prepaint);
+        let frame_stats_paint = crate::frame_stats::start();
         self.invalidator.set_phase(DrawPhase::Paint);
         crate::fast::composition::begin_base(self);
         root_element.paint(self, cx);
@@ -4035,6 +4223,18 @@ impl Window {
             drag_element.paint(self, cx);
         } else if let Some(mut tooltip_element) = tooltip_element {
             tooltip_element.paint(self, cx);
+        }
+        crate::frame_stats::record(crate::frame_stats::Phase::Paint, frame_stats_paint);
+
+        #[cfg(feature = "profiler")]
+        {
+            self.debug_frame_overlay.note_phases(
+                laid_out.duration_since(phase_start),
+                prepainted.duration_since(laid_out),
+                prepainted.elapsed(),
+            );
+            self.debug_frame_overlay.settle_frame();
+            self.debug_frame_overlay.settle_notified();
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -4499,6 +4699,25 @@ impl Window {
         self.with_absolute_element_offset(abs_offset, f)
     }
 
+    /// Lays a subtree out at exactly the offset it was given, and paints its quads, images and
+    /// icons at exactly the bounds they were given, instead of rounding either to the device
+    /// pixel grid. Shadows still grow to cover whole device pixels, so a shadow's extent steps
+    /// a pixel at a time under a quad that glides. An element that animates its own position
+    /// wants this: rounding turns a smooth path into whole-pixel steps, so a decelerating one
+    /// either sits on its last pixel for several frames or stops while it is still visibly
+    /// moving. Text is placed at subpixel positions either way; only an edge that falls between
+    /// pixels softens. Elements styled with [`Styled::pixel_snap`](crate::Styled::pixel_snap)
+    /// set this for themselves. This method should only be called during the prepaint or paint
+    /// phase of element drawing.
+    pub fn with_pixel_snapping<R>(&mut self, snap: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let was = std::mem::replace(&mut self.pixel_snapping, snap);
+        let result = f(self);
+        self.pixel_snapping = was;
+        result
+    }
+
     /// Updates the global element offset based on the given offset. This is used to implement
     /// drag handles and other manual painting of elements. This method should only be called during
     /// the prepaint phase of element drawing.
@@ -4859,13 +5078,16 @@ impl Window {
 
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
-    /// after the element's background so they layer on top of the fill.
+    /// after the element's background so they layer on top of the fill. A drop shadow is
+    /// clipped to outside `bounds`, whose corners are smoothed by `corner_smoothing`, so a
+    /// translucent fill never shows it through.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
@@ -4890,7 +5112,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                pad: 0,
+                element_corner_smoothing: corner_smoothing,
             });
         }
     }
@@ -4898,10 +5120,12 @@ impl Window {
     /// Paint the inset shadows from `shadows` into the scene at the current z-index. Should
     /// be called after the element's background so the shadow layers on top of the fill.
     /// Drop shadows are skipped; paint those with [`Self::paint_drop_shadows`] before the background.
+    /// The shadows stay inside `bounds`, whose corners are smoothed by `corner_smoothing`.
     pub fn paint_inset_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
@@ -4935,13 +5159,20 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                pad: 0,
+                element_corner_smoothing: corner_smoothing,
             });
         }
     }
 
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
-        let radii = &quad.corner_radii;
+        // A smoothed corner starts further along each edge than its radius.
+        let reach = 1.0 + SQUIRCLE_REACH * quad.corner_smoothing.clamp(0.0, 1.0);
+        let radii = &Corners {
+            top_left: quad.corner_radii.top_left * reach,
+            top_right: quad.corner_radii.top_right * reach,
+            bottom_right: quad.corner_radii.bottom_right * reach,
+            bottom_left: quad.corner_radii.bottom_left * reach,
+        };
         let widths = &quad.border_widths;
         let edge_radii = Edges {
             top: radii.top_left.max(radii.top_right),
@@ -4979,7 +5210,186 @@ impl Window {
         }
     }
 
+    /// Paints everything the callback draws into an offscreen layer, applies the given effects,
+    /// and composites the result back into the frame. `reach` is how far past `bounds` the
+    /// element paints on its own, its drop shadows, so the layer keeps room for them rather
+    /// than clipping them until the filter lets go. An edge fade is measured from the layer's
+    /// edge, so a layer that fades keeps no such room.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_filter<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        filter: LayerFilter,
+        reach: Pixels,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        if let Some(scale) = filter.scale {
+            assert!(
+                scale.is_finite() && scale > 0.0,
+                "layer scale must be finite and greater than zero"
+            );
+        }
+        if let Some(translation) = filter.translate {
+            assert!(
+                translation.x.0.is_finite() && translation.y.0.is_finite(),
+                "layer translation must be finite"
+            );
+        }
+        let grows_from = filter.scale_origin;
+        let filter = Filter {
+            blur: filter.blur.map_or(0., |blur| blur.0 * scale_factor),
+            fade_top: filter.fade_top.map_or(0., |fade| fade.0 * scale_factor),
+            fade_bottom: filter.fade_bottom.map_or(0., |fade| fade.0 * scale_factor),
+            fade_left: filter.fade_left.map_or(0., |fade| fade.0 * scale_factor),
+            fade_right: filter.fade_right.map_or(0., |fade| fade.0 * scale_factor),
+            scale: filter.scale.unwrap_or(1.0),
+            translate: filter.translate.map_or_else(Point::default, |translation| {
+                translation.scale(scale_factor)
+            }),
+        };
+        if filter.is_noop() {
+            return f(self);
+        }
+
+        let element_bounds = bounds.scale(scale_factor);
+        let transform_origin = match grows_from {
+            Some(origin) => {
+                element_bounds.origin
+                    + point(
+                        element_bounds.size.width * origin.x,
+                        element_bounds.size.height * origin.y,
+                    )
+            }
+            None => element_bounds.center(),
+        };
+        let fades = filter.fade_top + filter.fade_bottom + filter.fade_left + filter.fade_right;
+        let reach = match fades > 0. {
+            true => 0.,
+            false => reach.0.max(0.) * scale_factor,
+        };
+        let source_bounds = element_bounds.dilate(ScaledPixels(filter.blur * BLUR_REACH + reach));
+        let content_mask = self.snapped_content_mask().bounds;
+        self.next_frame
+            .scene
+            .push_filter(source_bounds, transform_origin, content_mask, filter);
+        let result = f(self);
+        self.next_frame.scene.pop_filter();
+        result
+    }
+
+    /// Names what `f` paints, so that [`Window::replay_span`] can paint it again on a later
+    /// frame once the element that drew it is gone. `bounds` comes back from
+    /// [`Window::rendered_span`]. A span survives a cached view replaying its paint.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_paint_span<R>(
+        &mut self,
+        id: SpanId,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame.scene.push_span(id, bounds);
+        let result = f(self);
+        self.next_frame.scene.pop_span();
+        result
+    }
+
+    /// Whether the frame being painted already holds a span named `id`.
+    pub fn span_painted(&self, id: SpanId) -> bool {
+        self.next_frame.scene.span(id).is_some()
+    }
+
+    /// The bounds of the span named `id` in the last frame drawn, when it held one.
+    pub fn rendered_span(&self, id: SpanId) -> Option<Bounds<Pixels>> {
+        self.rendered_frame.scene.span(id)
+    }
+
+    /// Paints what the last frame painted in its span `id` again, under the same name, with
+    /// the alpha of every colour scaled by `fade`. Only the pixels come back: nothing in the
+    /// span answers the pointer or the keyboard. Returns whether the last frame held the span.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn replay_span(&mut self, id: SpanId, fade: f32) -> bool {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame
+            .scene
+            .replay_span(id, &self.rendered_frame.scene, fade)
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
+    /// Blur whatever has already been painted behind the given bounds.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        blur: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        if blur <= Pixels::ZERO {
+            return;
+        }
+
+        let scale_factor = self.scale_factor();
+        self.next_frame.scene.insert_primitive(Backdrop {
+            order: 0,
+            corner_smoothing,
+            blur: blur.0 * scale_factor,
+            opacity: self.element_opacity(),
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+        });
+    }
+
+    /// Paints a custom shader over a rounded rectangle at the current stacking context. The
+    /// shader's colour is clipped to the corners, antialiased at the edge and faded by the
+    /// element's opacity. Radii larger than half the shorter side are clamped to it.
+    ///
+    /// The shader animates only by `instance.time`, so painting it never requests another
+    /// frame. An animated caller requests one itself, and one that passes a constant time
+    /// draws a still frame.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shader: &Shader,
+        instance: ShaderInstance,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = self.snap_bounds(bounds);
+        let corner_radii = corner_radii
+            .scale(scale_factor)
+            .clamp_radii_for_quad_size(bounds.size);
+        self.next_frame.scene.insert_primitive(ShaderQuad {
+            order: 0,
+            shader: shader.id(),
+            opacity: self.element_opacity(),
+            time: instance.time,
+            bounds,
+            content_mask: self.snapped_content_mask(),
+            corner_radii,
+            scale_factor,
+            pad: [0; 3],
+            params: instance.params,
+            colors: instance.rgba_colors(),
+        });
+    }
+
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.
     ///
@@ -5003,6 +5413,8 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            corner_smoothing: quad.corner_smoothing,
+            pad: 0,
         };
 
         if !quad.background.is_transparent() {
@@ -5325,7 +5737,10 @@ impl Window {
                 .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
         };
         let final_bounds = svg_bounds
-            .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
+            .map_origin(|value| match self.pixel_snapping {
+                true => ScaledPixels(round_half_toward_zero(value.0)),
+                false => value,
+            })
             .map_size(|size| size.ceil());
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -5565,8 +5980,10 @@ impl Window {
     ) {
         self.invalidator.debug_assert_prepaint();
 
+        let frame_stats_layout = crate::frame_stats::start();
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
+        crate::frame_stats::record(crate::frame_stats::Phase::Layout, frame_stats_layout);
         self.layout_engine = Some(layout_engine);
     }
 
@@ -5584,8 +6001,11 @@ impl Window {
             .unwrap()
             .layout_bounds(layout_id, scale_factor)
             .map(Into::into);
-        let snapped_offset = self.pixel_snap_point(self.element_offset());
-        bounds.origin += snapped_offset;
+        let offset = self.element_offset();
+        bounds.origin += match self.pixel_snapping {
+            true => self.pixel_snap_point(offset),
+            false => offset,
+        };
         bounds
     }
 
@@ -5662,6 +6082,7 @@ impl Window {
         id: EntityId,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.note_rendered_view();
         self.rendered_entity_stack.push(id);
         let result = f(self);
         self.rendered_entity_stack.pop();
@@ -5951,6 +6372,9 @@ impl Window {
             PlatformInput::MouseDown(mouse_down) => {
                 self.mouse_position = mouse_down.position;
                 self.modifiers = mouse_down.modifiers;
+                if let Some(coast) = self.scroll_coast.as_mut() {
+                    coast.stop();
+                }
                 PlatformInput::MouseDown(mouse_down)
             }
             PlatformInput::MouseUp(mouse_up) => {
@@ -5973,6 +6397,9 @@ impl Window {
             PlatformInput::Scroll(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
                 self.modifiers = scroll_wheel.modifiers;
+                if let Some(coast) = self.scroll_coast.as_mut() {
+                    coast.observe(&scroll_wheel);
+                }
                 PlatformInput::Scroll(scroll_wheel)
             }
             PlatformInput::Pinch(pinch) => {
@@ -6072,6 +6499,13 @@ impl Window {
             &mut cx.propagate_event,
         );
         crate::fast::layers::wheel::end_dispatch(self, cx);
+        if self
+            .scroll_coast
+            .as_ref()
+            .is_some_and(ScrollCoast::has_momentum)
+        {
+            self.schedule_scroll_coast_tick();
+        }
         if let PlatformInput::LongPress(long_press) = &event {
             match long_press.phase {
                 crate::TouchPhase::Started if !self.default_prevented => {
@@ -6128,6 +6562,15 @@ impl Window {
             && cx.hand_active_drag_to_platform(self.handle.window_id())
         {
             self.refresh();
+        }
+    }
+
+    /// Stops a touchpad scroll coasting on after the fingers lifted, for a listener that has
+    /// already acted on the gesture, such as one that turned the page, so the momentum does not
+    /// carry on into whatever is shown next.
+    pub fn stop_scroll_coast(&mut self) {
+        if let Some(coast) = self.scroll_coast.as_mut() {
+            coast.stop();
         }
     }
 
@@ -6261,6 +6704,36 @@ impl Window {
             })
             .log_err();
         }));
+    }
+
+    /// Queues the next step of a touchpad coast, unless one is queued already. The step is
+    /// dispatched where the pointer is, which on a touchpad has not moved since the scroll.
+    fn schedule_scroll_coast_tick(&mut self) {
+        let Some(coast) = self.scroll_coast.as_mut() else {
+            return;
+        };
+        if coast.ticking {
+            return;
+        }
+        coast.ticking = true;
+        self.on_next_frame(|window, cx| {
+            let position = window.mouse_position;
+            let Some(coast) = window.scroll_coast.as_mut() else {
+                return;
+            };
+            coast.ticking = false;
+            if let Some(step) = coast.tick(position) {
+                cx.propagate_event = true;
+                window.dispatch_mouse_event(&step, cx);
+            }
+            if window
+                .scroll_coast
+                .as_ref()
+                .is_some_and(ScrollCoast::has_momentum)
+            {
+                window.schedule_scroll_coast_tick();
+            }
+        });
     }
 
     fn schedule_touch_momentum_tick(&mut self) {
@@ -8132,9 +8605,20 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// How far the corners are smoothed from circular arcs towards a squircle, from 0 to 1.
+    /// See [`crate::Styled::corner_smoothing`].
+    pub corner_smoothing: f32,
 }
 
 impl PaintQuad {
+    /// Sets how far the quad's corners are smoothed towards a squircle, from 0 to 1.
+    pub fn corner_smoothing(self, corner_smoothing: f32) -> Self {
+        PaintQuad {
+            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
+            ..self
+        }
+    }
+
     /// Sets the corner radii of the quad.
     pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
         PaintQuad {
@@ -8168,6 +8652,11 @@ impl PaintQuad {
     }
 }
 
+/// How much further along each edge a fully smoothed corner starts than a round one, as a share
+/// of its radius. The shaders shape a corner over this length so that it meets the round corner of
+/// the same radius at its middle, the way the continuous corners of iOS do.
+pub(crate) const SQUIRCLE_REACH: f32 = 0.528_665;
+
 /// Creates a quad with the given parameters.
 pub fn quad(
     bounds: Bounds<Pixels>,
@@ -8184,6 +8673,7 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
+        corner_smoothing: 0.,
     }
 }
 
@@ -8196,6 +8686,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
+        corner_smoothing: 0.,
     }
 }
 
@@ -8212,6 +8703,7 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+        corner_smoothing: 0.,
     }
 }
 

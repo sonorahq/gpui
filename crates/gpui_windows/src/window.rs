@@ -909,6 +909,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.background_appearance.get()
     }
 
+    fn is_background_blur_supported(&self) -> bool {
+        true
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         true
     }
@@ -1054,6 +1058,18 @@ impl PlatformWindow for WindowsWindow {
             .draw(scene, self.state.background_appearance.get())
             .log_err();
         crate::fast::frame_schedule::schedule_frame(self);
+    }
+
+    fn can_release_idle_gpu_memory(&self) -> bool {
+        true
+    }
+
+    fn release_idle_gpu_memory(&self) {
+        // A nested message pump can run this while a draw holds the renderer. The next idle
+        // stretch frees the targets instead.
+        if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
+            renderer.release_idle_targets();
+        }
     }
 
     fn draw_composed(&self, scene: ComposedScene<'_>) {

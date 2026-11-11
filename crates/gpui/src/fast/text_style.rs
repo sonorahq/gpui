@@ -1,6 +1,6 @@
 //! The window's text style stack, which remembers the styles it resolves.
 
-use crate::{TextAlign, TextStyle, TextStyleRefinement, Window};
+use crate::{TextAlign, TextShadow, TextStyle, TextStyleRefinement, Window};
 use refineable::Refineable;
 use std::{cell::RefCell, rc::Rc};
 
@@ -104,6 +104,19 @@ impl TextStyleStack {
             // As `TextStyle::default()` has it.
             .unwrap_or_default()
     }
+
+    /// The `shadows` of [`Self::resolve`]'s style, found the way [`Self::text_align`] is.
+    pub(crate) fn shadows(&self) -> Vec<TextShadow> {
+        let depth = self.refinements.len();
+        if let Some(style) = &self.resolved.borrow()[depth] {
+            return style.shadows.clone();
+        }
+        self.refinements
+            .iter()
+            .rev()
+            .find_map(|refinement| refinement.shadows.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// The text style in effect, as [`Window::text_style`] returns it, without
@@ -116,6 +129,8 @@ pub(crate) fn text_style(window: &Window) -> Rc<TextStyle> {
 /// What painting a text element reads of the text style in effect.
 pub(crate) struct TextPaintStyle {
     pub(crate) text_align: TextAlign,
+    /// Shadows painted under the text, empty for nearly every element.
+    pub(crate) shadows: Vec<TextShadow>,
 }
 
 /// The part of the text style in effect that painting text reads. Resolving
@@ -125,5 +140,6 @@ pub(crate) struct TextPaintStyle {
 pub(crate) fn text_paint_style(window: &Window) -> TextPaintStyle {
     TextPaintStyle {
         text_align: window.text_style_stack.text_align(),
+        shadows: window.text_style_stack.shadows(),
     }
 }
