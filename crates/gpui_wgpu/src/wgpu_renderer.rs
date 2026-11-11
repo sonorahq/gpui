@@ -5,7 +5,7 @@ use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, BlurPasses, Bounds, DevicePixels, GAUSSIAN_REACH, GpuSpecs,
     KAWASE_LEVELS, Kawase, LayerEffect, Path, Point, PrimitiveBatch, ScaledPixels, Scene, ShaderId,
-    Size, get_gamma_correction_ratios,
+    Size, get_gamma_correction_ratios, point, size,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -315,6 +315,8 @@ impl Scratch {
 /// One of the offscreen targets filters draw through.
 #[derive(Clone, Copy)]
 enum FilterTarget {
+    /// The accumulated background of all open layers before a backdrop samples it.
+    Backdrop,
     /// The frame itself, drawn offscreen so a backdrop can sample what lies under it.
     Frame,
     /// The target a filtered layer is drawn into, by nesting depth.
@@ -331,12 +333,13 @@ impl FilterTarget {
     fn shrink(self) -> u32 {
         match self {
             Self::Level(level) => 1 << level,
-            Self::Frame | Self::Layer(_) | Self::Scratch => 1,
+            Self::Frame | Self::Layer(_) | Self::Scratch | Self::Backdrop => 1,
         }
     }
 
     fn label(self) -> String {
         match self {
+            Self::Backdrop => "backdrop_source".into(),
             Self::Frame => "backdrop_frame".into(),
             Self::Layer(depth) => format!("filter_layer_{depth}"),
             Self::Level(level) => format!("blur_{level}"),
@@ -351,6 +354,7 @@ impl FilterTarget {
 #[derive(Default)]
 struct FilterTargets {
     frame: Option<Scratch>,
+    backdrop: Option<Scratch>,
     layers: [Option<Scratch>; LAYER_DEPTH],
     levels: [Option<Scratch>; KAWASE_LEVELS + 1],
     scratch: Option<Scratch>,
@@ -359,6 +363,7 @@ struct FilterTargets {
 impl FilterTargets {
     fn slot(&mut self, target: FilterTarget) -> &mut Option<Scratch> {
         match target {
+            FilterTarget::Backdrop => &mut self.backdrop,
             FilterTarget::Frame => &mut self.frame,
             FilterTarget::Layer(depth) => &mut self.layers[depth],
             FilterTarget::Level(level) => &mut self.levels[level],
@@ -368,6 +373,7 @@ impl FilterTargets {
 
     fn slots(&mut self) -> impl Iterator<Item = &mut Option<Scratch>> {
         std::iter::once(&mut self.frame)
+            .chain(std::iter::once(&mut self.backdrop))
             .chain(self.layers.iter_mut())
             .chain(self.levels.iter_mut())
             .chain(std::iter::once(&mut self.scratch))
@@ -1419,6 +1425,52 @@ impl WgpuRendererCore {
         pass.set_scissor_rect(0, 0, self.frame_size.0, self.frame_size.1);
     }
 
+    /// Flattens open layers in source coordinates so nested backdrops can sample their ancestors.
+    /// The original targets stay unchanged for their eventual filtered composites.
+    fn backdrop_source(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::TextureView,
+        depth: usize,
+        clip: Option<Bounds<ScaledPixels>>,
+        instance_offset: &mut u64,
+    ) -> Result<wgpu::TextureView> {
+        if depth == 0 {
+            return Ok(frame.clone());
+        }
+        let target = self.filter_view(FilterTarget::Backdrop);
+        let bounds = [0., 0., self.frame_size.0 as f32, self.frame_size.1 as f32];
+        let params = self.write_instance_binding(
+            "backdrop_source_params",
+            instance_offset,
+            &[MaskParams {
+                source_bounds: bounds,
+                fade_bounds: bounds,
+                scale: 1.,
+                ..Default::default()
+            }],
+        )?;
+        let mut sources = vec![frame.clone()];
+        sources.extend((0..depth).map(|level| self.filter_view(FilterTarget::Layer(level))));
+        let clip = clip.unwrap_or_else(|| {
+            Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(bounds[2]), ScaledPixels(bounds[3])),
+            )
+        });
+        let mut pass = Self::resume_pass(
+            encoder,
+            "backdrop_source",
+            &target,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        for source in sources {
+            self.composite_layer(&source, clip, Composite::Plain, &params, &mut pass);
+        }
+        drop(pass);
+        Ok(target)
+    }
+
     /// Blurs a source and returns the target holding the result. A narrow blur comes back at
     /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
     /// stretches it back up. A `spare` source is a layer nothing reads again, so a gaussian
@@ -2449,7 +2501,7 @@ impl WgpuRendererCore {
                         )?;
                     }
                     PrimitiveBatch::Backdrops(range) => {
-                        if !filtered || !stack.is_empty() {
+                        if !filtered {
                             continue;
                         }
                         let backdrops = &scene.backdrops[range.clone()];
@@ -2465,9 +2517,18 @@ impl WgpuRendererCore {
                             .map(|backdrop| backdrop.bounds)
                             .reduce(|union, bounds| union.union(&bounds));
                         drop(pass);
-                        let blurred = self.blur_source(
+                        let source = self.backdrop_source(
                             &mut encoder,
                             &main_view,
+                            stack.len(),
+                            clip.map(|clip| {
+                                clip.dilate(BlurPasses::for_sigma(sigma).source_margin())
+                            }),
+                            &mut instance_offset,
+                        )?;
+                        let blurred = self.blur_source(
+                            &mut encoder,
+                            &source,
                             false,
                             sigma,
                             clip,
@@ -4188,4 +4249,28 @@ mod tests {
             ]
         );
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../gpui/src/backdrop_test_fixture.rs"]
+mod backdrop_fixture;
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn nested_backdrops_sample_ancestor_layers() -> anyhow::Result<()> {
+    use gpui::PlatformHeadlessRenderer as _;
+    let mut renderer = crate::WgpuHeadlessRenderer::new()?;
+    for blur in [3., 12.] {
+        for depth in [0, 1, 2] {
+            for inside in [false, true] {
+                let scene = backdrop_fixture::scene(depth, blur, inside);
+                let image = renderer.render_scene_to_image(
+                    &scene,
+                    gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)),
+                )?;
+                backdrop_fixture::check(&image);
+            }
+        }
+    }
+    Ok(())
 }

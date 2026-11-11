@@ -8,6 +8,7 @@ use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point,
 };
+use collections::FxHashMap;
 use std::{
     fmt::Debug,
     iter::Peekable,
@@ -21,6 +22,16 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
+
+/// Names a run of paint operations, so a later frame can find what an element drew and draw it
+/// again.
+pub type SpanId = u64;
+
+/// Where a named span sits among a scene's paint operations, with the bounds it was given.
+struct PaintSpan {
+    operations: Range<usize>,
+    bounds: Bounds<Pixels>,
+}
 
 /// A boolean stored as a `u32` so that GPU-facing structs contain no
 /// compiler-inserted padding bytes, which would be undefined behavior to
@@ -42,6 +53,8 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    spans: FxHashMap<SpanId, PaintSpan>,
+    span_stack: Vec<(SpanId, usize, Bounds<Pixels>)>,
     pub shadows: Vec<Shadow>,
     pub backdrops: Vec<Backdrop>,
     pub effects: Vec<LayerEffect>,
@@ -62,6 +75,8 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.spans.clear();
+        self.span_stack.clear();
         self.paths.clear();
         self.shadows.clear();
         self.backdrops.clear();
@@ -132,6 +147,77 @@ impl Scene {
             self.effects[index].end = self.primitive_bounds.barrier();
         }
         self.paint_operations.push(PaintOperation::EndFilter);
+    }
+
+    /// Starts a named span. Everything painted until [`Scene::pop_span`] can be found again under
+    /// `id`, in this scene and in the next one that replays it.
+    pub fn push_span(&mut self, id: SpanId, bounds: Bounds<Pixels>) {
+        self.paint_operations
+            .push(PaintOperation::StartSpan(id, bounds));
+        self.span_stack
+            .push((id, self.paint_operations.len(), bounds));
+    }
+
+    pub fn pop_span(&mut self) {
+        if let Some((id, start, bounds)) = self.span_stack.pop() {
+            let operations = start..self.paint_operations.len();
+            self.spans.insert(id, PaintSpan { operations, bounds });
+        }
+        self.paint_operations.push(PaintOperation::EndSpan);
+    }
+
+    /// The bounds the span `id` was given, when this scene holds one.
+    pub fn span(&self, id: SpanId) -> Option<Bounds<Pixels>> {
+        self.spans.get(&id).map(|span| span.bounds)
+    }
+
+    /// Paints what `prev_scene` painted in its span `id` again, under the same name, with the
+    /// alpha of every colour scaled by `fade`. Spans nested in it lose their names. Returns
+    /// whether `prev_scene` held the span.
+    pub fn replay_span(&mut self, id: SpanId, prev_scene: &Scene, fade: f32) -> bool {
+        let Some(span) = prev_scene.spans.get(&id) else {
+            return false;
+        };
+        self.push_span(id, span.bounds);
+        // A span pushed by hand can open a layer or a filter it does not close, or close one
+        // it did not open. The replay keeps count, so it never closes the caller's and never
+        // leaves one of its own open.
+        let (mut layers, mut filters) = (0usize, 0usize);
+        for operation in &prev_scene.paint_operations[span.operations.clone()] {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    self.insert_primitive(primitive.clone().faded(fade))
+                }
+                PaintOperation::StartLayer(bounds) => {
+                    layers += 1;
+                    self.push_layer(*bounds);
+                }
+                PaintOperation::EndLayer if layers > 0 => {
+                    layers -= 1;
+                    self.pop_layer();
+                }
+                PaintOperation::StartFilter(bounds, transform_origin, content_mask, filter) => {
+                    filters += 1;
+                    self.push_filter(*bounds, *transform_origin, *content_mask, *filter);
+                }
+                PaintOperation::EndFilter if filters > 0 => {
+                    filters -= 1;
+                    self.pop_filter();
+                }
+                PaintOperation::EndLayer
+                | PaintOperation::EndFilter
+                | PaintOperation::StartSpan(..)
+                | PaintOperation::EndSpan => {}
+            }
+        }
+        for _ in 0..filters {
+            self.pop_filter();
+        }
+        for _ in 0..layers {
+            self.pop_layer();
+        }
+        self.pop_span();
+        true
     }
 
     /// The draw order of a batch's first primitive.
@@ -251,11 +337,14 @@ impl Scene {
                     self.push_filter(*bounds, *transform_origin, *content_mask, *filter)
                 }
                 PaintOperation::EndFilter => self.pop_filter(),
+                PaintOperation::StartSpan(id, bounds) => self.push_span(*id, *bounds),
+                PaintOperation::EndSpan => self.pop_span(),
             }
         }
     }
 
     pub fn finish(&mut self) {
+        self.span_stack.clear();
         // A layer that never closed would otherwise swallow everything painted after it.
         for index in self.effect_stack.drain(..) {
             log::warn!("scene: a filtered layer was left open");
@@ -355,6 +444,8 @@ pub(crate) enum PaintOperation {
         Filter,
     ),
     EndFilter,
+    StartSpan(SpanId, Bounds<Pixels>),
+    EndSpan,
 }
 
 /// A run of primitives that is drawn offscreen, put through [`Effect`], and composited back.
@@ -494,6 +585,14 @@ pub enum BlurPasses {
 }
 
 impl BlurPasses {
+    /// The source margin needed around a clipped blur, including downsample alignment.
+    pub fn source_margin(self) -> ScaledPixels {
+        ScaledPixels(match self {
+            Self::Gaussian(sigma) => (sigma * GAUSSIAN_REACH).ceil() + 1.,
+            Self::Kawase(kawase) => kawase.reach() + (1u32 << kawase.levels) as f32,
+        })
+    }
+
     /// The blur that spreads a point as far as a gaussian of standard deviation `sigma`, in
     /// scaled pixels.
     pub fn for_sigma(sigma: f32) -> Self {
@@ -829,6 +928,28 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    /// The primitive with the alpha of its colours scaled by `fade`. A surface has no colour
+    /// of its own and comes back as it was.
+    pub fn faded(mut self, fade: f32) -> Self {
+        let fade = fade.clamp(0., 1.);
+        match &mut self {
+            Primitive::Shadow(shadow) => shadow.color = shadow.color.opacity(fade),
+            Primitive::Backdrop(backdrop) => backdrop.opacity *= fade,
+            Primitive::Quad(quad) => {
+                quad.background = quad.background.opacity(fade);
+                quad.border_color = quad.border_color.opacity(fade);
+            }
+            Primitive::Shader(shader) => shader.opacity *= fade,
+            Primitive::Path(path) => path.color = path.color.opacity(fade),
+            Primitive::Underline(underline) => underline.color = underline.color.opacity(fade),
+            Primitive::MonochromeSprite(sprite) => sprite.color = sprite.color.opacity(fade),
+            Primitive::SubpixelSprite(sprite) => sprite.color = sprite.color.opacity(fade),
+            Primitive::PolychromeSprite(sprite) => sprite.opacity *= fade,
+            Primitive::Surface(_) => {}
+        }
+        self
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,

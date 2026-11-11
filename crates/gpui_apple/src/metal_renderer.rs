@@ -1227,7 +1227,7 @@ impl MetalRenderer {
                         command_encoder,
                     ),
                 PrimitiveBatch::Backdrops(range) => {
-                    if !filtered || !stack.is_empty() {
+                    if !filtered {
                         continue;
                     }
                     let backdrops = &scene.backdrops[range.clone()];
@@ -1243,17 +1243,30 @@ impl MetalRenderer {
                         .reduce(|union, bounds| union.union(&bounds));
 
                     command_encoder.end_encoding();
-                    let blurred = self.blur_source(
+                    let source = self.backdrop_source(
                         command_buffer,
                         &main_texture,
+                        stack.len(),
+                        viewport_size,
+                        clip.map(|clip| clip.dilate(BlurPasses::for_sigma(sigma).source_margin())),
+                    );
+                    let blurred = self.blur_source(
+                        command_buffer,
+                        &source,
                         false,
                         sigma,
                         clip,
                         viewport_size,
                     );
+                    let target = match stack.len().checked_sub(1) {
+                        Some(depth) => {
+                            self.filter_texture(FilterTarget::Layer(depth), viewport_size)
+                        }
+                        None => main_texture.clone(),
+                    };
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
-                        &main_texture,
+                        &target,
                         viewport_size,
                         None,
                     );
@@ -1580,6 +1593,64 @@ impl MetalRenderer {
         encoder.set_scissor_rect(within);
         encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
         encoder.end_encoding();
+    }
+
+    /// Flattens open layers in source coordinates without changing their eventual composites.
+    fn backdrop_source(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        frame: &metal::TextureRef,
+        depth: usize,
+        viewport_size: Size<DevicePixels>,
+        clip: Option<Bounds<ScaledPixels>>,
+    ) -> metal::Texture {
+        if depth == 0 {
+            return frame.to_owned();
+        }
+        let target = self.filter_texture(FilterTarget::Backdrop, viewport_size);
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(
+                ScaledPixels(viewport_size.width.0 as f32),
+                ScaledPixels(viewport_size.height.0 as f32),
+            ),
+        );
+        let params = MaskParams {
+            source_bounds: bounds,
+            fade_bounds: bounds,
+            scale: 1.,
+            ..Default::default()
+        };
+        let mut sources = vec![frame.to_owned()];
+        sources.extend(
+            (0..depth).map(|level| self.filter_texture(FilterTarget::Layer(level), viewport_size)),
+        );
+        let encoder = new_command_encoder_for_texture(
+            command_buffer,
+            &target,
+            viewport_size,
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+        );
+        if let Some(within) = clip.and_then(|clip| Self::scissor(clip, viewport_size, 1)) {
+            encoder.set_scissor_rect(within);
+        }
+        encoder.set_render_pipeline_state(&self.composite_pipeline_state);
+        encoder.set_fragment_bytes(
+            FilterInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const _ as *const _,
+        );
+        encoder.set_fragment_bytes(
+            FilterInputIndex::Params as u64,
+            mem::size_of_val(&params) as u64,
+            &params as *const _ as *const _,
+        );
+        for source in sources {
+            encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(&source));
+            encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+        }
+        encoder.end_encoding();
+        target
     }
 
     fn draw_backdrops(
@@ -2299,6 +2370,8 @@ struct Scratch {
 /// One of the offscreen targets filters draw through.
 #[derive(Clone, Copy)]
 enum FilterTarget {
+    /// The accumulated background of all open layers before a backdrop samples it.
+    Backdrop,
     /// The frame itself, drawn offscreen so a backdrop can sample what lies under it.
     Frame,
     /// The target a filtered layer is drawn into, by nesting depth.
@@ -2315,7 +2388,7 @@ impl FilterTarget {
     fn shrink(self) -> u32 {
         match self {
             Self::Level(level) => 1 << level,
-            Self::Frame | Self::Layer(_) | Self::Scratch => 1,
+            Self::Frame | Self::Layer(_) | Self::Scratch | Self::Backdrop => 1,
         }
     }
 }
@@ -2327,6 +2400,7 @@ impl FilterTarget {
 struct FilterTargets {
     size: Size<DevicePixels>,
     frame: Option<Scratch>,
+    backdrop: Option<Scratch>,
     layers: [Option<Scratch>; LAYER_DEPTH],
     levels: [Option<Scratch>; KAWASE_LEVELS + 1],
     scratch: Option<Scratch>,
@@ -2335,6 +2409,7 @@ struct FilterTargets {
 impl FilterTargets {
     fn slot(&mut self, target: FilterTarget) -> &mut Option<Scratch> {
         match target {
+            FilterTarget::Backdrop => &mut self.backdrop,
             FilterTarget::Frame => &mut self.frame,
             FilterTarget::Layer(depth) => &mut self.layers[depth],
             FilterTarget::Level(level) => &mut self.levels[level],
@@ -2344,6 +2419,7 @@ impl FilterTargets {
 
     fn slots(&mut self) -> impl Iterator<Item = &mut Option<Scratch>> {
         std::iter::once(&mut self.frame)
+            .chain(std::iter::once(&mut self.backdrop))
             .chain(self.layers.iter_mut())
             .chain(self.levels.iter_mut())
             .chain(std::iter::once(&mut self.scratch))
@@ -2978,4 +3054,28 @@ mod tests {
             assert_eq!(*alpha, 255);
         }
     }
+}
+
+#[cfg(test)]
+#[path = "../../gpui/src/backdrop_test_fixture.rs"]
+mod backdrop_fixture;
+
+#[cfg(test)]
+#[test]
+fn nested_backdrops_sample_ancestor_layers() -> anyhow::Result<()> {
+    use gpui::PlatformHeadlessRenderer as _;
+    let mut renderer = MetalHeadlessRenderer::new();
+    for blur in [3., 12.] {
+        for depth in [0, 1, 2] {
+            for inside in [false, true] {
+                let scene = backdrop_fixture::scene(depth, blur, inside);
+                let image = renderer.render_scene_to_image(
+                    &scene,
+                    gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)),
+                )?;
+                backdrop_fixture::check(&image);
+            }
+        }
+    }
+    Ok(())
 }

@@ -35,6 +35,11 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// The nodes whose style chose on or off the device pixel grid, `false` for off.
+    pixel_snap: FxHashMap<LayoutId, bool>,
+    /// For each node laid out off the grid, how far its subtree was shifted as one so the
+    /// outermost such node's origin lands on a device pixel.
+    grid_shifts: FxHashMap<LayoutId, Point<f32>>,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -49,6 +54,8 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            pixel_snap: FxHashMap::default(),
+            grid_shifts: FxHashMap::default(),
         }
     }
 
@@ -57,6 +64,8 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.pixel_snap.clear();
+        self.grid_shifts.clear();
     }
 
     pub fn request_layout(
@@ -66,9 +75,10 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
-        let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let snap = style.pixel_snap;
+        let taffy_style = style.to_taffy(rem_size, Grid::new(scale_factor, snap));
 
-        if children.is_empty() {
+        let id = if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
                 .expect(EXPECT_MESSAGE)
@@ -79,6 +89,15 @@ impl TaffyLayoutEngine {
                 .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE)
                 .into()
+        };
+        self.note_pixel_snap(id, snap);
+        id
+    }
+
+    /// Remembers whether `id` chose on or off the device pixel grid, for `layout_bounds`.
+    fn note_pixel_snap(&mut self, id: LayoutId, snap: Option<bool>) {
+        if let Some(snap) = snap {
+            self.pixel_snap.insert(id, snap);
         }
     }
 
@@ -95,15 +114,19 @@ impl TaffyLayoutEngine {
         ) -> Size<Pixels>
         + 'static,
     ) -> LayoutId {
-        let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let snap = style.pixel_snap;
+        let taffy_style = style.to_taffy(rem_size, Grid::new(scale_factor, snap));
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
 
-        self.taffy
+        let id = self
+            .taffy
             .new_leaf_with_context(taffy_style, NodeContext { measure })
             .expect(EXPECT_MESSAGE)
-            .into()
+            .into();
+        self.note_pixel_snap(id, snap);
+        id
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -208,6 +231,7 @@ impl TaffyLayoutEngine {
             while let Some(id) = stack.pop() {
                 self.absolute_layout_bounds.remove(&id);
                 self.absolute_outer_origins.remove(&id);
+                self.grid_shifts.remove(&id);
                 stack.extend(
                     self.taffy
                         .children(id.into())
@@ -334,6 +358,12 @@ impl TaffyLayoutEngine {
     // are not touched by post-layout rounding; they keep their pre-layout
     // rounded value so that they remain stable under translation.
     //
+    // A subtree may opt out (`Styled::pixel_snap(false)`), for layout that
+    // animates. Its root keeps its own authored lengths unrounded, and every
+    // node inside keeps its unrounded edges, shifted as one by however far
+    // the root's origin had to move to land on a device pixel. Whole-pixel
+    // metrics inside such a subtree therefore still land on the grid.
+    //
     // This gives both closure and translation stability in the case that
     // all local metrics are integer device-pixel lengths. Pre-layout
     // rounding covers that in most cases. The exception is metrics
@@ -368,12 +398,27 @@ impl TaffyLayoutEngine {
             .insert(id, absolute_outer_origin);
 
         let absolute_far = absolute_outer_origin + Point::from(Size::from(layout_size));
-        let snapped_bounds = Bounds::from_corners(
-            absolute_outer_origin.map(round_half_toward_zero),
-            absolute_far.map(round_half_toward_zero),
-        );
+        let parent_shift =
+            parent.and_then(|parent_id| self.grid_shifts.get(&LayoutId::from(parent_id)).copied());
+        let on_grid = match self.pixel_snap.get(&id) {
+            Some(snap) => *snap,
+            None => parent_shift.is_none(),
+        };
+        let device_bounds = match on_grid {
+            true => Bounds::from_corners(
+                absolute_outer_origin.map(round_half_toward_zero),
+                absolute_far.map(round_half_toward_zero),
+            ),
+            false => {
+                let shift = parent_shift.unwrap_or_else(|| {
+                    absolute_outer_origin.map(round_half_toward_zero) - absolute_outer_origin
+                });
+                self.grid_shifts.insert(id, shift);
+                Bounds::from_corners(absolute_outer_origin + shift, absolute_far + shift)
+            }
+        };
 
-        let bounds = (snapped_bounds / scale_factor).map(Pixels);
+        let bounds = (device_bounds / scale_factor).map(Pixels);
         self.absolute_layout_bounds.insert(id, bounds);
         bounds
     }
@@ -432,12 +477,37 @@ fn border_widths_to_taffy(
     }
 }
 
+/// How authored lengths turn into device pixels: rounded onto the grid, or scaled with their
+/// fractions kept for a node that chose to leave it.
+#[derive(Clone, Copy)]
+struct Grid {
+    scale_factor: f32,
+    snap: bool,
+}
+
+impl Grid {
+    fn new(scale_factor: f32, snap: Option<bool>) -> Self {
+        Self {
+            scale_factor,
+            snap: snap != Some(false),
+        }
+    }
+
+    /// A logical length in device pixels.
+    fn place(self, logical: f32) -> f32 {
+        match self.snap {
+            true => round_to_device_pixel(logical, self.scale_factor),
+            false => logical * self.scale_factor,
+        }
+    }
+}
+
 trait ToTaffy<Output> {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> Output;
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> Output;
 }
 
 impl ToTaffy<taffy::style::Style> for Style {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::Style {
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::style::Style {
         use taffy::style_helpers::{fr, length, minmax, repeat};
 
         fn to_grid_line(
@@ -483,24 +553,24 @@ impl ToTaffy<taffy::style::Style> for Style {
         taffy::style::Style {
             display: self.display.into(),
             overflow: self.overflow.into(),
-            scrollbar_width: self.scrollbar_width.to_taffy(rem_size, scale_factor),
+            scrollbar_width: self.scrollbar_width.to_taffy(rem_size, grid),
             position: self.position.into(),
-            inset: self.inset.to_taffy(rem_size, scale_factor),
-            size: self.size.to_taffy(rem_size, scale_factor),
-            min_size: self.min_size.to_taffy(rem_size, scale_factor),
-            max_size: self.max_size.to_taffy(rem_size, scale_factor),
+            inset: self.inset.to_taffy(rem_size, grid),
+            size: self.size.to_taffy(rem_size, grid),
+            min_size: self.min_size.to_taffy(rem_size, grid),
+            max_size: self.max_size.to_taffy(rem_size, grid),
             aspect_ratio: self.aspect_ratio,
-            margin: self.margin.to_taffy(rem_size, scale_factor),
-            padding: self.padding.to_taffy(rem_size, scale_factor),
-            border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor),
+            margin: self.margin.to_taffy(rem_size, grid),
+            padding: self.padding.to_taffy(rem_size, grid),
+            border: border_widths_to_taffy(&self.border_widths, rem_size, grid.scale_factor),
             align_items: self.align_items.map(|x| x.into()),
             align_self: self.align_self.map(|x| x.into()),
             align_content: self.align_content.map(|x| x.into()),
             justify_content: self.justify_content.map(|x| x.into()),
-            gap: self.gap.to_taffy(rem_size, scale_factor),
+            gap: self.gap.to_taffy(rem_size, grid),
             flex_direction: self.flex_direction.into(),
             flex_wrap: self.flex_wrap.into(),
-            flex_basis: self.flex_basis.to_taffy(rem_size, scale_factor),
+            flex_basis: self.flex_basis.to_taffy(rem_size, grid),
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
             grid_template_rows: to_grid_repeat(&self.grid_rows),
@@ -521,37 +591,33 @@ impl ToTaffy<taffy::style::Style> for Style {
 }
 
 impl ToTaffy<f32> for AbsoluteLength {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> f32 {
-        round_to_device_pixel(self.to_pixels(rem_size).0, scale_factor)
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> f32 {
+        grid.place(self.to_pixels(rem_size).0)
     }
 }
 
 impl ToTaffy<taffy::style::LengthPercentageAuto> for Length {
-    fn to_taffy(
-        &self,
-        rem_size: Pixels,
-        scale_factor: f32,
-    ) -> taffy::prelude::LengthPercentageAuto {
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::prelude::LengthPercentageAuto {
         match self {
-            Length::Definite(length) => length.to_taffy(rem_size, scale_factor),
+            Length::Definite(length) => length.to_taffy(rem_size, grid),
             Length::Auto => taffy::prelude::LengthPercentageAuto::auto(),
         }
     }
 }
 
 impl ToTaffy<taffy::style::Dimension> for Length {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::prelude::Dimension {
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::prelude::Dimension {
         match self {
-            Length::Definite(length) => length.to_taffy(rem_size, scale_factor),
+            Length::Definite(length) => length.to_taffy(rem_size, grid),
             Length::Auto => taffy::prelude::Dimension::auto(),
         }
     }
 }
 
 impl ToTaffy<taffy::style::LengthPercentage> for DefiniteLength {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::LengthPercentage {
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::style::LengthPercentage {
         match self {
-            DefiniteLength::Absolute(length) => length.to_taffy(rem_size, scale_factor),
+            DefiniteLength::Absolute(length) => length.to_taffy(rem_size, grid),
             DefiniteLength::Fraction(fraction) => {
                 taffy::style::LengthPercentage::percent(*fraction)
             }
@@ -560,9 +626,9 @@ impl ToTaffy<taffy::style::LengthPercentage> for DefiniteLength {
 }
 
 impl ToTaffy<taffy::style::LengthPercentageAuto> for DefiniteLength {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::LengthPercentageAuto {
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::style::LengthPercentageAuto {
         match self {
-            DefiniteLength::Absolute(length) => length.to_taffy(rem_size, scale_factor),
+            DefiniteLength::Absolute(length) => length.to_taffy(rem_size, grid),
             DefiniteLength::Fraction(fraction) => {
                 taffy::style::LengthPercentageAuto::percent(*fraction)
             }
@@ -571,29 +637,29 @@ impl ToTaffy<taffy::style::LengthPercentageAuto> for DefiniteLength {
 }
 
 impl ToTaffy<taffy::style::Dimension> for DefiniteLength {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::Dimension {
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::style::Dimension {
         match self {
-            DefiniteLength::Absolute(length) => length.to_taffy(rem_size, scale_factor),
+            DefiniteLength::Absolute(length) => length.to_taffy(rem_size, grid),
             DefiniteLength::Fraction(fraction) => taffy::style::Dimension::percent(*fraction),
         }
     }
 }
 
 impl ToTaffy<taffy::style::LengthPercentage> for AbsoluteLength {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::LengthPercentage {
-        taffy::style::LengthPercentage::length(self.to_taffy(rem_size, scale_factor))
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::style::LengthPercentage {
+        taffy::style::LengthPercentage::length(self.to_taffy(rem_size, grid))
     }
 }
 
 impl ToTaffy<taffy::style::LengthPercentageAuto> for AbsoluteLength {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::LengthPercentageAuto {
-        taffy::style::LengthPercentageAuto::length(self.to_taffy(rem_size, scale_factor))
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::style::LengthPercentageAuto {
+        taffy::style::LengthPercentageAuto::length(self.to_taffy(rem_size, grid))
     }
 }
 
 impl ToTaffy<taffy::style::Dimension> for AbsoluteLength {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::Dimension {
-        taffy::style::Dimension::length(self.to_taffy(rem_size, scale_factor))
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> taffy::style::Dimension {
+        taffy::style::Dimension::length(self.to_taffy(rem_size, grid))
     }
 }
 
@@ -626,10 +692,10 @@ impl<T, U> ToTaffy<TaffySize<U>> for Size<T>
 where
     T: ToTaffy<U> + Clone + Debug + Default + PartialEq,
 {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> TaffySize<U> {
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> TaffySize<U> {
         TaffySize {
-            width: self.width.to_taffy(rem_size, scale_factor),
-            height: self.height.to_taffy(rem_size, scale_factor),
+            width: self.width.to_taffy(rem_size, grid),
+            height: self.height.to_taffy(rem_size, grid),
         }
     }
 }
@@ -638,12 +704,12 @@ impl<T, U> ToTaffy<TaffyRect<U>> for Edges<T>
 where
     T: ToTaffy<U> + Clone + Debug + Default + PartialEq,
 {
-    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> TaffyRect<U> {
+    fn to_taffy(&self, rem_size: Pixels, grid: Grid) -> TaffyRect<U> {
         TaffyRect {
-            top: self.top.to_taffy(rem_size, scale_factor),
-            right: self.right.to_taffy(rem_size, scale_factor),
-            bottom: self.bottom.to_taffy(rem_size, scale_factor),
-            left: self.left.to_taffy(rem_size, scale_factor),
+            top: self.top.to_taffy(rem_size, grid),
+            right: self.right.to_taffy(rem_size, grid),
+            bottom: self.bottom.to_taffy(rem_size, grid),
+            left: self.left.to_taffy(rem_size, grid),
         }
     }
 }

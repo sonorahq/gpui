@@ -17,7 +17,7 @@ use crate::{
     PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shader,
-    ShaderInstance, ShaderQuad, Shadow, SharedString, Size, StrikethroughStyle, Style,
+    ShaderInstance, ShaderQuad, Shadow, SharedString, Size, SpanId, StrikethroughStyle, Style,
     SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
     TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
@@ -1260,7 +1260,8 @@ pub struct Window {
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
-    pub(crate) snap_offsets: bool,
+    /// Whether element offsets and painted primitives land on the device pixel grid.
+    pub(crate) pixel_snapping: bool,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -2199,7 +2200,7 @@ impl Window {
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
-            snap_offsets: true,
+            pixel_snapping: true,
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -3354,6 +3355,9 @@ impl Window {
     #[inline]
     fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
+        if !self.pixel_snapping {
+            return bounds.scale(scale_factor);
+        }
         let left = round_to_device_pixel(bounds.left().0, scale_factor);
         let top = round_to_device_pixel(bounds.top().0, scale_factor);
         let right = round_to_device_pixel(bounds.right().0, scale_factor).max(left);
@@ -4405,18 +4409,22 @@ impl Window {
         self.with_absolute_element_offset(abs_offset, f)
     }
 
-    /// Lays a subtree out at exactly the offset it was given, instead of rounding that offset to
-    /// the device pixel grid. An element that animates its own position wants this: rounding turns
-    /// a smooth path into whole-pixel steps, so a decelerating one either sits on its last pixel
-    /// for several frames or stops while it is still visibly moving. Text is placed at subpixel
-    /// positions either way; only a quad edge softens. This method should only be called during the
-    /// prepaint phase of element drawing.
+    /// Lays a subtree out at exactly the offset it was given, and paints its quads, images and
+    /// icons at exactly the bounds they were given, instead of rounding either to the device
+    /// pixel grid. Shadows still grow to cover whole device pixels, so a shadow's extent steps
+    /// a pixel at a time under a quad that glides. An element that animates its own position
+    /// wants this: rounding turns a smooth path into whole-pixel steps, so a decelerating one
+    /// either sits on its last pixel for several frames or stops while it is still visibly
+    /// moving. Text is placed at subpixel positions either way; only an edge that falls between
+    /// pixels softens. Elements styled with [`Styled::pixel_snap`](crate::Styled::pixel_snap)
+    /// set this for themselves. This method should only be called during the prepaint or paint
+    /// phase of element drawing.
     pub fn with_pixel_snapping<R>(&mut self, snap: bool, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.invalidator.debug_assert_prepaint();
+        self.invalidator.debug_assert_paint_or_prepaint();
 
-        let was = std::mem::replace(&mut self.snap_offsets, snap);
+        let was = std::mem::replace(&mut self.pixel_snapping, snap);
         let result = f(self);
-        self.snap_offsets = was;
+        self.pixel_snapping = was;
         result
     }
 
@@ -4981,6 +4989,48 @@ impl Window {
         result
     }
 
+    /// Names what `f` paints, so that [`Window::replay_span`] can paint it again on a later
+    /// frame once the element that drew it is gone. `bounds` comes back from
+    /// [`Window::rendered_span`]. A span survives a cached view replaying its paint.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_paint_span<R>(
+        &mut self,
+        id: SpanId,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame.scene.push_span(id, bounds);
+        let result = f(self);
+        self.next_frame.scene.pop_span();
+        result
+    }
+
+    /// Whether the frame being painted already holds a span named `id`.
+    pub fn span_painted(&self, id: SpanId) -> bool {
+        self.next_frame.scene.span(id).is_some()
+    }
+
+    /// The bounds of the span named `id` in the last frame drawn, when it held one.
+    pub fn rendered_span(&self, id: SpanId) -> Option<Bounds<Pixels>> {
+        self.rendered_frame.scene.span(id)
+    }
+
+    /// Paints what the last frame painted in its span `id` again, under the same name, with
+    /// the alpha of every colour scaled by `fade`. Only the pixels come back: nothing in the
+    /// span answers the pointer or the keyboard. Returns whether the last frame held the span.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn replay_span(&mut self, id: SpanId, fade: f32) -> bool {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame
+            .scene
+            .replay_span(id, &self.rendered_frame.scene, fade)
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Blur whatever has already been painted behind the given bounds.
     ///
@@ -5403,7 +5453,10 @@ impl Window {
                 .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
         };
         let final_bounds = svg_bounds
-            .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
+            .map_origin(|value| match self.pixel_snapping {
+                true => ScaledPixels(round_half_toward_zero(value.0)),
+                false => value,
+            })
             .map_size(|size| size.ceil());
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -5662,7 +5715,7 @@ impl Window {
             .layout_bounds(layout_id, scale_factor)
             .map(Into::into);
         let offset = self.element_offset();
-        bounds.origin += match self.snap_offsets {
+        bounds.origin += match self.pixel_snapping {
             true => self.pixel_snap_point(offset),
             false => offset,
         };
