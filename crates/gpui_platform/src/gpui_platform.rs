@@ -3,9 +3,6 @@
 
 pub use gpui::Platform;
 
-#[cfg(target_family = "wasm")]
-pub use gpui_web::WebBackendPreference;
-
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.
@@ -34,34 +31,9 @@ pub fn linux(allowed_modes: gpui::WindowingModes) -> gpui::Application {
     gpui::Application::with_platform(gpui_linux::linux_platform(allowed_modes))
 }
 
-#[cfg(target_family = "wasm")]
-pub fn application_with_web_backend(backend_preference: WebBackendPreference) -> gpui::Application {
-    let platform = Rc::new(gpui_web::WebPlatform::new_with_backend(
-        true,
-        backend_preference,
-    ));
-    gpui::Application::with_platform(platform)
-}
-
-/// Unlike `application`, this function returns a single-threaded web application.
-#[cfg(target_family = "wasm")]
-pub fn single_threaded_web() -> gpui::Application {
-    let platform = Rc::new(gpui_web::WebPlatform::new(false));
-    gpui::Application::with_platform(platform)
-}
-
-/// Initializes panic hooks and logging for the web platform.
-/// Call this before running the application in a wasm_bindgen entrypoint.
-#[cfg(target_family = "wasm")]
-pub fn web_init() {
-    console_error_panic_hook::set_once();
-    gpui_web::init_logging();
-}
-
 /// Returns the default [`Platform`] for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     cfg_select! {
-        target_os = "ios" => gpui_ios::current_platform(headless),
         target_os = "macos" => Rc::new(gpui_macos::MacPlatform::new(headless)),
         target_os = "windows" => Rc::new(
             gpui_windows::WindowsPlatform::new(headless)
@@ -71,13 +43,6 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
             any(target_os = "linux", target_os = "freebsd"),
             not(target_env = "ohos")
         ) => gpui_linux::current_platform(headless),
-        target_family = "wasm" => {
-            let _ = headless;
-            Rc::new(gpui_web::WebPlatform::new_with_backend(
-                true,
-                gpui_web::WebBackendPreference::Auto,
-            ))
-        },
     }
 }
 
