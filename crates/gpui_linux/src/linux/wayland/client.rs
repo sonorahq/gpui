@@ -256,7 +256,9 @@ pub struct Globals {
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
-    pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
+    /// KDE's own blur manager. KWin adds and removes this global as its blur effect is switched
+    /// on and off, so the registry handler swaps it while the app runs.
+    pub blur_manager: Rc<RefCell<Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>>>,
     pub background_effect_manager:
         Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
     /// Whether `background_effect_manager` last reported that it can blur. The capability
@@ -311,7 +313,7 @@ impl Globals {
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
-            blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            blur_manager: Rc::new(RefCell::new(globals.bind(&qh, 1..=1, ()).ok())),
             background_effect_manager: globals.bind(&qh, 1..=1, ()).ok(),
             background_blur: Rc::default(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
@@ -389,6 +391,8 @@ pub(crate) struct WaylandClientState {
     wl_outputs: HashMap<ObjectId, wl_output::WlOutput>,
     // Registry global names of the outputs, for `global_remove`.
     output_globals: HashMap<u32, ObjectId>,
+    // Registry global name of KDE's blur manager, for `global_remove`.
+    blur_manager_global: Option<u32>,
     keyboard_layout: LinuxKeyboardLayout,
     keymap_state: Option<xkb::State>,
     compose_state: Option<xkb::compose::State>,
@@ -606,6 +610,21 @@ impl WaylandClientStatePtr {
                 .callbacks
                 .displays_changed
                 .get_or_insert(callback);
+        }
+    }
+
+    /// Reapplies blur on every window and tells the app, after the compositor gained or lost a
+    /// way to blur. The client state must not be borrowed.
+    fn background_blur_changed(&self) {
+        let client = self.get_client();
+        let windows = client
+            .borrow()
+            .windows
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for window in windows {
+            window.background_blur_changed();
         }
     }
 
@@ -1013,6 +1032,7 @@ impl WaylandConnection {
         let mut wl_outputs: HashMap<ObjectId, wl_output::WlOutput> = HashMap::default();
         #[allow(clippy::mutable_key_type)]
         let mut output_globals: HashMap<u32, ObjectId> = HashMap::default();
+        let mut blur_manager_global = None;
         globals.contents().with_list(|list| -> anyhow::Result<()> {
             for global in list {
                 match &global.interface[..] {
@@ -1035,6 +1055,7 @@ impl WaylandConnection {
                         output_globals.insert(global.name, output.id());
                         wl_outputs.insert(output.id(), output);
                     }
+                    "org_kde_kwin_blur_manager" => blur_manager_global = Some(global.name),
                     _ => {}
                 }
             }
@@ -1091,6 +1112,7 @@ impl WaylandConnection {
             outputs: HashMap::default(),
             in_progress_outputs,
             output_globals,
+            blur_manager_global,
             wl_outputs,
             windows: HashMap::default(),
             common,
@@ -1647,9 +1669,23 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     state.output_globals.insert(name, output.id());
                     state.wl_outputs.insert(output.id(), output);
                 }
+                "org_kde_kwin_blur_manager" => {
+                    let manager = registry.bind(name, 1, qh, ());
+                    state.globals.blur_manager.replace(Some(manager));
+                    state.blur_manager_global = Some(name);
+                    drop(state);
+                    this.background_blur_changed();
+                }
                 _ => {}
             },
             wl_registry::Event::GlobalRemove { name } => {
+                if state.blur_manager_global == Some(name) {
+                    state.blur_manager_global = None;
+                    state.globals.blur_manager.take();
+                    drop(state);
+                    this.background_blur_changed();
+                    return;
+                }
                 let Some(id) = state.output_globals.remove(&name) else {
                     return;
                 };
@@ -1704,20 +1740,17 @@ impl Dispatch<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, ()
         let ext_background_effect_manager_v1::Event::Capabilities { flags } = event else {
             return;
         };
-        let blur = matches!(
-            flags,
-            WEnum::Value(flags) if flags.contains(ext_background_effect_manager_v1::Capability::Blur)
-        );
-        let client = this.get_client();
-        let windows = {
+        // A capability this binding does not know arrives as `WEnum::Unknown`, so the blur bit is
+        // read from the raw value.
+        let blur = ext_background_effect_manager_v1::Capability::from_bits_retain(flags.into())
+            .contains(ext_background_effect_manager_v1::Capability::Blur);
+        let changed = {
+            let client = this.get_client();
             let state = client.borrow();
-            if state.globals.background_blur.replace(blur) == blur {
-                return;
-            }
-            state.windows.values().cloned().collect::<Vec<_>>()
+            state.globals.background_blur.replace(blur) != blur
         };
-        for window in windows {
-            window.background_blur_changed();
+        if changed {
+            this.background_blur_changed();
         }
     }
 }

@@ -2017,7 +2017,7 @@ impl PlatformWindow for WaylandWindow {
 
     fn is_background_blur_supported(&self) -> bool {
         let state = self.borrow();
-        state.globals.background_blur.get() || state.globals.blur_manager.is_some()
+        state.globals.background_blur.get() || state.globals.blur_manager.borrow().is_some()
     }
 
     fn set_window_corner_radius(&self, radius: Pixels) {
@@ -2474,7 +2474,7 @@ fn update_blur(state: &mut WaylandWindowState) {
 
     if let Some(manager) = effect_manager {
         if let Some(blur) = state.blur.take() {
-            if let Some(blur_manager) = &state.globals.blur_manager {
+            if let Some(blur_manager) = state.globals.blur_manager.borrow().as_ref() {
                 blur_manager.unset(&state.surface);
             }
             blur.release();
@@ -2493,7 +2493,10 @@ fn update_blur(state: &mut WaylandWindowState) {
     if let Some(effect) = &state.background_effect {
         effect.set_blur_region(None);
     }
-    let Some(blur_manager) = state.globals.blur_manager.clone() else {
+    let Some(blur_manager) = state.globals.blur_manager.borrow().clone() else {
+        if let Some(blur) = state.blur.take() {
+            blur.release();
+        }
         return;
     };
     match blurred {
