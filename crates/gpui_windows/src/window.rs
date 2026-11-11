@@ -903,6 +903,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.background_appearance.get()
     }
 
+    fn is_background_blur_supported(&self) -> bool {
+        true
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         true
     }
