@@ -1427,13 +1427,16 @@ impl WgpuRendererCore {
         Some((texture, view))
     }
 
+    /// Begins a pass into `view` with the rounded clip group every pipeline expects already bound
+    /// to nothing.
     fn resume_pass<'a>(
+        &self,
         encoder: &'a mut wgpu::CommandEncoder,
         label: &str,
         view: &wgpu::TextureView,
         load: wgpu::LoadOp<wgpu::Color>,
     ) -> wgpu::RenderPass<'a> {
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
@@ -1446,7 +1449,9 @@ impl WgpuRendererCore {
             })],
             depth_stencil_attachment: None,
             ..Default::default()
-        })
+        });
+        crate::fast::rounded_clip::bind_unmasked(&mut pass, self.resources());
+        pass
     }
 
     /// A bounds rectangle as a scissor for a target shrunk by the given factor.
@@ -1545,7 +1550,7 @@ impl WgpuRendererCore {
                 size(ScaledPixels(bounds[2]), ScaledPixels(bounds[3])),
             )
         });
-        let mut pass = Self::resume_pass(
+        let mut pass = self.resume_pass(
             encoder,
             "backdrop_source",
             &target,
@@ -1744,6 +1749,7 @@ impl WgpuRendererCore {
             ..Default::default()
         });
 
+        crate::fast::rounded_clip::bind_unmasked(&mut pass, self.resources());
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
@@ -2414,6 +2420,7 @@ impl WgpuRendererCore {
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
+            crate::fast::rounded_clip::bind_unmasked(&mut pass, self.resources());
 
             // Where the pass in hand is drawing: the frame, or the layer being filled when one
             // is open. Anything that has to break the pass and resume it has to resume it here,
@@ -2469,7 +2476,7 @@ impl WgpuRendererCore {
                         &mut instance_offset,
                     )?;
                     target = onto;
-                    pass = Self::resume_pass(
+                    pass = self.resume_pass(
                         &mut encoder,
                         "layer_composite_pass",
                         &target,
@@ -2494,7 +2501,7 @@ impl WgpuRendererCore {
 
                     drop(pass);
                     target = self.filter_view(FilterTarget::Layer(depth));
-                    pass = Self::resume_pass(&mut encoder, "layer_pass", &target, load);
+                    pass = self.resume_pass(&mut encoder, "layer_pass", &target, load);
                     stack.push(*index);
                     spans.push(layer.destination_clip());
                 }
@@ -2535,7 +2542,7 @@ impl WgpuRendererCore {
                             &mut instance_offset,
                         )?;
 
-                        pass = Self::resume_pass(
+                        pass = self.resume_pass(
                             &mut encoder,
                             "main_pass_continued",
                             &target,
@@ -2624,7 +2631,7 @@ impl WgpuRendererCore {
                             clip,
                             &mut instance_offset,
                         )?;
-                        pass = Self::resume_pass(
+                        pass = self.resume_pass(
                             &mut encoder,
                             "main_pass_continued",
                             &target,
@@ -2658,7 +2665,7 @@ impl WgpuRendererCore {
                     &mut instance_offset,
                 )?;
                 target = onto;
-                pass = Self::resume_pass(
+                pass = self.resume_pass(
                     &mut encoder,
                     "layer_composite_pass",
                     &target,
