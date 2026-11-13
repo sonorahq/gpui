@@ -770,6 +770,8 @@ mod tests {
                     fallbacks: None,
                     weight: FontWeight::default(),
                     style: FontStyle::Normal,
+                    letter_spacing: Default::default(),
+                    scale: Default::default(),
                 },
                 ..Default::default()
             })

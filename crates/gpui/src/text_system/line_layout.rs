@@ -1,4 +1,7 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{
+    FontId, FontScale, GlyphId, LetterSpacing, Pixels, PlatformTextSystem, Point, SharedString,
+    Size, point, px,
+};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -38,6 +41,8 @@ pub struct ShapedRun {
     pub font_id: FontId,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
+    /// The size the run is drawn at, when it is not the line's
+    pub font_size: Option<Pixels>,
 }
 
 /// A single glyph, ready to paint.
@@ -266,6 +271,7 @@ impl LineLayout {
                 left_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: run.glyphs[..split_pos].to_vec(),
+                    font_size: run.font_size,
                 });
             }
 
@@ -282,6 +288,7 @@ impl LineLayout {
                 right_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: right_glyphs,
+                    font_size: run.font_size,
                 });
             }
         }
@@ -312,6 +319,7 @@ impl LineLayout {
         text: &str,
         wrap_width: Pixels,
         max_lines: Option<usize>,
+        gaps: &[(usize, Pixels)],
     ) -> SmallVec<[WrapBoundary; 1]> {
         let mut boundaries = SmallVec::new();
         let mut first_non_whitespace_ix = None;
@@ -328,8 +336,13 @@ impl LineLayout {
                     .iter()
                     .enumerate()
                     .flat_map(|(run_ix, run)| {
+                        // A gap goes with the glyph after it: to the next row's start when the
+                        // line wraps there, not to the end of the row before.
                         run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                            (WrapBoundary { run_ix, glyph_ix }, glyph.position.x)
+                            (
+                                WrapBoundary { run_ix, glyph_ix },
+                                glyph.position.x - super::line::gap_at(gaps, glyph.index),
+                            )
                         })
                     })
                     .collect::<Vec<_>>(),
@@ -426,6 +439,10 @@ pub struct WrappedLineLayout {
 
     /// The width of the line, if it was wrapped
     pub wrap_width: Option<Pixels>,
+
+    /// The space opened before each of these byte indices, which a row that wraps at one keeps
+    /// at its start.
+    pub gaps: SmallVec<[(usize, Pixels); 1]>,
 }
 
 /// A boundary at which a line was wrapped
@@ -526,7 +543,7 @@ impl WrappedLineLayout {
             let run = &self.unwrapped_layout.runs[line_start_boundary.run_ix];
             let glyph = &run.glyphs[line_start_boundary.glyph_ix];
             wrapped_line_start_index = glyph.index;
-            wrapped_line_start_x = glyph.position.x;
+            wrapped_line_start_x = glyph.position.x - super::line::gap_at(&self.gaps, glyph.index);
         } else {
             wrapped_line_start_index = 0;
             wrapped_line_start_x = Pixels::ZERO;
@@ -567,6 +584,19 @@ impl WrappedLineLayout {
         }
     }
 
+    /// Where the space opened before `index` is drawn: at the start of the row when the line
+    /// wraps there, else just before the character at `index`.
+    pub fn gap_origin(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
+        let wraps_here = self.wrap_boundaries.iter().position(|boundary| {
+            self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index == index
+        });
+        if let Some(row) = wraps_here {
+            return Some(point(Pixels::ZERO, (row + 1) as f32 * line_height));
+        }
+        let at = self.position_for_index(index, line_height)?;
+        Some(point(at.x - super::line::gap_at(&self.gaps, index), at.y))
+    }
+
     /// Returns the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
         let mut line_start_ix = 0;
@@ -588,7 +618,13 @@ impl WrappedLineLayout {
                 line_start_ix = line_end_ix;
                 continue;
             } else {
-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
+                let line_start_x = match ix {
+                    0 => Pixels::ZERO,
+                    _ => {
+                        self.unwrapped_layout.x_for_index(line_start_ix)
+                            - super::line::gap_at(&self.gaps, line_start_ix)
+                    }
+                };
                 let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
                 return Some(point(x, line_y));
             }
@@ -780,8 +816,21 @@ impl LineLayoutCache {
             drop(current_frame);
             let text = SharedString::from(text);
             let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let mut start = 0;
+            let mut gaps = SmallVec::new();
+            for run in runs {
+                if run.leading.0 != 0. {
+                    gaps.push((start, font_size * run.leading.0));
+                }
+                start += run.len;
+            }
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
+                unwrapped_layout.compute_wrap_boundaries(
+                    text.as_ref(),
+                    wrap_width,
+                    max_lines,
+                    &gaps,
+                )
             } else {
                 SmallVec::new()
             };
@@ -789,6 +838,7 @@ impl LineLayoutCache {
                 unwrapped_layout,
                 wrap_boundaries,
                 wrap_width,
+                gaps,
             });
             let key = Arc::new(CacheKey {
                 text,
@@ -843,6 +893,9 @@ impl LineLayoutCache {
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            apply_font_scale(&mut layout, runs);
+            apply_letter_spacing(&mut layout, runs);
+            apply_leading(&mut layout, runs);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -994,6 +1047,9 @@ impl LineLayoutCache {
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
+        apply_font_scale(&mut layout, runs);
+        apply_letter_spacing(&mut layout, runs);
+        apply_leading(&mut layout, runs);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -1070,6 +1126,136 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
+    pub letter_spacing: LetterSpacing,
+    pub scale: FontScale,
+    /// Space opened before the run's first character, in ems of the line's font size, where
+    /// an element draws something of its own inside the text.
+    pub leading: LetterSpacing,
+}
+
+/// Draws each run at its share of the line's font size. Its glyphs grow or
+/// shrink from where the run starts, and the glyphs after it move by the width
+/// it gained or lost, so every text system gives the same result.
+fn apply_font_scale(layout: &mut LineLayout, runs: &[FontRun]) {
+    if runs.iter().all(|run| run.scale == FontScale::default()) {
+        return;
+    }
+    let mut ends = Vec::with_capacity(runs.len());
+    let mut end = 0;
+    for run in runs {
+        end += run.len;
+        ends.push((end, run.scale.0));
+    }
+    let scale_at = |index: usize| {
+        ends.iter()
+            .find(|(end, _)| index < *end)
+            .map_or(1., |(_, scale)| *scale)
+    };
+    let font_size = layout.font_size;
+    let mut split = Vec::with_capacity(layout.runs.len());
+    for run in layout.runs.drain(..) {
+        for glyph in run.glyphs {
+            let scale = scale_at(glyph.index);
+            let size = (scale != 1.).then(|| font_size * scale);
+            match split.last_mut() {
+                Some(ShapedRun {
+                    font_id,
+                    glyphs,
+                    font_size,
+                }) if *font_id == run.font_id && *font_size == size => glyphs.push(glyph),
+                _ => split.push(ShapedRun {
+                    font_id: run.font_id,
+                    glyphs: vec![glyph],
+                    font_size: size,
+                }),
+            }
+        }
+    }
+    layout.runs = split;
+    let mut glyphs: Vec<(f32, &mut ShapedGlyph)> = layout
+        .runs
+        .iter_mut()
+        .flat_map(|run| {
+            let scale = run.font_size.map_or(1., |size| size / font_size);
+            run.glyphs.iter_mut().map(move |glyph| (scale, glyph))
+        })
+        .collect();
+    glyphs.sort_by(|a, b| f32::from(a.1.position.x).total_cmp(&f32::from(b.1.position.x)));
+    let (mut from, mut to, mut scale) = (Pixels::ZERO, Pixels::ZERO, 1.);
+    for (glyph_scale, glyph) in glyphs {
+        if glyph_scale != scale {
+            to += (glyph.position.x - from) * scale;
+            from = glyph.position.x;
+            scale = glyph_scale;
+        }
+        glyph.position.x = to + (glyph.position.x - from) * scale;
+    }
+    layout.width = to + (layout.width - from) * scale;
+}
+
+/// Moves each glyph along by the letter spacing of the characters before it, and
+/// widens the line by all of it. A cluster shaped into one glyph is spaced once.
+fn apply_letter_spacing(layout: &mut LineLayout, runs: &[FontRun]) {
+    if runs.iter().all(|run| run.letter_spacing.0 == 0.) {
+        return;
+    }
+    let mut ends = Vec::with_capacity(runs.len());
+    let mut end = 0;
+    for run in runs {
+        end += run.len;
+        ends.push((end, layout.font_size * run.letter_spacing.0));
+    }
+    let spacing_at = |index: usize| {
+        ends.iter()
+            .find(|(end, _)| index < *end)
+            .map_or(Pixels::ZERO, |(_, spacing)| *spacing)
+    };
+    let mut glyphs: Vec<&mut ShapedGlyph> = layout
+        .runs
+        .iter_mut()
+        .flat_map(|run| run.glyphs.iter_mut())
+        .collect();
+    glyphs.sort_by_key(|glyph| glyph.index);
+    let mut offset = Pixels::ZERO;
+    let mut previous = None;
+    for glyph in glyphs {
+        if previous != Some(glyph.index) {
+            if let Some(index) = previous {
+                offset += spacing_at(index);
+            }
+            previous = Some(glyph.index);
+        }
+        glyph.position.x += offset;
+    }
+    if let Some(index) = previous {
+        offset += spacing_at(index);
+    }
+    layout.width += offset;
+}
+
+/// Opens each run's leading space before its first character: the glyphs from there on move
+/// right by it, and the line grows by all of it.
+fn apply_leading(layout: &mut LineLayout, runs: &[FontRun]) {
+    if runs.iter().all(|run| run.leading.0 == 0.) {
+        return;
+    }
+    let mut starts = Vec::with_capacity(runs.len());
+    let mut start = 0;
+    for run in runs {
+        if run.leading.0 != 0. {
+            starts.push((start, layout.font_size * run.leading.0));
+        }
+        start += run.len;
+    }
+    for glyph in layout.runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
+        let opened: Pixels = starts
+            .iter()
+            .filter(|(start, _)| glyph.index >= *start)
+            .map(|(_, width)| *width)
+            .sum();
+        glyph.position.x += opened;
+    }
+    layout.width += starts.iter().map(|(_, width)| *width).sum::<Pixels>();
 }
 
 trait AsCacheKeyRef {
@@ -1319,6 +1505,7 @@ mod tests {
             runs: vec![ShapedRun {
                 font_id: FontId(0),
                 glyphs,
+                font_size: None,
             }],
             len: 0,
         }
@@ -1430,6 +1617,16 @@ mod tests {
         }
     }
 
+    fn run(len: usize, ems: f32) -> FontRun {
+        FontRun {
+            len,
+            font_id: FontId(0),
+            letter_spacing: LetterSpacing(ems),
+            scale: FontScale::default(),
+            leading: Default::default(),
+        }
+    }
+
     #[test]
     fn left_to_right_text_keeps_its_own_measures() {
         let layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1), glyph_at(16., 2)]);
@@ -1503,7 +1700,7 @@ mod tests {
             ])
         };
 
-        let boundaries = layout.compute_wrap_boundaries("אב גד", px(35.), None);
+        let boundaries = layout.compute_wrap_boundaries("אב גד", px(35.), None, &[]);
         assert_eq!(
             boundaries.as_slice(),
             &[WrapBoundary {
@@ -1511,5 +1708,42 @@ mod tests {
                 glyph_ix: 3
             }]
         );
+    }
+
+    #[test]
+    fn test_leading_opens_space_before_its_run() {
+        // 16px text: 1em (16px) before the first character, and 0.5em (8px) before the second.
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1), glyph_at(16., 2)]);
+        let mut first = run(1, 0.);
+        first.leading = LetterSpacing(1.);
+        let mut rest = run(2, 0.);
+        rest.leading = LetterSpacing(0.5);
+
+        apply_leading(&mut layout, &[first, rest]);
+
+        assert_eq!(glyph_x_positions(&layout), vec![16., 32., 40.]);
+        assert_eq!(layout.width, px(124.));
+    }
+
+    #[test]
+    fn test_letter_spacing_follows_each_character_in_its_run() {
+        // 16px text, the first two characters spaced 0.25em (4px), the third not.
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1), glyph_at(16., 2)]);
+
+        apply_letter_spacing(&mut layout, &[run(2, 0.25), run(1, 0.)]);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 12., 24.]);
+        assert_eq!(layout.width, px(108.));
+    }
+
+    #[test]
+    fn test_letter_spacing_spaces_a_cluster_once() {
+        // A base and its combining mark share an index and move together.
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(0., 0), glyph_at(8., 3)]);
+
+        apply_letter_spacing(&mut layout, &[run(4, 0.5)]);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 0., 16.]);
+        assert_eq!(layout.width, px(116.));
     }
 }

@@ -151,6 +151,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            &[],
             None,
             window,
             cx,
@@ -175,6 +176,7 @@ impl ShapedLine {
             align,
             align_width,
             &self.decoration_runs,
+            &[],
             &[],
             window,
             cx,
@@ -326,6 +328,7 @@ impl<'a> ShapedLineCursor<'a> {
                             is_emoji: glyph.is_emoji,
                         })
                         .collect(),
+                    font_size: run.font_size,
                 });
             }
             if let Some(glyph) = run.glyphs.get(self.glyph_index) {
@@ -405,6 +408,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            &[],
             None,
             window,
             cx,
@@ -434,6 +438,7 @@ impl LineLayout {
             align,
             align_width,
             decoration_runs,
+            &[],
             &[],
             window,
             cx,
@@ -510,6 +515,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            &self.gaps,
             tint,
             window,
             cx,
@@ -542,12 +548,20 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            &self.gaps,
             window,
             cx,
         )?;
 
         Ok(())
     }
+}
+
+/// The space opened before `index`, which a row that wraps there keeps at its start.
+pub(crate) fn gap_at(gaps: &[(usize, Pixels)], index: usize) -> Pixels {
+    gaps.iter()
+        .find(|(at, _)| *at == index)
+        .map_or(Pixels::ZERO, |(_, width)| *width)
 }
 
 fn paint_line(
@@ -558,6 +572,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    gaps: &[(usize, Pixels)],
     tint: Option<Hsla>,
     window: &mut Window,
     cx: &mut App,
@@ -667,14 +682,15 @@ fn paint_line(
                         }
                     }
 
+                    let gap = gap_at(gaps, glyph.index);
                     glyph_origin.x = aligned_origin_x(
                         origin,
                         align_width.unwrap_or(layout.width),
-                        glyph.position.x,
+                        glyph.position.x - gap,
                         &align,
                         layout,
                         wraps.peek(),
-                    );
+                    ) + gap;
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
@@ -791,14 +807,14 @@ fn paint_line(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run.font_size.unwrap_or(layout.font_size),
                         )?;
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run.font_size.unwrap_or(layout.font_size),
                             color,
                         )?;
                     }
@@ -851,6 +867,7 @@ fn paint_line_background(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    gaps: &[(usize, Pixels)],
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -921,14 +938,15 @@ fn paint_line_background(
                         }
                     }
 
+                    let gap = gap_at(gaps, glyph.index);
                     glyph_origin.x = aligned_origin_x(
                         origin,
                         align_width.unwrap_or(layout.width),
-                        glyph.position.x,
+                        glyph.position.x - gap,
                         &align,
                         layout,
                         wraps.peek(),
-                    );
+                    ) + gap;
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
@@ -1347,6 +1365,7 @@ mod tests {
                 runs: vec![ShapedRun {
                     font_id: FontId(0),
                     glyphs: shaped_glyphs,
+                    font_size: None,
                 }],
                 len: text.len(),
             }),
@@ -1682,6 +1701,7 @@ mod tests {
                             glyph_ix: 2,
                         }]),
                         wrap_width: Some(px(16.)),
+                        gaps: SmallVec::new(),
                     }),
                     text: line.text,
                     decoration_runs: line.decoration_runs.into_vec(),
@@ -1701,6 +1721,7 @@ mod tests {
                     Some(px(16.)),
                     &wrapped.decoration_runs,
                     &wrapped.wrap_boundaries,
+                    &wrapped.gaps,
                     None,
                     window,
                     cx,
@@ -1814,6 +1835,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        font_size: None,
                     },
                     ShapedRun {
                         font_id: FontId(1),
@@ -1837,6 +1859,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        font_size: None,
                     },
                 ],
                 len: 6,
@@ -2060,6 +2083,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        font_size: None,
                     },
                     ShapedRun {
                         font_id: FontId(8),
@@ -2077,6 +2101,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        font_size: None,
                     },
                 ],
                 len: 10,
