@@ -2845,6 +2845,13 @@ impl Window {
         })
     }
 
+    /// Tells a window on X11 the scale of the display it is on, which X11 cannot report. Does
+    /// nothing on other platforms.
+    pub fn set_platform_scale_factor(&mut self, scale_factor: f32, cx: &mut App) {
+        self.platform_window.set_scale_factor(scale_factor);
+        self.bounds_changed(cx);
+    }
+
     /// Notify the window that its bounds have changed.
     ///
     /// This updates internal state like `viewport_size` and `scale_factor` from
