@@ -2,8 +2,8 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow, TextShadow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    LetterSpacing, Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign,
+    TextOverflow, TextShadow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -614,6 +614,15 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the space after each character, in ems of the font size, like CSS
+    /// `letter-spacing`.
+    ///
+    /// This value cascades to its child elements.
+    fn letter_spacing(mut self, ems: f32) -> Self {
+        self.text_style().letter_spacing = Some(LetterSpacing(ems));
+        self
+    }
+
     /// Sets the background color of this element.
     ///
     /// This value cascades to its child elements.
@@ -814,6 +823,7 @@ pub trait Styled: Sized {
             fallbacks,
             weight,
             style,
+            letter_spacing,
         } = font;
 
         let text_style = self.text_style();
@@ -822,6 +832,7 @@ pub trait Styled: Sized {
         text_style.font_weight = Some(weight);
         text_style.font_style = Some(style);
         text_style.font_fallbacks = fallbacks;
+        text_style.letter_spacing = Some(letter_spacing);
 
         self
     }
