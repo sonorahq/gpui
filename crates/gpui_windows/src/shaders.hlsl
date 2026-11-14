@@ -1554,37 +1554,64 @@ float4 blit_fragment(FilterFragmentInput input): SV_Target {
     return t_sprite.Sample(s_sprite, input.uv);
 }
 
+// Where a point of a layer's source lands in the frame, applying the layer's transform.
+float2 mask_destination(FilterParams params, float2 source_point) {
+    return params.transform_origin + (source_point - params.transform_origin) * params.scale
+        + params.translation;
+}
+
 float4 mask_fragment(FilterFragmentInput input): SV_Target {
     FilterParams params = filter_params[batch_start_index];
     float2 destination_point = input.position.xy;
     float2 source_point = params.transform_origin
         + (destination_point - params.translation - params.transform_origin) / params.scale;
-    float2 source_end = params.source_bounds.origin + params.source_bounds.size;
-    if (any(source_point < params.source_bounds.origin)
-        || any(source_point >= source_end)
-        || any(source_point < float2(0.0, 0.0))
-        || any(source_point >= global_viewport_size)) {
-        return float4(0.0, 0.0, 0.0, 0.0);
+    // Only the part of the source inside the frame was drawn, so only that part covers pixels.
+    float2 source_start = max(params.source_bounds.origin, float2(0.0, 0.0));
+    float2 source_end = min(params.source_bounds.origin + params.source_bounds.size,
+        global_viewport_size);
+
+    // An untransformed layer keeps the frame's pixel grid, so a pixel is in or out. A
+    // transformed one covers each pixel as far as its transformed bounds overlap it, which
+    // smooths the edge the clamped sample below leaves hard.
+    float coverage = 1.0;
+    if (params.scale == 1.0 && all(params.translation == float2(0.0, 0.0))) {
+        if (any(source_point < source_start) || any(source_point >= source_end)) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+    } else {
+        float2 start = mask_destination(params, source_start);
+        float2 end = mask_destination(params, source_end);
+        float2 overlap = saturate(min(destination_point + 0.5, end) - max(destination_point - 0.5, start));
+        coverage = overlap.x * overlap.y;
+        if (coverage <= 0.0) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
     }
 
     float top = source_point.y - params.fade_bounds.origin.y;
     float bottom = params.fade_bounds.origin.y + params.fade_bounds.size.y - source_point.y;
 
-    float coverage = 1.0;
+    float fade = 1.0;
     if (params.fade_top > 0.0) {
-        coverage = min(coverage, smoothstep(0.0, params.fade_top, top));
+        fade = min(fade, smoothstep(0.0, params.fade_top, top));
     }
     if (params.fade_bottom > 0.0) {
-        coverage = min(coverage, smoothstep(0.0, params.fade_bottom, bottom));
+        fade = min(fade, smoothstep(0.0, params.fade_bottom, bottom));
     }
     if (params.fade_left > 0.0) {
         float left = source_point.x - params.fade_bounds.origin.x;
-        coverage = min(coverage, smoothstep(0.0, params.fade_left, left));
+        fade = min(fade, smoothstep(0.0, params.fade_left, left));
     }
     if (params.fade_right > 0.0) {
         float right = params.fade_bounds.origin.x + params.fade_bounds.size.x - source_point.x;
-        coverage = min(coverage, smoothstep(0.0, params.fade_right, right));
+        fade = min(fade, smoothstep(0.0, params.fade_right, right));
     }
 
-    return t_sprite.Sample(s_sprite, source_point / global_viewport_size) * coverage;
+    // The sample stays half a texel inside the texels the layer covers and inside the frame, so
+    // a stretched edge repeats the layer's last texels rather than blending them with whatever
+    // lies past it. A pixel centre of an untransformed layer is already inside and does not move.
+    float2 low = max(floor(source_start), float2(0.0, 0.0)) + 0.5;
+    float2 high = min(ceil(source_end), global_viewport_size) - 0.5;
+    float2 texel = clamp(source_point, low, max(low, high));
+    return t_sprite.Sample(s_sprite, texel / global_viewport_size) * coverage * fade;
 }
