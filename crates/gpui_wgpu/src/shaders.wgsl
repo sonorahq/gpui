@@ -1615,11 +1615,12 @@ struct Mask {
 fn fs_mask(input: BlurVarying) -> @location(0) vec4<f32> {
     let mask = load_mask(0u);
     let source_point = mask_source(mask, input.position.xy);
-    let coverage = mask_coverage(mask, source_point);
+    let coverage = mask_coverage(mask, input.position.xy, source_point);
     if (coverage <= 0.0) {
         return vec4<f32>(0.0);
     }
-    return textureSample(t_sprite, s_sprite, source_point / globals.viewport_size) * coverage;
+    let uv = mask_texel(mask, source_point) / globals.viewport_size;
+    return textureSample(t_sprite, s_sprite, uv) * coverage;
 }
 
 // `fs_mask` for a layer the gaussian has only blurred across, which runs the pass down on the
@@ -1630,11 +1631,11 @@ fn fs_mask(input: BlurVarying) -> @location(0) vec4<f32> {
 fn fs_mask_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
     let mask = load_mask(0u);
     let source_point = mask_source(mask, input.position.xy);
-    let coverage = mask_coverage(mask, source_point);
+    let coverage = mask_coverage(mask, input.position.xy, source_point);
     if (coverage <= 0.0) {
         return vec4<f32>(0.0);
     }
-    let uv = source_point / globals.viewport_size;
+    let uv = mask_texel(mask, source_point) / globals.viewport_size;
     let texel = vec2<f32>(0.0, 1.0) / vec2<f32>(textureDimensions(t_sprite));
     let sigma = max(mask.pad, 0.0001);
     let reach = min(ceil(sigma * 3.0), 24.0);
@@ -1659,21 +1660,61 @@ fn mask_source(mask: Mask, destination_point: vec2<f32>) -> vec2<f32> {
         + (destination_point - mask.translation - mask.transform_origin) / mask.scale;
 }
 
-// How much of a layer's source point reaches the frame: nothing outside the source, and the
-// edge fades within it.
-fn mask_coverage(mask: Mask, source_point: vec2<f32>) -> f32 {
-    let source_end = mask.source_bounds.origin + mask.source_bounds.size;
-    if (any(source_point < mask.source_bounds.origin)
-        || any(source_point >= source_end)
-        || any(source_point < vec2<f32>(0.0))
-        || any(source_point >= globals.viewport_size)) {
+// Where a point of a layer's source lands in the frame, applying the layer's transform.
+fn mask_destination(mask: Mask, source_point: vec2<f32>) -> vec2<f32> {
+    return mask.transform_origin + (source_point - mask.transform_origin) * mask.scale
+        + mask.translation;
+}
+
+// Where a layer's source is sampled for a source point: held half a texel inside the texels the
+// layer covers and inside the frame, so a stretched edge repeats the layer's last texels rather
+// than blending them with whatever lies past it. A pixel centre of an untransformed layer is
+// already inside, so its sample does not move.
+fn mask_texel(mask: Mask, source_point: vec2<f32>) -> vec2<f32> {
+    let low = max(floor(mask.source_bounds.origin), vec2<f32>(0.0)) + 0.5;
+    let high = min(
+        ceil(mask.source_bounds.origin + mask.source_bounds.size),
+        globals.viewport_size,
+    ) - 0.5;
+    return clamp(source_point, low, max(low, high));
+}
+
+// How much of a destination pixel a layer covers. An untransformed layer keeps the frame's pixel
+// grid, so a pixel is in or out. A transformed one covers each pixel as far as its transformed
+// bounds overlap it, which smooths the edge `mask_texel` leaves hard.
+fn mask_edge(mask: Mask, destination_point: vec2<f32>, source_point: vec2<f32>) -> f32 {
+    let source_start = mask.source_bounds.origin;
+    let source_end = source_start + mask.source_bounds.size;
+    if (mask.scale == 1.0 && all(mask.translation == vec2<f32>(0.0))) {
+        if (any(source_point < source_start) || any(source_point >= source_end)) {
+            return 0.0;
+        }
+        return 1.0;
+    }
+    let start = mask_destination(mask, source_start);
+    let end = mask_destination(mask, source_end);
+    let overlap = clamp(
+        min(destination_point + 0.5, end) - max(destination_point - 0.5, start),
+        vec2<f32>(0.0),
+        vec2<f32>(1.0),
+    );
+    return overlap.x * overlap.y;
+}
+
+// How much of a layer reaches a destination pixel: nothing outside the source or the frame, a
+// share of the pixel along a transformed edge, and the edge fades within it.
+fn mask_coverage(mask: Mask, destination_point: vec2<f32>, source_point: vec2<f32>) -> f32 {
+    if (any(source_point < vec2<f32>(0.0)) || any(source_point >= globals.viewport_size)) {
+        return 0.0;
+    }
+    var coverage = mask_edge(mask, destination_point, source_point);
+    if (coverage <= 0.0) {
         return 0.0;
     }
 
     let top = source_point.y - mask.fade_bounds.origin.y;
     let bottom = mask.fade_bounds.origin.y + mask.fade_bounds.size.y - source_point.y;
 
-    var coverage = 1.0;
     if (mask.fade_top > 0.0) {
         coverage = min(coverage, smoothstep(0.0, mask.fade_top, top));
     }

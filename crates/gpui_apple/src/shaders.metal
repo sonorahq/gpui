@@ -1548,15 +1548,32 @@ fragment float4 mask_fragment(
                                 params->source_bounds.origin.y);
   float2 source_end = source_origin + float2(params->source_bounds.size.width,
                                               params->source_bounds.size.height);
-  if (any(source_point < source_origin) || any(source_point >= source_end) ||
-      any(source_point < float2(0.0)) || any(source_point >= extent)) {
+  if (any(source_point < float2(0.0)) || any(source_point >= extent)) {
     return float4(0.0);
+  }
+
+  // An untransformed layer keeps the frame's pixel grid, so a pixel is in or out. A transformed
+  // one covers each pixel as far as its transformed bounds overlap it, which smooths the edge
+  // the clamped sample below leaves hard.
+  float coverage = 1.0;
+  if (params->scale == 1.0 && all(translation == float2(0.0))) {
+    if (any(source_point < source_origin) || any(source_point >= source_end)) {
+      return float4(0.0);
+    }
+  } else {
+    float2 start = origin + (source_origin - origin) * params->scale + translation;
+    float2 end = origin + (source_end - origin) * params->scale + translation;
+    float2 overlap =
+        saturate(min(destination_point + 0.5, end) - max(destination_point - 0.5, start));
+    coverage = overlap.x * overlap.y;
+    if (coverage <= 0.0) {
+      return float4(0.0);
+    }
   }
 
   float top = source_point.y - params->fade_bounds.origin.y;
   float bottom = params->fade_bounds.origin.y + params->fade_bounds.size.height - source_point.y;
 
-  float coverage = 1.0;
   if (params->fade_top > 0.0) {
     coverage = min(coverage, smoothstep(0.0, params->fade_top, top));
   }
@@ -1572,5 +1589,11 @@ fragment float4 mask_fragment(
     coverage = min(coverage, smoothstep(0.0, params->fade_right, right));
   }
 
-  return source.sample(source_sampler, source_point / extent) * coverage;
+  // The sample stays half a texel inside the texels the layer covers and inside the frame, so a
+  // stretched edge repeats the layer's last texels rather than blending them with whatever lies
+  // past it. A pixel centre of an untransformed layer is already inside and does not move.
+  float2 low = max(floor(source_origin), float2(0.0)) + 0.5;
+  float2 high = min(ceil(source_end), extent) - 0.5;
+  float2 texel = clamp(source_point, low, max(low, high));
+  return source.sample(source_sampler, texel / extent) * coverage;
 }
