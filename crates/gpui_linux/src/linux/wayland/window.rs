@@ -2501,13 +2501,16 @@ fn update_blur(state: &mut WaylandWindowState) {
     };
     match blurred {
         true => {
+            // KWin reads the region only when a blur object is created and ignores a later
+            // `set_region`, so each change gets a new object and the old one is released after it.
             let region = blur_region(state);
-            let blur = state
-                .blur
-                .get_or_insert_with(|| blur_manager.create(&state.surface, &state.globals.qh, ()));
+            let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
             blur.set_region(Some(&region));
             blur.commit();
             region.destroy();
+            if let Some(stale) = state.blur.replace(blur) {
+                stale.release();
+            }
         }
         false => {
             blur_manager.unset(&state.surface);
