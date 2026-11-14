@@ -1679,12 +1679,16 @@ fn mask_texel(mask: Mask, source_point: vec2<f32>) -> vec2<f32> {
     return clamp(source_point, low, max(low, high));
 }
 
-// How much of a destination pixel a layer covers. An untransformed layer keeps the frame's pixel
-// grid, so a pixel is in or out. A transformed one covers each pixel as far as its transformed
-// bounds overlap it, which smooths the edge `mask_texel` leaves hard.
+// How much of a destination pixel a layer covers, counting only the part of its source inside
+// the frame. An untransformed layer keeps the frame's pixel grid, so a pixel is in or out. A
+// transformed one covers each pixel as far as its transformed bounds overlap it, which smooths
+// the edge `mask_texel` leaves hard.
 fn mask_edge(mask: Mask, destination_point: vec2<f32>, source_point: vec2<f32>) -> f32 {
-    let source_start = mask.source_bounds.origin;
-    let source_end = source_start + mask.source_bounds.size;
+    let source_start = max(mask.source_bounds.origin, vec2<f32>(0.0));
+    let source_end = min(
+        mask.source_bounds.origin + mask.source_bounds.size,
+        globals.viewport_size,
+    );
     if (mask.scale == 1.0 && all(mask.translation == vec2<f32>(0.0))) {
         if (any(source_point < source_start) || any(source_point >= source_end)) {
             return 0.0;
@@ -1702,12 +1706,9 @@ fn mask_edge(mask: Mask, destination_point: vec2<f32>, source_point: vec2<f32>) 
 }
 
 // How much of a layer reaches a destination pixel: nothing outside the source or the frame, a
-// share of the pixel along a transformed edge, and the edge fades within it.
+// share of the pixel along a transformed edge, and that share faded by the edge fades.
 fn mask_coverage(mask: Mask, destination_point: vec2<f32>, source_point: vec2<f32>) -> f32 {
-    if (any(source_point < vec2<f32>(0.0)) || any(source_point >= globals.viewport_size)) {
-        return 0.0;
-    }
-    var coverage = mask_edge(mask, destination_point, source_point);
+    let coverage = mask_edge(mask, destination_point, source_point);
     if (coverage <= 0.0) {
         return 0.0;
     }
@@ -1715,20 +1716,21 @@ fn mask_coverage(mask: Mask, destination_point: vec2<f32>, source_point: vec2<f3
     let top = source_point.y - mask.fade_bounds.origin.y;
     let bottom = mask.fade_bounds.origin.y + mask.fade_bounds.size.y - source_point.y;
 
+    var fade = 1.0;
     if (mask.fade_top > 0.0) {
-        coverage = min(coverage, smoothstep(0.0, mask.fade_top, top));
+        fade = min(fade, smoothstep(0.0, mask.fade_top, top));
     }
     if (mask.fade_bottom > 0.0) {
-        coverage = min(coverage, smoothstep(0.0, mask.fade_bottom, bottom));
+        fade = min(fade, smoothstep(0.0, mask.fade_bottom, bottom));
     }
     if (mask.fade_left > 0.0) {
         let left = source_point.x - mask.fade_bounds.origin.x;
-        coverage = min(coverage, smoothstep(0.0, mask.fade_left, left));
+        fade = min(fade, smoothstep(0.0, mask.fade_left, left));
     }
     if (mask.fade_right > 0.0) {
         let right = mask.fade_bounds.origin.x + mask.fade_bounds.size.x - source_point.x;
-        coverage = min(coverage, smoothstep(0.0, mask.fade_right, right));
+        fade = min(fade, smoothstep(0.0, mask.fade_right, right));
     }
 
-    return coverage;
+    return coverage * fade;
 }

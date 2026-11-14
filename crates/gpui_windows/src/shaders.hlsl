@@ -1565,11 +1565,10 @@ float4 mask_fragment(FilterFragmentInput input): SV_Target {
     float2 destination_point = input.position.xy;
     float2 source_point = params.transform_origin
         + (destination_point - params.translation - params.transform_origin) / params.scale;
-    float2 source_start = params.source_bounds.origin;
-    float2 source_end = source_start + params.source_bounds.size;
-    if (any(source_point < float2(0.0, 0.0)) || any(source_point >= global_viewport_size)) {
-        return float4(0.0, 0.0, 0.0, 0.0);
-    }
+    // Only the part of the source inside the frame was drawn, so only that part covers pixels.
+    float2 source_start = max(params.source_bounds.origin, float2(0.0, 0.0));
+    float2 source_end = min(params.source_bounds.origin + params.source_bounds.size,
+        global_viewport_size);
 
     // An untransformed layer keeps the frame's pixel grid, so a pixel is in or out. A
     // transformed one covers each pixel as far as its transformed bounds overlap it, which
@@ -1592,19 +1591,20 @@ float4 mask_fragment(FilterFragmentInput input): SV_Target {
     float top = source_point.y - params.fade_bounds.origin.y;
     float bottom = params.fade_bounds.origin.y + params.fade_bounds.size.y - source_point.y;
 
+    float fade = 1.0;
     if (params.fade_top > 0.0) {
-        coverage = min(coverage, smoothstep(0.0, params.fade_top, top));
+        fade = min(fade, smoothstep(0.0, params.fade_top, top));
     }
     if (params.fade_bottom > 0.0) {
-        coverage = min(coverage, smoothstep(0.0, params.fade_bottom, bottom));
+        fade = min(fade, smoothstep(0.0, params.fade_bottom, bottom));
     }
     if (params.fade_left > 0.0) {
         float left = source_point.x - params.fade_bounds.origin.x;
-        coverage = min(coverage, smoothstep(0.0, params.fade_left, left));
+        fade = min(fade, smoothstep(0.0, params.fade_left, left));
     }
     if (params.fade_right > 0.0) {
         float right = params.fade_bounds.origin.x + params.fade_bounds.size.x - source_point.x;
-        coverage = min(coverage, smoothstep(0.0, params.fade_right, right));
+        fade = min(fade, smoothstep(0.0, params.fade_right, right));
     }
 
     // The sample stays half a texel inside the texels the layer covers and inside the frame, so
@@ -1613,5 +1613,5 @@ float4 mask_fragment(FilterFragmentInput input): SV_Target {
     float2 low = max(floor(source_start), float2(0.0, 0.0)) + 0.5;
     float2 high = min(ceil(source_end), global_viewport_size) - 0.5;
     float2 texel = clamp(source_point, low, max(low, high));
-    return t_sprite.Sample(s_sprite, texel / global_viewport_size) * coverage;
+    return t_sprite.Sample(s_sprite, texel / global_viewport_size) * coverage * fade;
 }

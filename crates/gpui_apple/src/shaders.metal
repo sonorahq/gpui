@@ -1544,13 +1544,13 @@ fragment float4 mask_fragment(
   float2 origin = float2(params->transform_origin[0], params->transform_origin[1]);
   float2 translation = float2(params->translation[0], params->translation[1]);
   float2 source_point = origin + (destination_point - translation - origin) / params->scale;
-  float2 source_origin = float2(params->source_bounds.origin.x,
+  // Only the part of the source inside the frame was drawn, so only that part covers pixels.
+  float2 bounds_origin = float2(params->source_bounds.origin.x,
                                 params->source_bounds.origin.y);
-  float2 source_end = source_origin + float2(params->source_bounds.size.width,
-                                              params->source_bounds.size.height);
-  if (any(source_point < float2(0.0)) || any(source_point >= extent)) {
-    return float4(0.0);
-  }
+  float2 source_origin = max(bounds_origin, float2(0.0));
+  float2 source_end = min(bounds_origin + float2(params->source_bounds.size.width,
+                                                 params->source_bounds.size.height),
+                          extent);
 
   // An untransformed layer keeps the frame's pixel grid, so a pixel is in or out. A transformed
   // one covers each pixel as far as its transformed bounds overlap it, which smooths the edge
@@ -1574,19 +1574,20 @@ fragment float4 mask_fragment(
   float top = source_point.y - params->fade_bounds.origin.y;
   float bottom = params->fade_bounds.origin.y + params->fade_bounds.size.height - source_point.y;
 
+  float fade = 1.0;
   if (params->fade_top > 0.0) {
-    coverage = min(coverage, smoothstep(0.0, params->fade_top, top));
+    fade = min(fade, smoothstep(0.0, params->fade_top, top));
   }
   if (params->fade_bottom > 0.0) {
-    coverage = min(coverage, smoothstep(0.0, params->fade_bottom, bottom));
+    fade = min(fade, smoothstep(0.0, params->fade_bottom, bottom));
   }
   if (params->fade_left > 0.0) {
     float left = source_point.x - params->fade_bounds.origin.x;
-    coverage = min(coverage, smoothstep(0.0, params->fade_left, left));
+    fade = min(fade, smoothstep(0.0, params->fade_left, left));
   }
   if (params->fade_right > 0.0) {
     float right = params->fade_bounds.origin.x + params->fade_bounds.size.width - source_point.x;
-    coverage = min(coverage, smoothstep(0.0, params->fade_right, right));
+    fade = min(fade, smoothstep(0.0, params->fade_right, right));
   }
 
   // The sample stays half a texel inside the texels the layer covers and inside the frame, so a
@@ -1595,5 +1596,5 @@ fragment float4 mask_fragment(
   float2 low = max(floor(source_origin), float2(0.0)) + 0.5;
   float2 high = min(ceil(source_end), extent) - 0.5;
   float2 texel = clamp(source_point, low, max(low, high));
-  return source.sample(source_sampler, texel / extent) * coverage;
+  return source.sample(source_sampler, texel / extent) * coverage * fade;
 }
