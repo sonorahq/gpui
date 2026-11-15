@@ -616,6 +616,10 @@ pub struct TextLayout(Rc<RefCell<TextLayoutCell>>);
 /// How many layouts a text keeps beside the one it shows.
 const SPARE_LAYOUTS: usize = 3;
 
+/// How many references a text's layout cell has while only its own measuring holds it: the
+/// [`TextMeasure`] memo left with the layout node, and the node's measure function.
+const MEASURE_HOLDERS: usize = 2;
+
 /// The layout a text shows, and the ones measured before it. Flex layout probes a text with
 /// and without a width limit in turn, and a layout node kept across frames is probed again
 /// only for a width it has not answered, so the layout measured last is not always the one for
@@ -799,11 +803,14 @@ impl TextLayout {
             .filter(|earlier| earlier.measures_as(&memo))
             .map(|earlier| {
                 if !Rc::ptr_eq(&earlier.layout.0, &self.0) {
-                    let mut earlier = earlier.layout.0.borrow_mut();
                     // A handle the earlier frame gave out, as a visible tooltip's callback
-                    // holds, still reads the layout that frame showed.
+                    // holds, still reads the layout that frame showed. Without one, only the
+                    // memo and the node's measure function hold the cell, and nothing reads
+                    // it again, so the layouts move over without a copy.
+                    let handed_out = Rc::strong_count(&earlier.layout.0) > MEASURE_HOLDERS;
+                    let mut earlier = earlier.layout.0.borrow_mut();
                     let shown = TextLayoutCell {
-                        current: earlier.current.clone(),
+                        current: handed_out.then(|| earlier.current.clone()).flatten(),
                         spares: SmallVec::new(),
                     };
                     *self.0.borrow_mut() = mem::replace(&mut *earlier, shown);

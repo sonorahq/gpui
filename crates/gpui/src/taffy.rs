@@ -270,7 +270,9 @@ impl TaffyLayoutEngine {
         // whose next request no longer lists it, and a parent a root was taken from is
         // compared in full, so a fingerprint that matches the last request's matches the
         // children Taffy holds.
-        let uprooted = self.uprooted.remove(&id);
+        // Almost always empty, and checked for every node a frame asks for, so the hash is
+        // skipped while nothing is in it.
+        let uprooted = !self.uprooted.is_empty() && self.uprooted.remove(&id);
         let same_children = match &record {
             Some(node) if kept && !uprooted && node.children == children_print => {
                 debug_assert!(
