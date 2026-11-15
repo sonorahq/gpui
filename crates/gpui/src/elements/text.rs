@@ -1,9 +1,9 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
+    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, Font, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayerFilter, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    WrappedLineLayout, px, register_tooltip_mouse_handlers, set_tooltip_on_window, taffy::Measured,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -281,10 +281,10 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self)
+        text_layout.prepaint(bounds, self, window)
     }
 
     fn paint(
@@ -355,10 +355,10 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self.as_ref())
+        text_layout.prepaint(bounds, self.as_ref(), window)
     }
 
     fn paint(
@@ -581,10 +581,10 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text)
+        self.layout.prepaint(bounds, &self.text, window)
     }
 
     fn paint(
@@ -611,7 +611,136 @@ impl IntoElement for StyledText {
 
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
-pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+pub struct TextLayout(Rc<RefCell<TextLayoutCell>>);
+
+/// How many layouts a text keeps beside the one it shows.
+const SPARE_LAYOUTS: usize = 3;
+
+/// How many references a text's layout cell has while only its own measuring holds it: the
+/// [`TextMeasure`] memo left with the layout node, and the node's measure function.
+const MEASURE_HOLDERS: usize = 2;
+
+/// The layout a text shows, and the ones measured before it. Flex layout probes a text with
+/// and without a width limit in turn, and a layout node kept across frames is probed again
+/// only for a width it has not answered, so the layout measured last is not always the one for
+/// the bounds the text ends up with. Keeping the earlier ones answers a repeated probe without
+/// shaping again, and lets [`TextLayout::prepaint`] show the one its bounds were measured from.
+#[derive(Default)]
+struct TextLayoutCell {
+    current: Option<TextLayoutInner>,
+    spares: SmallVec<[TextLayoutInner; 1]>,
+}
+
+impl Deref for TextLayoutCell {
+    type Target = Option<TextLayoutInner>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.current
+    }
+}
+
+impl DerefMut for TextLayoutCell {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.current
+    }
+}
+
+impl TextLayoutCell {
+    /// Shows `layout`, keeping the one shown before as a spare.
+    fn show(&mut self, layout: TextLayoutInner) {
+        let Some(previous) = self.current.replace(layout) else {
+            return;
+        };
+        if self.spares.len() == SPARE_LAYOUTS {
+            self.spares.remove(0);
+        }
+        self.spares.push(previous);
+    }
+
+    /// Shows the first spare `wanted` accepts, and returns whether there was one.
+    fn show_spare(&mut self, wanted: impl Fn(&TextLayoutInner) -> bool) -> bool {
+        let Some(index) = self.spares.iter().position(wanted) else {
+            return false;
+        };
+        self.show_spare_at(index);
+        true
+    }
+
+    /// Shows the spare at `index`, keeping the one shown before as a spare.
+    fn show_spare_at(&mut self, index: usize) {
+        let spare = self.spares.swap_remove(index);
+        if let Some(previous) = self.current.replace(spare) {
+            self.spares.push(previous);
+        }
+    }
+
+    /// Shows the layout measured closest to the size a text ended up, when the one shown was
+    /// measured for another. `slack` is how far a size may be off, which is what snapping an
+    /// edge to a device pixel moves it by. A layout further off than that is never shown.
+    fn settle(&mut self, size: Size<Pixels>, slack: Pixels) {
+        // How far the width a layout was wrapped or cut at, or the size it came out, is from
+        // `size`, whichever is nearest.
+        let off = |layout: &TextLayoutInner| {
+            let width_off = |width: Pixels| (width - size.width).abs();
+            [
+                layout.wrap_width.map(width_off),
+                layout.truncate_width.map(width_off),
+                layout.size.map(|measured| {
+                    width_off(measured.width).max((measured.height - size.height).abs())
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|off| *off <= slack)
+            .reduce(Pixels::min)
+        };
+        let shown = self.current.as_ref().and_then(off);
+        let closest = self
+            .spares
+            .iter()
+            .enumerate()
+            .filter_map(|(index, spare)| Some((index, off(spare)?)))
+            .reduce(|a, b| match b.1 < a.1 {
+                true => b,
+                false => a,
+            });
+        if let Some((index, spare_off)) = closest
+            && shown.is_none_or(|shown| spare_off < shown)
+        {
+            self.show_spare_at(index);
+        }
+    }
+}
+
+/// What a text is measured from, left with its layout node so that the text asked for at the
+/// same place on the next frame can tell that it measures the same, and take over the layouts
+/// instead of shaping again.
+struct TextMeasure {
+    text: SharedString,
+    runs: Vec<TextRun>,
+    font_size: Pixels,
+    line_height: Pixels,
+    white_space: WhiteSpace,
+    text_overflow: Option<TextOverflow>,
+    line_clamp: Option<usize>,
+    /// The font of the text style, which a text that may be truncated is cut with.
+    font: Option<Font>,
+    layout: TextLayout,
+}
+
+impl TextMeasure {
+    /// Whether a text measured from `other` comes out as this one did.
+    fn measures_as(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.runs == other.runs
+            && self.font == other.font
+            && self.font_size == other.font_size
+            && self.line_height == other.line_height
+            && self.white_space == other.white_space
+            && self.text_overflow == other.text_overflow
+            && self.line_clamp == other.line_clamp
+    }
+}
 
 #[derive(Clone, Copy)]
 enum TextPaintPass {
@@ -620,6 +749,7 @@ enum TextPaintPass {
     Foreground,
 }
 
+#[derive(Clone)]
 struct TextLayoutInner {
     len: usize,
     lines: SmallVec<[WrappedLine; 1]>,
@@ -651,14 +781,54 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
-            let element_state = self.clone();
-            // The layout measured before the current one. Flex layout probes a text with and
-            // without a width limit in turn, so keeping both answers each probe without
-            // shaping again.
-            let spare: RefCell<Option<TextLayoutInner>> = RefCell::new(None);
 
-            move |known_dimensions, available_space, window, cx| {
+        let font = text_style
+            .text_overflow
+            .is_some()
+            .then(|| text_style.font());
+        let memo = Rc::new(TextMeasure {
+            text,
+            runs,
+            font_size,
+            line_height,
+            white_space: text_style.white_space,
+            text_overflow: text_style.text_overflow,
+            line_clamp: text_style.line_clamp,
+            font,
+            layout: self.clone(),
+        });
+        let unchanged = window
+            .retained_measure()
+            .and_then(|memo| memo.downcast::<TextMeasure>().ok())
+            .filter(|earlier| earlier.measures_as(&memo))
+            .map(|earlier| {
+                if !Rc::ptr_eq(&earlier.layout.0, &self.0) {
+                    // A handle the earlier frame gave out, as a visible tooltip's callback
+                    // holds, still reads the layout that frame showed. Without one, only the
+                    // memo and the node's measure function hold the cell, and nothing reads
+                    // it again, so the layouts move over without a copy.
+                    let handed_out = Rc::strong_count(&earlier.layout.0) > MEASURE_HOLDERS;
+                    let mut earlier = earlier.layout.0.borrow_mut();
+                    let shown = TextLayoutCell {
+                        current: handed_out.then(|| earlier.current.clone()).flatten(),
+                        spares: SmallVec::new(),
+                    };
+                    *self.0.borrow_mut() = mem::replace(&mut *earlier, shown);
+                }
+            })
+            .is_some();
+
+        let measure = {
+            let element_state = self.clone();
+            let inputs = memo.clone();
+
+            move |known_dimensions: Size<Option<Pixels>>,
+                  available_space: Size<crate::AvailableSpace>,
+                  window: &mut Window,
+                  cx: &mut App| {
+                let text_style = &*inputs;
+                let text = &inputs.text;
+                let runs: &[TextRun] = &inputs.runs;
                 let wrap_width = if text_style.white_space == WhiteSpace::Normal {
                     known_dimensions.width.or(match available_space.width {
                         crate::AvailableSpace::Definite(x) => Some(x),
@@ -702,20 +872,19 @@ impl TextLayout {
                             && wrap_width == text_layout.wrap_width
                     }
                 };
-                if let Some(text_layout) = element_state.0.borrow().as_ref()
-                    && let Some(size) = text_layout.size
-                    && answers(text_layout)
                 {
-                    return size;
-                }
-                let mut spare = spare.borrow_mut();
-                if let Some(text_layout) = spare.as_ref()
-                    && let Some(size) = text_layout.size
-                    && answers(text_layout)
-                {
-                    let current = element_state.0.borrow_mut().replace(spare.take().unwrap());
-                    *spare = current;
-                    return size;
+                    let mut layouts = element_state.0.borrow_mut();
+                    let measured =
+                        |layout: &TextLayoutInner| layout.size.is_some() && answers(layout);
+                    if layouts.current.as_ref().is_some_and(measured)
+                        || layouts.show_spare(measured)
+                    {
+                        return layouts
+                            .current
+                            .as_ref()
+                            .and_then(|layout| layout.size)
+                            .unwrap_or_default();
+                    }
                 }
 
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
@@ -723,7 +892,7 @@ impl TextLayout {
                         && let Some(wrap_width) = wrap_width
                     {
                         cx.text_system()
-                            .line_wrapper(text_style.font(), font_size)
+                            .line_wrapper(inputs.font.clone().unwrap_or_default(), font_size)
                             .truncate_wrapped_line(
                                 text.clone(),
                                 wrap_width,
@@ -746,10 +915,10 @@ impl TextLayout {
                         // whenever the honestly-shaped text fits; the shaping result
                         // comes from the line layout cache when the same text was
                         // already measured untruncated this frame.
-                        (text.clone(), Cow::Borrowed(&*runs))
+                        (text.clone(), Cow::Borrowed(runs))
                     } else {
                         cx.text_system()
-                            .line_wrapper(text_style.font(), font_size)
+                            .line_wrapper(inputs.font.clone().unwrap_or_default(), font_size)
                             .truncate_line(
                                 text.clone(),
                                 truncate_width,
@@ -759,7 +928,7 @@ impl TextLayout {
                             )
                     }
                 } else {
-                    (text.clone(), Cow::Borrowed(&*runs))
+                    (text.clone(), Cow::Borrowed(runs))
                 };
                 let len = text.len();
 
@@ -774,7 +943,7 @@ impl TextLayout {
                     )
                     .log_err()
                 else {
-                    *spare = element_state.0.borrow_mut().replace(TextLayoutInner {
+                    element_state.0.borrow_mut().show(TextLayoutInner {
                         lines: Default::default(),
                         len: 0,
                         line_height,
@@ -793,7 +962,7 @@ impl TextLayout {
                     size.width = size.width.max(line_size.width).ceil();
                 }
 
-                *spare = element_state.0.borrow_mut().replace(TextLayoutInner {
+                element_state.0.borrow_mut().show(TextLayoutInner {
                     lines,
                     len,
                     line_height,
@@ -805,11 +974,16 @@ impl TextLayout {
 
                 size
             }
-        })
+        };
+        window.request_measured(
+            Default::default(),
+            Measured::new(measure).remembered(memo, unchanged),
+        )
     }
 
-    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
+    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, window: &Window) {
         let mut element_state = self.0.borrow_mut();
+        element_state.settle(bounds.size, px(1.) / window.scale_factor());
         let element_state = element_state
             .as_mut()
             .with_context(|| format!("measurement has not been performed on {text}"))
@@ -1387,5 +1561,83 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+
+    #[test]
+    fn settling_shows_the_layout_measured_closest_to_the_bounds() {
+        use crate::size;
+
+        let wrapped_at = |width: f32| TextLayoutInner {
+            len: 0,
+            lines: SmallVec::new(),
+            line_height: px(10.),
+            wrap_width: Some(px(width)),
+            truncate_width: None,
+            size: Some(size(px(width), px(10.))),
+            bounds: None,
+        };
+        let mut cell = TextLayoutCell::default();
+        cell.show(wrapped_at(100.));
+        cell.show(wrapped_at(80.));
+        cell.show(wrapped_at(100.5));
+        cell.settle(size(px(100.), px(10.)), px(1.));
+        assert_eq!(
+            cell.as_ref().and_then(|layout| layout.wrap_width),
+            Some(px(100.))
+        );
+        cell.settle(size(px(100.4), px(10.)), px(1.));
+        assert_eq!(
+            cell.as_ref().and_then(|layout| layout.wrap_width),
+            Some(px(100.5))
+        );
+        cell.settle(size(px(60.), px(10.)), px(1.));
+        assert_eq!(
+            cell.as_ref().and_then(|layout| layout.wrap_width),
+            Some(px(100.5)),
+            "a layout further off than the slack is never shown"
+        );
+    }
+
+    /// Shows one text and keeps the layout handle of the first frame that drew it, as a
+    /// tooltip's callback keeps the one of the frame that showed the tooltip.
+    #[derive(Default)]
+    struct Kept {
+        first: Option<TextLayout>,
+    }
+
+    impl crate::Render for Kept {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::{ParentElement as _, Styled as _, div};
+
+            let text = StyledText::new("a text drawn the same on every frame");
+            self.first.get_or_insert_with(|| text.layout().clone());
+            div().size_full().child(text)
+        }
+    }
+
+    #[crate::test]
+    fn an_earlier_frames_layout_stays_readable(cx: &mut crate::TestAppContext) {
+        use crate::{AppContext as _, point, px, size};
+
+        let window = cx.open_window(size(px(400.), px(100.)), |_, _| Kept::default());
+        let root = window.root(cx).expect("the window has a root");
+        let draw = |cx: &mut crate::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .expect("the window is open");
+        };
+        draw(cx);
+        let first = root.update(cx, |kept, _| kept.first.clone().expect("drawn once"));
+        let before = first.index_for_position(point(px(20.), px(5.)));
+        for _ in 0..2 {
+            root.update(cx, |_, cx| cx.notify());
+            draw(cx);
+        }
+        assert_eq!(first.index_for_position(point(px(20.), px(5.))), before);
     }
 }
