@@ -1314,6 +1314,12 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// How many frames this window has finished drawing. What a frame records is read back
+    /// only on the frame right after it, so a cached view stamps its recorded ranges with it.
+    pub(crate) drawn_frames: u64,
+    /// Cached views this frame replayed under another opacity than they painted with. They
+    /// render on the next frame, which is drawn for them.
+    pub(crate) faded_views: Vec<EntityId>,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2243,6 +2249,8 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            drawn_frames: 0,
+            faded_views: Vec::new(),
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -3596,6 +3604,14 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.drawn_frames += 1;
+        // Marked against the frame just drawn, whose dispatch tree holds their ancestors.
+        if !self.faded_views.is_empty() {
+            for view_id in mem::take(&mut self.faded_views) {
+                self.mark_view_dirty(view_id);
+            }
+            self.invalidator.set_dirty(true);
+        }
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;

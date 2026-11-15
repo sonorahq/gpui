@@ -8,7 +8,6 @@ use crate::{Empty, Window};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
-use std::mem;
 use std::{
     any::{TypeId, type_name},
     fmt,
@@ -323,6 +322,14 @@ impl<V: View> IntoElement for ViewElement<V> {
 struct ViewElementState {
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// The frame the ranges were recorded on, from [`Window::drawn_frames`]. They index the
+    /// frame drawn last only when that frame recorded them. A view whose cached ancestor was
+    /// replayed whole last frame was not visited then, so its ranges are older and it renders.
+    frame: u64,
+    /// The inherited opacity the view last painted under. Painting multiplies colours by it,
+    /// so a replay under another one shows the old colours, and the view renders next frame.
+    /// It is only known at paint, after prepaint chose to replay.
+    opacity: f32,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
 }
@@ -550,6 +557,7 @@ fn prepaint_view(
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && element_state.frame + 1 == window.drawn_frames
                 {
                     let prepaint_start = window.prepaint_index();
                     window.note_view_cache(true);
@@ -558,14 +566,16 @@ fn prepaint_view(
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();
                     element_state.prepaint_range = prepaint_start..prepaint_end;
+                    element_state.frame = window.drawn_frames;
 
                     return (None, element_state);
                 }
 
+                // A cached view nested in this one replays what it recorded last frame, which
+                // its frame stamp vouches for, so rendering this view leaves the others alone.
                 window.note_view_cache(false);
                 window.note_notified(entity_id, bounds);
                 window.note_repaint(entity_id, bounds);
-                let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
@@ -575,7 +585,6 @@ fn prepaint_view(
                 });
 
                 let prepaint_end = window.prepaint_index();
-                window.refreshing = refreshing;
 
                 (
                     Some(element),
@@ -583,6 +592,8 @@ fn prepaint_view(
                         accessed_entities,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
+                        frame: window.drawn_frames,
+                        opacity: window.element_opacity(),
                         cache_key: ViewElementCacheKey {
                             bounds,
                             content_mask,
@@ -626,13 +637,16 @@ fn paint_view(
                     let mut element_state = element_state.unwrap();
 
                     let paint_start = window.paint_index();
+                    let opacity = window.element_opacity();
 
                     if let Some(element) = element {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
                         element.paint(window, cx);
-                        window.refreshing = refreshing;
+                        element_state.opacity = opacity;
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());
+                        if element_state.opacity != opacity {
+                            window.faded_views.push(entity_id);
+                        }
                     }
 
                     let paint_end = window.paint_index();
@@ -657,4 +671,202 @@ fn paint_component(
     window.with_id(ElementId::Name(name.into()), |window| {
         element.as_mut().unwrap().paint(window, cx);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AppContext as _, Hsla, ParentElement as _, Styled as _, TestAppContext, WindowHandle, blue,
+        div, green, px, red, size, util::FluentBuilder as _,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    /// A box of one colour that counts how often it renders.
+    struct Leaf {
+        color: Hsla,
+        /// Draws a second box, which moves everything recorded after this view.
+        extra: bool,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Leaf {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .size_full()
+                .bg(self.color)
+                .when(self.extra, |this| this.child(div().size(px(5.)).bg(red())))
+        }
+    }
+
+    fn leaf(color: Hsla, cx: &mut App) -> Entity<Leaf> {
+        cx.new(|_| Leaf {
+            color,
+            extra: false,
+            renders: Rc::default(),
+        })
+    }
+
+    fn cached_box(width: f32) -> StyleRefinement {
+        StyleRefinement::default().w(px(width)).h(px(50.))
+    }
+
+    /// A cached view holding two cached leaves, as a screen holds its cards.
+    struct Pane {
+        leaves: [Entity<Leaf>; 2],
+        renders: usize,
+    }
+
+    impl Render for Pane {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            div().size_full().flex().children(
+                self.leaves
+                    .iter()
+                    .map(|leaf| leaf.clone().cached(cached_box(50.))),
+            )
+        }
+    }
+
+    /// The window root: a cached sibling drawn before the pane, and the pane under an opacity.
+    struct Shell {
+        before: Entity<Leaf>,
+        pane: Entity<Pane>,
+        opacity: f32,
+    }
+
+    impl Render for Shell {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .child(self.before.clone().cached(cached_box(50.)))
+                .child(
+                    div()
+                        .opacity(self.opacity)
+                        .child(self.pane.clone().cached(cached_box(100.))),
+                )
+        }
+    }
+
+    struct Drawn {
+        window: WindowHandle<Shell>,
+        shell: Entity<Shell>,
+        leaves: [Entity<Leaf>; 2],
+    }
+
+    impl Drawn {
+        fn open(cx: &mut TestAppContext) -> Self {
+            let window = cx.open_window(size(px(200.), px(50.)), |_, cx| {
+                let leaves = [leaf(blue(), cx), leaf(green(), cx)];
+                Shell {
+                    before: leaf(red(), cx),
+                    pane: cx.new(|_| Pane { leaves, renders: 0 }),
+                    opacity: 1.,
+                }
+            });
+            let shell = window.root(cx).expect("the window has a root");
+            let leaves = shell.read_with(cx, |shell, cx| shell.pane.read(cx).leaves.clone());
+            Self {
+                window,
+                shell,
+                leaves,
+            }
+        }
+
+        /// Where every quad of the frame drawn last lands, and in what colour. The test
+        /// platform draws a window as soon as a notify dirties it, as the real one does on its
+        /// next frame, so the frames a test makes are the ones its notifies ask for.
+        fn shown(&self, cx: &mut TestAppContext) -> Vec<String> {
+            cx.update_window(self.window.into(), |_, window, _| {
+                window
+                    .rendered_frame
+                    .scene
+                    .quads
+                    .iter()
+                    .map(|quad| format!("{:?} {:?}", quad.bounds, quad.background))
+                    .collect()
+            })
+            .expect("the window is open")
+        }
+
+        /// What the window shows once every view renders, which any frame has to match.
+        fn refreshed(&self, cx: &mut TestAppContext) -> Vec<String> {
+            cx.update_window(self.window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .expect("the window is open");
+            self.shown(cx)
+        }
+
+        fn renders(&self, cx: &mut TestAppContext) -> [usize; 2] {
+            self.leaves
+                .each_ref()
+                .map(|leaf| leaf.read_with(cx, |leaf, _| leaf.renders.get()))
+        }
+    }
+
+    #[crate::test]
+    fn a_rendered_cached_view_replays_the_cached_views_in_it(cx: &mut TestAppContext) {
+        let drawn = Drawn::open(cx);
+        for _ in 0..3 {
+            let before = drawn.renders(cx);
+            drawn.leaves[0].update(cx, |_, cx| cx.notify());
+            assert_eq!(
+                drawn.renders(cx),
+                [before[0] + 1, before[1]],
+                "only the leaf that notified renders, though the pane around both does"
+            );
+            assert_eq!(drawn.shown(cx), drawn.refreshed(cx));
+        }
+    }
+
+    #[crate::test]
+    fn a_cached_view_not_visited_last_frame_renders(cx: &mut TestAppContext) {
+        let drawn = Drawn::open(cx);
+
+        // The pane replays whole behind a sibling that now records more, so what the leaves
+        // recorded two frames ago no longer lines up with the frame drawn last.
+        let before = drawn.shell.read_with(cx, |shell, _| shell.before.clone());
+        before.update(cx, |leaf, cx| {
+            leaf.extra = true;
+            cx.notify();
+        });
+        let replayed = drawn.renders(cx);
+
+        drawn.leaves[0].update(cx, |_, cx| cx.notify());
+        assert_eq!(drawn.renders(cx), [replayed[0] + 1, replayed[1] + 1]);
+        assert_eq!(drawn.shown(cx), drawn.refreshed(cx));
+    }
+
+    #[crate::test]
+    fn a_cached_view_replayed_under_a_new_opacity_renders_on_the_next_frame(
+        cx: &mut TestAppContext,
+    ) {
+        let drawn = Drawn::open(cx);
+        let pane = drawn.shell.read_with(cx, |shell, _| shell.pane.clone());
+        let pane_renders = |cx: &mut TestAppContext| pane.read_with(cx, |pane, _| pane.renders);
+        let before = pane_renders(cx);
+
+        drawn.shell.update(cx, |shell, cx| {
+            shell.opacity = 0.5;
+            cx.notify();
+        });
+        // The pane replays on the frame the shell renders in, and asks for the next one.
+        cx.run_until_parked();
+        cx.update_window(drawn.window.into(), |_, window, cx| {
+            if window.invalidator.is_dirty() {
+                window.draw(cx).clear(cx);
+            }
+        })
+        .expect("the window is open");
+        assert_eq!(
+            pane_renders(cx),
+            before + 1,
+            "the pane renders under the new opacity"
+        );
+        assert_eq!(drawn.shown(cx), drawn.refreshed(cx));
+    }
 }
