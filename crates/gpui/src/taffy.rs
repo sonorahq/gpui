@@ -40,6 +40,12 @@ struct RetainedNode {
     id: LayoutId,
     /// The frame that last asked for the node. A node no request takes for a frame is released.
     claimed: u64,
+    /// [`layout_fingerprint`] of the style the node was last given. A request whose style
+    /// fingerprints the same leaves the node's style alone without reading it: a Taffy node is
+    /// over a kilobyte, and reading it to compare was most of what keeping it cost.
+    style: u64,
+    /// [`children_fingerprint`] of the children the node was last given, for the same reason.
+    children: u64,
     /// Whether the node measures itself.
     measured: bool,
     /// What the element that last measured the node left for the next one to compare itself
@@ -92,6 +98,9 @@ pub struct TaffyLayoutEngine {
     transient: Vec<LayoutId>,
     /// Counts frames, to tell the nodes this frame asked for from the ones it did not.
     frame: u64,
+    /// Nodes whose style [`Self::stretch_auto_size_to_fill`] rewrote, so the style Taffy holds
+    /// is not the one their fingerprint stands for, and a request compares them in full.
+    stretched: FxHashSet<LayoutId>,
     retain: bool,
     /// How many nodes the frame being drawn made or wrote to, which is what lays a tree out
     /// again. Tests read it to check that an unchanged frame leaves every node alone.
@@ -120,6 +129,7 @@ impl TaffyLayoutEngine {
             retained: FxHashMap::default(),
             transient: Vec::new(),
             frame: 0,
+            stretched: FxHashSet::default(),
             retain: *RETAIN,
             #[cfg(test)]
             writes: 0,
@@ -148,13 +158,14 @@ impl TaffyLayoutEngine {
     fn release_unclaimed(&mut self) {
         let frame = self.frame;
         let taffy = &mut self.taffy;
+        let stretched = &mut self.stretched;
         for id in self.transient.drain(..) {
-            Self::release(taffy, id);
+            Self::release(taffy, stretched, id);
         }
         self.retained.retain(|_, node| {
             let keep = node.claimed == frame;
             if !keep {
-                Self::release(taffy, node.id);
+                Self::release(taffy, stretched, node.id);
             }
             keep
         });
@@ -163,7 +174,12 @@ impl TaffyLayoutEngine {
 
     /// Removes a node. A parent that outlives it was laid out around it, so it is laid out
     /// again.
-    fn release(taffy: &mut TaffyTree<NodeContext>, id: LayoutId) {
+    fn release(
+        taffy: &mut TaffyTree<NodeContext>,
+        stretched: &mut FxHashSet<LayoutId>,
+        id: LayoutId,
+    ) {
+        stretched.remove(&id);
         if let Some(parent) = taffy.parent(id.0) {
             taffy.mark_dirty(parent).expect(EXPECT_MESSAGE);
         }
@@ -183,12 +199,15 @@ impl TaffyLayoutEngine {
     fn retained_layout(
         &mut self,
         key: Option<u64>,
-        style: taffy::style::Style,
+        fingerprint: u64,
+        style: impl Fn() -> taffy::style::Style,
         children: &[LayoutId],
         measured: Option<Measured>,
     ) -> LayoutId {
         let frame = self.frame;
         let taffy = &mut self.taffy;
+        let stretched = &self.stretched;
+        let children_print = children_fingerprint(children);
         let mut writes = 0;
 
         // The node, whether it was kept from an earlier frame, and the record a node with a key
@@ -197,41 +216,70 @@ impl TaffyLayoutEngine {
             Some(Entry::Occupied(entry)) if entry.get().claimed != frame => {
                 let node = entry.into_mut();
                 node.claimed = frame;
-                if *taffy.style(node.id.0).expect(EXPECT_MESSAGE) != style {
-                    taffy.set_style(node.id.0, style).expect(EXPECT_MESSAGE);
-                    writes += 1;
+                let same = node.style == fingerprint && !stretched.contains(&node.id);
+                debug_assert!(
+                    !same || *taffy.style(node.id.0).expect(EXPECT_MESSAGE) == style(),
+                    "a style that fingerprints the same converts to the same Taffy style"
+                );
+                if !same {
+                    let style = style();
+                    if *taffy.style(node.id.0).expect(EXPECT_MESSAGE) != style {
+                        taffy.set_style(node.id.0, style).expect(EXPECT_MESSAGE);
+                        writes += 1;
+                    }
+                    node.style = fingerprint;
                 }
                 (node.id, true, Some(node))
             }
             Some(Entry::Vacant(entry)) => {
-                let id = LayoutId::from(taffy.new_leaf(style).expect(EXPECT_MESSAGE));
+                let id = LayoutId::from(taffy.new_leaf(style()).expect(EXPECT_MESSAGE));
                 writes += 1;
                 let node = entry.insert(RetainedNode {
                     id,
                     claimed: frame,
+                    style: fingerprint,
+                    children: children_fingerprint(&[]),
                     measured: false,
                     memo: None,
                 });
                 (id, false, Some(node))
             }
             Some(Entry::Occupied(_)) | None => {
-                let id = LayoutId::from(taffy.new_leaf(style).expect(EXPECT_MESSAGE));
+                let id = LayoutId::from(taffy.new_leaf(style()).expect(EXPECT_MESSAGE));
                 writes += 1;
                 self.transient.push(id);
                 (id, false, None)
             }
         };
 
+        // A node's children change only through its own request, and a child only leaves a
+        // parent whose next request no longer lists it, so a fingerprint that matches the
+        // last request's matches the children Taffy holds.
+        let same_children = match &record {
+            Some(node) if kept && node.children == children_print => {
+                debug_assert!(
+                    taffy
+                        .child_ids(id.0)
+                        .eq(children.iter().map(|child| child.0)),
+                    "a node keeps the children its fingerprint stands for"
+                );
+                true
+            }
+            _ => taffy
+                .child_ids(id.0)
+                .eq(children.iter().map(|child| child.0)),
+        };
         // `set_children` takes a child away from the parent it had, which `new_with_children`
         // does not, and a kept child may come from any parent.
-        let same_children = taffy
-            .child_ids(id.0)
-            .eq(children.iter().map(|child| child.0));
         if !same_children {
             taffy
                 .set_children(id.0, LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE);
             writes += 1;
+        }
+        let mut record = record;
+        if let Some(node) = record.as_mut() {
+            node.children = children_print;
         }
 
         let was_measured = record.as_ref().is_some_and(|node| node.measured);
@@ -291,11 +339,22 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let snap = style.pixel_snap;
-        let taffy_style = style.to_taffy(rem_size, Grid::new(scale_factor, snap));
+        let grid = Grid::new(scale_factor, snap);
 
-        let id = if self.retain {
-            self.retained_layout(key, taffy_style, children, None)
-        } else if children.is_empty() {
+        if self.retain {
+            let fingerprint = layout_fingerprint(&style, rem_size, grid);
+            let id = self.retained_layout(
+                key,
+                fingerprint,
+                || style.to_taffy(rem_size, grid),
+                children,
+                None,
+            );
+            self.note_pixel_snap(id, snap);
+            return id;
+        }
+        let taffy_style = style.to_taffy(rem_size, grid);
+        let id = if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
                 .expect(EXPECT_MESSAGE)
@@ -328,11 +387,19 @@ impl TaffyLayoutEngine {
         measured: Measured,
     ) -> LayoutId {
         let snap = style.pixel_snap;
-        let taffy_style = style.to_taffy(rem_size, Grid::new(scale_factor, snap));
+        let grid = Grid::new(scale_factor, snap);
 
         let id = if self.retain {
-            self.retained_layout(key, taffy_style, &[], Some(measured))
+            let fingerprint = layout_fingerprint(&style, rem_size, grid);
+            self.retained_layout(
+                key,
+                fingerprint,
+                || style.to_taffy(rem_size, grid),
+                &[],
+                Some(measured),
+            )
         } else {
+            let taffy_style = style.to_taffy(rem_size, grid);
             #[cfg(feature = "stacker")]
             let measure = StackSafe::new(measured.measure);
             #[cfg(not(feature = "stacker"))]
@@ -374,6 +441,9 @@ impl TaffyLayoutEngine {
                 taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
         }
         self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+        if self.retain {
+            self.stretched.insert(id);
+        }
     }
 
     // Used to understand performance
@@ -700,6 +770,157 @@ fn border_widths_to_taffy(
         bottom: snap(&widths.bottom),
         left: snap(&widths.left),
     }
+}
+
+/// A hash of everything [`ToTaffy::to_taffy`] reads from a style, and of what it converts
+/// lengths with, so two styles that fingerprint the same convert to the same Taffy style. A
+/// field `to_taffy` comes to read has to be added here; the debug assertion in
+/// [`TaffyLayoutEngine::retained_layout`] catches one that is not.
+fn layout_fingerprint(style: &Style, rem_size: Pixels, grid: Grid) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    use std::mem::discriminant;
+
+    fn absolute(hasher: &mut collections::FxHasher, length: &AbsoluteLength) {
+        use std::hash::{Hash as _, Hasher as _};
+        match length {
+            AbsoluteLength::Pixels(pixels) => {
+                0u8.hash(hasher);
+                hasher.write_u32(pixels.0.to_bits());
+            }
+            AbsoluteLength::Rems(rems) => {
+                1u8.hash(hasher);
+                hasher.write_u32(rems.0.to_bits());
+            }
+        }
+    }
+    fn definite(hasher: &mut collections::FxHasher, length: &DefiniteLength) {
+        use std::hash::{Hash as _, Hasher as _};
+        match length {
+            DefiniteLength::Absolute(length) => {
+                0u8.hash(hasher);
+                absolute(hasher, length);
+            }
+            DefiniteLength::Fraction(fraction) => {
+                1u8.hash(hasher);
+                hasher.write_u32(fraction.to_bits());
+            }
+        }
+    }
+    fn length(hasher: &mut collections::FxHasher, length: &Length) {
+        use std::hash::Hash as _;
+        match length {
+            Length::Definite(length) => {
+                0u8.hash(hasher);
+                definite(hasher, length);
+            }
+            Length::Auto => 1u8.hash(hasher),
+        }
+    }
+    fn placement(hasher: &mut collections::FxHasher, placement: &crate::GridPlacement) {
+        use std::hash::Hash as _;
+        match placement {
+            crate::GridPlacement::Line(line) => (0u8, *line).hash(hasher),
+            crate::GridPlacement::Span(span) => (1u8, *span).hash(hasher),
+            crate::GridPlacement::Auto => 2u8.hash(hasher),
+        }
+    }
+
+    let mut hasher = collections::FxHasher::default();
+    let h = &mut hasher;
+    h.write_u32(rem_size.0.to_bits());
+    h.write_u32(grid.scale_factor.to_bits());
+    grid.snap.hash(h);
+
+    discriminant(&style.display).hash(h);
+    discriminant(&style.overflow.x).hash(h);
+    discriminant(&style.overflow.y).hash(h);
+    absolute(h, &style.scrollbar_width);
+    discriminant(&style.position).hash(h);
+    for edge in [
+        &style.inset.top,
+        &style.inset.right,
+        &style.inset.bottom,
+        &style.inset.left,
+    ] {
+        length(h, edge);
+    }
+    for size in [&style.size, &style.min_size, &style.max_size] {
+        length(h, &size.width);
+        length(h, &size.height);
+    }
+    style.aspect_ratio.map(f32::to_bits).hash(h);
+    for edge in [
+        &style.margin.top,
+        &style.margin.right,
+        &style.margin.bottom,
+        &style.margin.left,
+    ] {
+        length(h, edge);
+    }
+    for edge in [
+        &style.padding.top,
+        &style.padding.right,
+        &style.padding.bottom,
+        &style.padding.left,
+    ] {
+        definite(h, edge);
+    }
+    for edge in [
+        &style.border_widths.top,
+        &style.border_widths.right,
+        &style.border_widths.bottom,
+        &style.border_widths.left,
+    ] {
+        absolute(h, edge);
+    }
+    style.align_items.map(|value| discriminant(&value)).hash(h);
+    style.align_self.map(|value| discriminant(&value)).hash(h);
+    style
+        .align_content
+        .map(|value| discriminant(&value))
+        .hash(h);
+    style
+        .justify_content
+        .map(|value| discriminant(&value))
+        .hash(h);
+    definite(h, &style.gap.width);
+    definite(h, &style.gap.height);
+    discriminant(&style.flex_direction).hash(h);
+    discriminant(&style.flex_wrap).hash(h);
+    length(h, &style.flex_basis);
+    h.write_u32(style.flex_grow.to_bits());
+    h.write_u32(style.flex_shrink.to_bits());
+    for template in [&style.grid_rows, &style.grid_cols] {
+        template
+            .map(|template| (template.repeat, discriminant(&template.min_size)))
+            .hash(h);
+    }
+    match &style.grid_location {
+        Some(location) => {
+            1u8.hash(h);
+            for line in [
+                &location.row.start,
+                &location.row.end,
+                &location.column.start,
+                &location.column.end,
+            ] {
+                placement(h, line);
+            }
+        }
+        None => 0u8.hash(h),
+    }
+    hasher.finish()
+}
+
+/// A hash of a node's children in order.
+fn children_fingerprint(children: &[LayoutId]) -> u64 {
+    use std::hash::Hasher as _;
+    let mut hasher = collections::FxHasher::default();
+    hasher.write_usize(children.len());
+    for child in children {
+        hasher.write_u64(u64::from(child.0));
+    }
+    hasher.finish()
 }
 
 /// How authored lengths turn into device pixels: rounded onto the grid, or scaled with their
