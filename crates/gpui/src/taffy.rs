@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use collections::{FxHashMap, FxHashSet};
-use std::{fmt::Debug, ops::Range};
+use std::{any::Any, collections::hash_map::Entry, fmt::Debug, ops::Range, rc::Rc, sync::LazyLock};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -28,8 +28,75 @@ type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 struct NodeContext {
     measure: NodeMeasureFn,
 }
+
+/// Whether layout nodes are kept from one frame to the next. `GPUI_RETAINED_LAYOUT=0` turns it
+/// off, and every frame then builds and lays out its tree from nothing.
+static RETAIN: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("GPUI_RETAINED_LAYOUT").is_none_or(|value| value != "0"));
+
+/// A layout node kept from one frame to the next, so a frame that asks for the same style and
+/// children at the same place leaves it, and what Taffy cached for it, alone.
+struct RetainedNode {
+    id: LayoutId,
+    /// The frame that last asked for the node. A node no request takes for a frame is released.
+    claimed: u64,
+    /// Whether the node measures itself.
+    measured: bool,
+    /// What the element that last measured the node left for the next one to compare itself
+    /// against. See [`Window::retained_measure`].
+    memo: Option<Rc<dyn Any>>,
+}
+
+/// What a request passes for a node that measures itself.
+pub(crate) struct Measured {
+    measure: Box<MeasureFn>,
+    /// See [`RetainedNode::memo`].
+    memo: Option<Rc<dyn Any>>,
+    /// Whether the element vouches that it measures as the one that left the memo did, so a
+    /// node kept for it keeps what Taffy cached.
+    unchanged: bool,
+}
+
+impl Measured {
+    pub(crate) fn new(
+        measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut Window,
+            &mut App,
+        ) -> Size<Pixels>
+        + 'static,
+    ) -> Self {
+        Self {
+            measure: Box::new(measure),
+            memo: None,
+            unchanged: false,
+        }
+    }
+
+    /// Leaves `memo` with the node for the next frame, and when `unchanged` keeps what Taffy
+    /// cached for a node that held a memo before.
+    pub(crate) fn remembered(mut self, memo: Rc<dyn Any>, unchanged: bool) -> Self {
+        self.memo = Some(memo);
+        self.unchanged = unchanged;
+        self
+    }
+}
+
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
+    /// The nodes kept across frames, by the key of the place that asks for them.
+    retained: FxHashMap<u64, RetainedNode>,
+    /// Nodes made this frame for a request with no key, or whose key another request had
+    /// taken. They are released when the frame ends.
+    transient: Vec<LayoutId>,
+    /// Counts frames, to tell the nodes this frame asked for from the ones it did not.
+    frame: u64,
+    retain: bool,
+    /// How many nodes the frame being drawn made or wrote to, which is what lays a tree out
+    /// again. Tests read it to check that an unchanged frame leaves every node alone.
+    #[cfg(test)]
+    pub(crate) writes: usize,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
@@ -50,6 +117,12 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            retained: FxHashMap::default(),
+            transient: Vec::new(),
+            frame: 0,
+            retain: *RETAIN,
+            #[cfg(test)]
+            writes: 0,
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -60,7 +133,10 @@ impl TaffyLayoutEngine {
     }
 
     pub fn clear(&mut self) {
-        self.taffy.clear();
+        match self.retain {
+            true => self.release_unclaimed(),
+            false => self.taffy.clear(),
+        }
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
@@ -68,8 +144,147 @@ impl TaffyLayoutEngine {
         self.grid_shifts.clear();
     }
 
+    /// Releases every node no request took this frame, and starts the next frame.
+    fn release_unclaimed(&mut self) {
+        let frame = self.frame;
+        let taffy = &mut self.taffy;
+        for id in self.transient.drain(..) {
+            Self::release(taffy, id);
+        }
+        self.retained.retain(|_, node| {
+            let keep = node.claimed == frame;
+            if !keep {
+                Self::release(taffy, node.id);
+            }
+            keep
+        });
+        self.frame += 1;
+    }
+
+    /// Removes a node. A parent that outlives it was laid out around it, so it is laid out
+    /// again.
+    fn release(taffy: &mut TaffyTree<NodeContext>, id: LayoutId) {
+        if let Some(parent) = taffy.parent(id.0) {
+            taffy.mark_dirty(parent).expect(EXPECT_MESSAGE);
+        }
+        taffy.remove(id.0).expect(EXPECT_MESSAGE);
+    }
+
+    /// What the element that last measured the node kept under `key` left with it, while no
+    /// request has taken that node this frame.
+    pub(crate) fn retained_memo(&self, key: u64) -> Option<Rc<dyn Any>> {
+        let node = self.retained.get(&key)?;
+        (node.claimed != self.frame).then(|| node.memo.clone())?
+    }
+
+    /// The node for a request: the one kept under `key` with only what differs written to it,
+    /// or a new one. Taffy lays a node out again when its style, children or measure function
+    /// is written, so a request that matches the last frame's costs the comparison alone.
+    fn retained_layout(
+        &mut self,
+        key: Option<u64>,
+        style: taffy::style::Style,
+        children: &[LayoutId],
+        measured: Option<Measured>,
+    ) -> LayoutId {
+        let frame = self.frame;
+        let taffy = &mut self.taffy;
+        let mut writes = 0;
+
+        // The node, whether it was kept from an earlier frame, and the record a node with a key
+        // of its own is kept by.
+        let (id, kept, record) = match key.map(|key| self.retained.entry(key)) {
+            Some(Entry::Occupied(entry)) if entry.get().claimed != frame => {
+                let node = entry.into_mut();
+                node.claimed = frame;
+                if *taffy.style(node.id.0).expect(EXPECT_MESSAGE) != style {
+                    taffy.set_style(node.id.0, style).expect(EXPECT_MESSAGE);
+                    writes += 1;
+                }
+                (node.id, true, Some(node))
+            }
+            Some(Entry::Vacant(entry)) => {
+                let id = LayoutId::from(taffy.new_leaf(style).expect(EXPECT_MESSAGE));
+                writes += 1;
+                let node = entry.insert(RetainedNode {
+                    id,
+                    claimed: frame,
+                    measured: false,
+                    memo: None,
+                });
+                (id, false, Some(node))
+            }
+            Some(Entry::Occupied(_)) | None => {
+                let id = LayoutId::from(taffy.new_leaf(style).expect(EXPECT_MESSAGE));
+                writes += 1;
+                self.transient.push(id);
+                (id, false, None)
+            }
+        };
+
+        // `set_children` takes a child away from the parent it had, which `new_with_children`
+        // does not, and a kept child may come from any parent.
+        let same_children = taffy
+            .child_ids(id.0)
+            .eq(children.iter().map(|child| child.0));
+        if !same_children {
+            taffy
+                .set_children(id.0, LayoutId::to_taffy_slice(children))
+                .expect(EXPECT_MESSAGE);
+            writes += 1;
+        }
+
+        let was_measured = record.as_ref().is_some_and(|node| node.measured);
+        match measured {
+            Some(measured) => {
+                #[cfg(feature = "stacker")]
+                let measure = StackSafe::new(measured.measure);
+                #[cfg(not(feature = "stacker"))]
+                let measure = measured.measure;
+                let context = NodeContext { measure };
+                let unchanged = kept && was_measured && measured.unchanged;
+                if let Some(node) = record {
+                    node.measured = true;
+                    node.memo = measured.memo;
+                }
+                match unchanged {
+                    true => {
+                        *taffy
+                            .get_node_context_mut(id.0)
+                            .expect("a measured node keeps its context") = context;
+                    }
+                    false => {
+                        taffy
+                            .set_node_context(id.0, Some(context))
+                            .expect(EXPECT_MESSAGE);
+                        writes += 1;
+                    }
+                }
+            }
+            None if was_measured => {
+                if let Some(node) = record {
+                    node.measured = false;
+                    node.memo = None;
+                }
+                taffy.set_node_context(id.0, None).expect(EXPECT_MESSAGE);
+                writes += 1;
+            }
+            None => {}
+        }
+
+        #[cfg(test)]
+        {
+            self.writes += writes;
+        }
+        #[cfg(not(test))]
+        let _ = writes;
+        id
+    }
+
+    /// `key` names the place the request comes from, see [`crate::window::LayoutKeys`].
     pub fn request_layout(
         &mut self,
+        key: Option<u64>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
@@ -78,7 +293,9 @@ impl TaffyLayoutEngine {
         let snap = style.pixel_snap;
         let taffy_style = style.to_taffy(rem_size, Grid::new(scale_factor, snap));
 
-        let id = if children.is_empty() {
+        let id = if self.retain {
+            self.retained_layout(key, taffy_style, children, None)
+        } else if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
                 .expect(EXPECT_MESSAGE)
@@ -101,30 +318,30 @@ impl TaffyLayoutEngine {
         }
     }
 
-    pub fn request_measured_layout(
+    /// `key` names the place the request comes from, see [`crate::window::LayoutKeys`].
+    pub(crate) fn request_measured_layout(
         &mut self,
+        key: Option<u64>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
-        measure: impl FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
-        ) -> Size<Pixels>
-        + 'static,
+        measured: Measured,
     ) -> LayoutId {
         let snap = style.pixel_snap;
         let taffy_style = style.to_taffy(rem_size, Grid::new(scale_factor, snap));
-        let measure = Box::new(measure) as Box<MeasureFn>;
-        #[cfg(feature = "stacker")]
-        let measure = StackSafe::new(measure);
 
-        let id = self
-            .taffy
-            .new_leaf_with_context(taffy_style, NodeContext { measure })
-            .expect(EXPECT_MESSAGE)
-            .into();
+        let id = if self.retain {
+            self.retained_layout(key, taffy_style, &[], Some(measured))
+        } else {
+            #[cfg(feature = "stacker")]
+            let measure = StackSafe::new(measured.measure);
+            #[cfg(not(feature = "stacker"))]
+            let measure = measured.measure;
+            self.taffy
+                .new_leaf_with_context(taffy_style, NodeContext { measure })
+                .expect(EXPECT_MESSAGE)
+                .into()
+        };
         self.note_pixel_snap(id, snap);
         id
     }
@@ -224,6 +441,14 @@ impl TaffyLayoutEngine {
         //     println!("N{} --> N{}", u64::from(a), u64::from(b));
         // }
         //
+
+        // A kept node laid out as a root may have been a child on an earlier frame, and the
+        // parent it had then would place it.
+        if self.retain
+            && let Some(parent) = self.taffy.parent(id.0)
+        {
+            self.taffy.remove_child(parent, id.0).expect(EXPECT_MESSAGE);
+        }
 
         if !self.computed_layouts.insert(id) {
             let stack = &mut self.layout_bounds_scratch_space;
@@ -838,5 +1063,170 @@ mod tests {
             taffy_border.left,
             taffy::style::LengthPercentage::length(2.0)
         );
+    }
+
+    /// What a test window shows. Each field changes one thing a kept layout node has to
+    /// notice, and the test changes one field a frame, so nothing else lays the tree out again
+    /// and hides a change that went unnoticed.
+    #[derive(Clone, Copy, Default)]
+    struct Shown {
+        /// Widens the column the title wraps in.
+        wide: bool,
+        /// Swaps the title for a longer one.
+        long_title: bool,
+        /// Takes a box out of layout with `display: none`.
+        hidden: bool,
+        /// Adds a box without an id between the rows and the filler.
+        extra: bool,
+        /// Moves the window of rows on by one, so one row leaves and one arrives.
+        scrolled: bool,
+        /// Changes every row's text without changing its width class.
+        relabeled: bool,
+        /// Changes the colour of the text, which measures the same.
+        recolored: bool,
+    }
+
+    impl Shown {
+        const FIELDS: usize = 7;
+
+        fn flip(&mut self, field: usize) {
+            let field = match field {
+                0 => &mut self.wide,
+                1 => &mut self.long_title,
+                2 => &mut self.hidden,
+                3 => &mut self.extra,
+                4 => &mut self.scrolled,
+                5 => &mut self.relabeled,
+                _ => &mut self.recolored,
+            };
+            *field = !*field;
+        }
+    }
+
+    impl crate::Render for Shown {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::{
+                InteractiveElement as _, IntoElement as _, ParentElement as _, SharedString,
+                Styled as _, blue, div, green, px, red, util::FluentBuilder as _,
+            };
+
+            let title = match self.long_title {
+                true => "a title long enough to wrap onto more lines when its column narrows",
+                false => "a title",
+            };
+            let first_row = usize::from(self.scrolled);
+            let label = usize::from(self.relabeled);
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .when(self.recolored, |this| this.text_color(red()))
+                .child(
+                    div()
+                        .id("title")
+                        .w(px(if self.wide { 300. } else { 120. }))
+                        .bg(red())
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .when(self.hidden, |this| this.hidden())
+                        .h(px(30.))
+                        .bg(green())
+                        .child("hidden now and then"),
+                )
+                .children((first_row..first_row + 5).map(|row| {
+                    div()
+                        .id(("row", row))
+                        .h(px(20.))
+                        .flex()
+                        .gap_1()
+                        .child(div().w(px(10. + row as f32)).h_full().bg(blue()))
+                        .child(format!("row {row} labeled {label}"))
+                        .into_any_element()
+                }))
+                .children(self.extra.then(|| div().h(px(15.)).bg(red())))
+                .child(div().flex_1().bg(green()).child("fills what is left"))
+        }
+    }
+
+    /// Where every quad and glyph of the frame a window draws now lands.
+    fn painted(window: crate::AnyWindowHandle, cx: &mut crate::TestAppContext) -> Vec<String> {
+        use crate::AppContext as _;
+
+        cx.update_window(window, |_, window, cx| {
+            let arena_clear_needed = window.draw(cx);
+            let scene = &window.rendered_frame.scene;
+            let painted = scene
+                .quads
+                .iter()
+                .map(|quad| format!("quad {:?} {:?}", quad.bounds, quad.background))
+                .chain(scene.monochrome_sprites.iter().map(|sprite| {
+                    format!(
+                        "glyph {:?} {:?} {:?}",
+                        sprite.bounds, sprite.color, sprite.tile.tile_id
+                    )
+                }))
+                .collect();
+            arena_clear_needed.clear(cx);
+            painted
+        })
+        .expect("the window stays open while it is drawn")
+    }
+
+    #[crate::test]
+    fn kept_layout_nodes_lay_out_as_a_fresh_window_does(cx: &mut crate::TestAppContext) {
+        use crate::{AppContext as _, px, size};
+
+        let window_size = size(px(640.), px(480.));
+        let kept = cx.open_window(window_size, |_, _| Shown::default());
+        let root = kept.root(cx).expect("the window has a root");
+        let writes = |cx: &mut crate::TestAppContext| {
+            cx.update_window(kept.into(), |_, window, _| window.layout_writes())
+                .expect("the kept window is open")
+        };
+        painted(kept.into(), cx);
+        let mut written = writes(cx);
+        // Coprime with the field count, so every field is flipped on and off beside every
+        // setting of its neighbours.
+        for step in 0..Shown::FIELDS * 12 {
+            let field = step * 3 % Shown::FIELDS;
+            let shown = root.update(cx, |shown, cx| {
+                shown.flip(field);
+                cx.notify();
+                *shown
+            });
+            let fresh = cx.open_window(window_size, move |_, _| shown);
+            let expected = painted(fresh.into(), cx);
+            cx.update_window(fresh.into(), |_, window, _| window.remove_window())
+                .expect("the fresh window is open");
+            assert!(!expected.is_empty());
+            assert_eq!(
+                painted(kept.into(), cx),
+                expected,
+                "after flipping field {field} at step {step}"
+            );
+            assert!(
+                writes(cx) > written,
+                "flipping field {field} writes to the nodes it changes"
+            );
+            written = writes(cx);
+            assert_eq!(
+                painted(kept.into(), cx),
+                expected,
+                "drawn again at step {step}"
+            );
+            assert_eq!(
+                writes(cx),
+                written,
+                "a frame that changes nothing leaves every node alone, at step {step}"
+            );
+        }
     }
 }

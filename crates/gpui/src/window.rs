@@ -1021,7 +1021,7 @@ impl ElementIdStack {
     }
 
     /// The hash of the whole path on the stack.
-    fn hash(&self) -> u64 {
+    pub(crate) fn hash(&self) -> u64 {
         self.hashes
             .last()
             .copied()
@@ -1030,6 +1030,95 @@ impl ElementIdStack {
 
     pub(crate) fn global_id(&self) -> GlobalElementId {
         GlobalElementId::with_hash(&self.ids, self.hash())
+    }
+}
+
+/// Names every layout request of a frame by the place it is asked from, so that the request
+/// for the same place on a later frame finds the layout node this one made. A name is a hash of
+/// the path of elements whose `request_layout` is running: an element with an id is a step by
+/// that id, wherever it stands among its siblings, and one without by its position among the
+/// siblings that have none. Two requests that come to the same name are told apart by the
+/// layout engine, which keeps a node for the first only.
+#[derive(Default)]
+pub(crate) struct LayoutKeys {
+    /// One scope per element whose `request_layout` is running, innermost last.
+    scopes: Vec<LayoutKeyScope>,
+    /// The counts of what was asked for outside any element's `request_layout`, as an element
+    /// laid out as a root during prepaint is, by the id path it was asked under.
+    roots: FxHashMap<u64, LayoutKeyScope>,
+}
+
+#[derive(Default)]
+struct LayoutKeyScope {
+    key: u64,
+    /// How many elements without an id have entered under this scope.
+    children: u32,
+    /// How many nodes this scope's own element has asked for.
+    nodes: u32,
+}
+
+impl LayoutKeys {
+    const ROOT: u64 = 0x9e37_79b9_7f4a_7c15;
+    const BY_ID: u64 = 1;
+    const BY_POSITION: u64 = 2;
+    const OWN_NODE: u64 = 3;
+
+    fn mix(key: u64, kind: u64, value: u64) -> u64 {
+        const SEED: u64 = 0x517c_c1b7_2722_0a95;
+        let key = (key.rotate_left(5) ^ kind).wrapping_mul(SEED);
+        (key.rotate_left(5) ^ value).wrapping_mul(SEED)
+    }
+
+    /// The scope requests are counted in: the innermost element's, or the one of `id_path`
+    /// while no element is requesting layout.
+    fn scope(&mut self, id_path: u64) -> &mut LayoutKeyScope {
+        match self.scopes.is_empty() {
+            false => self.scopes.last_mut().unwrap(),
+            true => self.roots.entry(id_path).or_insert(LayoutKeyScope {
+                key: Self::mix(Self::ROOT, Self::BY_ID, id_path),
+                ..LayoutKeyScope::default()
+            }),
+        }
+    }
+
+    /// Opens the scope of an element about to request its layout. `id` is the hash of its
+    /// global id when it has one, and `id_path` the hash of the id path around it.
+    pub(crate) fn enter(&mut self, id: Option<u64>, id_path: u64) {
+        let scope = self.scope(id_path);
+        let key = match id {
+            Some(id) => Self::mix(scope.key, Self::BY_ID, id),
+            None => {
+                scope.children += 1;
+                Self::mix(scope.key, Self::BY_POSITION, u64::from(scope.children))
+            }
+        };
+        self.scopes.push(LayoutKeyScope {
+            key,
+            ..LayoutKeyScope::default()
+        });
+    }
+
+    /// Closes the scope [`Self::enter`] opened.
+    pub(crate) fn exit(&mut self) {
+        self.scopes.pop();
+    }
+
+    /// The name of the next node the current scope asks for.
+    fn peek(&mut self, id_path: u64) -> u64 {
+        let scope = self.scope(id_path);
+        Self::mix(scope.key, Self::OWN_NODE, u64::from(scope.nodes))
+    }
+
+    /// The name of the node the current scope asks for now.
+    fn take(&mut self, id_path: u64) -> u64 {
+        let key = self.peek(id_path);
+        self.scope(id_path).nodes += 1;
+        key
+    }
+
+    fn clear(&mut self) {
+        self.scopes.clear();
+        self.roots.clear();
     }
 }
 
@@ -1255,6 +1344,7 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
+    pub(crate) layout_keys: LayoutKeys,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: ElementIdStack,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -2195,6 +2285,7 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
+            layout_keys: LayoutKeys::default(),
             root: None,
             element_id_stack: ElementIdStack::default(),
             text_style_stack: Vec::new(),
@@ -3588,6 +3679,7 @@ impl Window {
         }
 
         self.layout_engine.as_mut().unwrap().clear();
+        self.layout_keys.clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
@@ -5661,8 +5753,10 @@ impl Window {
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        let key = self.layout_keys.take(self.element_id_stack.hash());
 
         self.layout_engine.as_mut().unwrap().request_layout(
+            Some(key),
             style,
             rem_size,
             scale_factor,
@@ -5683,14 +5777,41 @@ impl Window {
         F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
             + 'static,
     {
+        self.request_measured(style, crate::taffy::Measured::new(measure))
+    }
+
+    /// How many layout nodes have been made or written to. See [`TaffyLayoutEngine::writes`].
+    #[cfg(test)]
+    pub(crate) fn layout_writes(&self) -> usize {
+        self.layout_engine
+            .as_ref()
+            .map_or(0, |engine| engine.writes)
+    }
+
+    /// What the element that measured the node at the place the next request names left with
+    /// it on an earlier frame. An element that finds it measures as that one did moves over
+    /// what the measuring produced and asks with [`crate::taffy::Measured::remembered`], and
+    /// the node is then not measured again while what is around it lays it out as before.
+    pub(crate) fn retained_measure(&mut self) -> Option<Rc<dyn Any>> {
+        let key = self.layout_keys.peek(self.element_id_stack.hash());
+        self.layout_engine.as_ref()?.retained_memo(key)
+    }
+
+    /// [`Self::request_measured_layout`] for an element that may leave a memo with the node.
+    pub(crate) fn request_measured(
+        &mut self,
+        style: Style,
+        measured: crate::taffy::Measured,
+    ) -> LayoutId {
         self.invalidator.debug_assert_prepaint();
 
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        let key = self.layout_keys.take(self.element_id_stack.hash());
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(Some(key), style, rem_size, scale_factor, measured)
     }
 
     /// Compute the layout for the given id within the given available space.

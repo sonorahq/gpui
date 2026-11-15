@@ -359,10 +359,14 @@ impl<E: Element> Drawable<E> {
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
+                let id_path = window.element_id_stack.hash();
                 let global_id = self
                     .element
                     .id()
                     .map(|element_id| prepare_element_id(element_id, window));
+                window
+                    .layout_keys
+                    .enter(global_id.as_ref().map(|id| id.hash), id_path);
 
                 let inspector_id;
                 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -386,6 +390,7 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
+                window.layout_keys.exit();
 
                 if global_id.is_some() {
                     window.element_id_stack.pop();
