@@ -846,11 +846,10 @@ impl LineLayoutCache {
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
-            apply_letter_spacing(&mut layout, runs);
-
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
             }
+            apply_letter_spacing(&mut layout, runs);
 
             let key = Arc::new(CacheKey {
                 text,
@@ -998,11 +997,10 @@ impl LineLayoutCache {
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
-        apply_letter_spacing(&mut layout, runs);
-
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
         }
+        apply_letter_spacing(&mut layout, runs);
 
         let key = Arc::new(HashedCacheKey {
             text_hash,
@@ -1078,8 +1076,9 @@ pub struct FontRun {
     pub letter_spacing: LetterSpacing,
 }
 
-/// Moves each glyph along by the letter spacing of the characters before it, and
-/// widens the line by all of it. A cluster shaped into one glyph is spaced once.
+/// Moves each glyph along by the letter spacing of the characters drawn to its left, and
+/// widens the line by all of it. It walks the line in visual order, so right-to-left text
+/// spreads apart as left-to-right text does. A cluster shaped into one glyph is spaced once.
 fn apply_letter_spacing(layout: &mut LineLayout, runs: &[FontRun]) {
     if runs.iter().all(|run| run.letter_spacing.0 == 0.) {
         return;
@@ -1095,12 +1094,26 @@ fn apply_letter_spacing(layout: &mut LineLayout, runs: &[FontRun]) {
             .find(|(end, _)| index < *end)
             .map_or(Pixels::ZERO, |(_, spacing)| *spacing)
     };
+    // Where each cluster starts on screen, so the glyphs of one cluster stay together even
+    // when a mark is drawn a little left of its base.
+    let mut cluster_x = FxHashMap::<usize, Pixels>::default();
+    for glyph in layout.runs.iter().flat_map(|run| &run.glyphs) {
+        cluster_x
+            .entry(glyph.index)
+            .and_modify(|x| *x = (*x).min(glyph.position.x))
+            .or_insert(glyph.position.x);
+    }
     let mut glyphs: Vec<&mut ShapedGlyph> = layout
         .runs
         .iter_mut()
         .flat_map(|run| run.glyphs.iter_mut())
         .collect();
-    glyphs.sort_by_key(|glyph| glyph.index);
+    glyphs.sort_by(|a, b| {
+        cluster_x[&a.index]
+            .partial_cmp(&cluster_x[&b.index])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.index.cmp(&b.index))
+    });
     let mut offset = Pixels::ZERO;
     let mut previous = None;
     for glyph in glyphs {
@@ -1576,6 +1589,17 @@ mod tests {
 
         assert_eq!(glyph_x_positions(&layout), vec![0., 12., 24.]);
         assert_eq!(layout.width, px(108.));
+    }
+
+    #[test]
+    fn test_letter_spacing_spreads_right_to_left_text() {
+        // Right-to-left: the first character is drawn rightmost. 0.5em is 8px.
+        let mut layout = make_layout(vec![glyph_at(16., 0), glyph_at(8., 1), glyph_at(0., 2)]);
+
+        apply_letter_spacing(&mut layout, &[run(3, 0.5)]);
+
+        assert_eq!(glyph_x_positions(&layout), vec![32., 16., 0.]);
+        assert_eq!(layout.width, px(124.));
     }
 
     #[test]
