@@ -333,6 +333,10 @@ impl WindowFrameSource {
         Ok(())
     }
 
+    pub fn is_running(&self) -> bool {
+        self.registration.is_some()
+    }
+
     pub fn take_signal(&self) -> Option<(Instant, FrameRequestSource)> {
         self.signal.take()
     }
