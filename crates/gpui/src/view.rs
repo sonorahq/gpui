@@ -326,6 +326,10 @@ struct ViewElementState {
     /// frame drawn last only when that frame recorded them. A view whose cached ancestor was
     /// replayed whole last frame was not visited then, so its ranges are older and it renders.
     frame: u64,
+    /// The frame `paint_range` was recorded on, `None` before the view first paints. A view can
+    /// prepaint on a frame that does not paint it, which leaves its paint range older than its
+    /// prepaint range, so a replay needs both from the frame drawn last.
+    painted: Option<u64>,
     /// The inherited opacity the view last painted under. Painting multiplies colours by it,
     /// so a replay under another one shows the old colours, and the view renders next frame.
     /// It is only known at paint, after prepaint chose to replay.
@@ -338,6 +342,8 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    /// What a rem is inside the view, which a parent can change without moving its bounds.
+    rem_size: Pixels,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -550,14 +556,22 @@ fn prepaint_view(
             |element_state, window| {
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
+                let rem_size = window.rem_size();
+                let last_frame = |frame: u64| frame + 1 == window.drawn_frames;
 
+                // A replay does not restore the accessibility nodes the view's elements push
+                // while they prepaint, and the tree is built anew each frame, so a screen reader
+                // would lose the view.
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
+                    && element_state.cache_key.rem_size == rem_size
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
-                    && element_state.frame + 1 == window.drawn_frames
+                    && !window.a11y.is_active()
+                    && last_frame(element_state.frame)
+                    && element_state.painted.is_some_and(last_frame)
                 {
                     let prepaint_start = window.prepaint_index();
                     window.note_view_cache(true);
@@ -593,11 +607,13 @@ fn prepaint_view(
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         frame: window.drawn_frames,
+                        painted: None,
                         opacity: window.element_opacity(),
                         cache_key: ViewElementCacheKey {
                             bounds,
                             content_mask,
                             text_style,
+                            rem_size,
                         },
                     },
                 )
@@ -651,6 +667,7 @@ fn paint_view(
 
                     let paint_end = window.paint_index();
                     element_state.paint_range = paint_start..paint_end;
+                    element_state.painted = Some(window.drawn_frames);
 
                     ((), element_state)
                 },
@@ -677,8 +694,8 @@ fn paint_component(
 mod tests {
     use super::*;
     use crate::{
-        AppContext as _, Hsla, ParentElement as _, Styled as _, TestAppContext, WindowHandle, blue,
-        div, green, px, red, size, util::FluentBuilder as _,
+        AppContext as _, Hsla, InspectorElementId, ParentElement as _, Styled as _, TestAppContext,
+        WindowHandle, blue, div, green, px, red, rems, size, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -696,7 +713,80 @@ mod tests {
             div()
                 .size_full()
                 .bg(self.color)
+                .child(div().w(rems(1.)).h(px(2.)).bg(red()))
                 .when(self.extra, |this| this.child(div().size(px(5.)).bg(red())))
+        }
+    }
+
+    /// Lays its child out and prepaints it under `rem_size`, and paints it only while not
+    /// `hidden`, as an element that measures what it may not show does.
+    struct Veil {
+        child: AnyElement,
+        hidden: bool,
+        rem_size: Option<Pixels>,
+    }
+
+    impl Element for Veil {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            let child = &mut self.child;
+            let layout_id =
+                window.with_rem_size(self.rem_size, |window| child.request_layout(window, cx));
+            (layout_id, ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            let child = &mut self.child;
+            window.with_rem_size(self.rem_size, |window| child.prepaint(window, cx));
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            if self.hidden {
+                return;
+            }
+            let child = &mut self.child;
+            window.with_rem_size(self.rem_size, |window| child.paint(window, cx));
+        }
+    }
+
+    impl IntoElement for Veil {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
         }
     }
 
@@ -734,19 +824,25 @@ mod tests {
         before: Entity<Leaf>,
         pane: Entity<Pane>,
         opacity: f32,
+        /// Prepaints the pane without painting it.
+        hidden: bool,
+        rem_size: Option<Pixels>,
     }
 
     impl Render for Shell {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let pane = div()
+                .opacity(self.opacity)
+                .child(self.pane.clone().cached(cached_box(100.)));
             div()
                 .size_full()
                 .flex()
                 .child(self.before.clone().cached(cached_box(50.)))
-                .child(
-                    div()
-                        .opacity(self.opacity)
-                        .child(self.pane.clone().cached(cached_box(100.))),
-                )
+                .child(Veil {
+                    child: pane.into_any_element(),
+                    hidden: self.hidden,
+                    rem_size: self.rem_size,
+                })
         }
     }
 
@@ -764,6 +860,8 @@ mod tests {
                     before: leaf(red(), cx),
                     pane: cx.new(|_| Pane { leaves, renders: 0 }),
                     opacity: 1.,
+                    hidden: false,
+                    rem_size: None,
                 }
             });
             let shell = window.root(cx).expect("the window has a root");
@@ -868,5 +966,34 @@ mod tests {
             "the pane renders under the new opacity"
         );
         assert_eq!(drawn.shown(cx), drawn.refreshed(cx));
+    }
+
+    #[crate::test]
+    fn a_cached_view_prepainted_without_painting_renders_when_shown_again(cx: &mut TestAppContext) {
+        let drawn = Drawn::open(cx);
+        let veil = |hidden: bool, cx: &mut TestAppContext| {
+            drawn.shell.update(cx, |shell, cx| {
+                shell.hidden = hidden;
+                cx.notify();
+            });
+        };
+        // The pane prepaints on the hidden frame, so its prepaint range is new, but its paint
+        // range is still the one the frame before recorded.
+        veil(true, cx);
+        veil(false, cx);
+        assert_eq!(drawn.shown(cx), drawn.refreshed(cx));
+    }
+
+    #[crate::test]
+    fn a_cached_view_under_a_new_rem_size_renders(cx: &mut TestAppContext) {
+        let drawn = Drawn::open(cx);
+        let shown = drawn.shown(cx);
+        drawn.shell.update(cx, |shell, cx| {
+            shell.rem_size = Some(px(32.));
+            cx.notify();
+        });
+        let resized = drawn.shown(cx);
+        assert_ne!(resized, shown, "a rem wide box inside the pane grows");
+        assert_eq!(resized, drawn.refreshed(cx));
     }
 }
