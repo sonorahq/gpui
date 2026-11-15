@@ -191,6 +191,9 @@ impl TaffyLayoutEngine {
         if let Some(parent) = taffy.parent(id.0) {
             taffy.mark_dirty(parent).expect(EXPECT_MESSAGE);
         }
+        // Taffy keeps a removed node's context until its slot is reused, and a measured one
+        // holds its measure function and the text layouts it captured.
+        taffy.set_node_context(id.0, None).expect(EXPECT_MESSAGE);
         taffy.remove(id.0).expect(EXPECT_MESSAGE);
     }
 
@@ -290,6 +293,18 @@ impl TaffyLayoutEngine {
         // `set_children` takes a child away from the parent it had, which `new_with_children`
         // does not, and a kept child may come from any parent.
         if !same_children {
+            // A child that was a stretched root last frame still holds the stretch, which its
+            // request left in place on the bet that it would stay a root.
+            if !stretched.is_empty() {
+                for child in children {
+                    if let Some(axes) = stretched.remove(child) {
+                        let style =
+                            unstretched(taffy.style(child.0).expect(EXPECT_MESSAGE), Some(&axes));
+                        taffy.set_style(child.0, style).expect(EXPECT_MESSAGE);
+                        writes += 1;
+                    }
+                }
+            }
             taffy
                 .set_children(id.0, LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE);
@@ -1527,6 +1542,38 @@ mod tests {
                     engine.taffy.children(parent.0).expect(EXPECT_MESSAGE),
                     [child.0],
                     "the parent lists its child again"
+                );
+            })
+            .expect("the window is open");
+    }
+
+    #[crate::test]
+    fn a_stretched_root_turned_child_gets_back_its_auto_size(cx: &mut crate::TestAppContext) {
+        use crate::{px, size};
+
+        let window = cx.open_window(size(px(100.), px(100.)), |_, _| Shown::default());
+        window
+            .update(cx, |_, window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                engine.retain = true;
+                let space = size(px(100.), px(100.)).into();
+
+                let root = engine.request_layout(Some(1), Style::default(), px(16.), 1., &[]);
+                engine.stretch_auto_size_to_fill(root, size(px(100.), px(100.)), 1.);
+                engine.compute_layout(root, space, window, cx);
+                engine.clear();
+
+                let child = engine.request_layout(Some(1), Style::default(), px(16.), 1., &[]);
+                assert_eq!(child, root, "the node is kept");
+                let mut parent_style = Style::default();
+                parent_style.size = size(px(50.).into(), px(50.).into());
+                let parent = engine.request_layout(Some(2), parent_style, px(16.), 1., &[child]);
+                engine.compute_layout(parent, space, window, cx);
+                let fresh = Style::default().to_taffy(px(16.), Grid::new(1., None));
+                assert_eq!(
+                    engine.taffy.style(child.0).expect(EXPECT_MESSAGE).size,
+                    fresh.size,
+                    "the child is laid out with the size it asked for"
                 );
             })
             .expect("the window is open");
