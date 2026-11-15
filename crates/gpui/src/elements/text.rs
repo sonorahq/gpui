@@ -658,33 +658,53 @@ impl TextLayoutCell {
         let Some(index) = self.spares.iter().position(wanted) else {
             return false;
         };
+        self.show_spare_at(index);
+        true
+    }
+
+    /// Shows the spare at `index`, keeping the one shown before as a spare.
+    fn show_spare_at(&mut self, index: usize) {
         let spare = self.spares.swap_remove(index);
         if let Some(previous) = self.current.replace(spare) {
             self.spares.push(previous);
         }
-        true
     }
 
-    /// Shows the layout measured for a text that ended up `size` large, when the one shown was
+    /// Shows the layout measured closest to the size a text ended up, when the one shown was
     /// measured for another. `slack` is how far a size may be off, which is what snapping an
-    /// edge to a device pixel moves it by.
+    /// edge to a device pixel moves it by. A layout further off than that is never shown.
     fn settle(&mut self, size: Size<Pixels>, slack: Pixels) {
-        let near = |a: Pixels, b: Pixels| (a - b).abs() <= slack;
-        let fits = |layout: &TextLayoutInner| {
-            layout
-                .wrap_width
-                .is_some_and(|width| near(width, size.width))
-                || layout
-                    .truncate_width
-                    .is_some_and(|width| near(width, size.width))
-                || layout.size.is_some_and(|measured| {
-                    near(measured.width, size.width) && near(measured.height, size.height)
-                })
+        // How far the width a layout was wrapped or cut at, or the size it came out, is from
+        // `size`, whichever is nearest.
+        let off = |layout: &TextLayoutInner| {
+            let width_off = |width: Pixels| (width - size.width).abs();
+            [
+                layout.wrap_width.map(width_off),
+                layout.truncate_width.map(width_off),
+                layout.size.map(|measured| {
+                    width_off(measured.width).max((measured.height - size.height).abs())
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|off| *off <= slack)
+            .reduce(Pixels::min)
         };
-        if self.current.as_ref().is_some_and(fits) {
-            return;
+        let shown = self.current.as_ref().and_then(off);
+        let closest = self
+            .spares
+            .iter()
+            .enumerate()
+            .filter_map(|(index, spare)| Some((index, off(spare)?)))
+            .reduce(|a, b| match b.1 < a.1 {
+                true => b,
+                false => a,
+            });
+        if let Some((index, spare_off)) = closest
+            && shown.is_none_or(|shown| spare_off < shown)
+        {
+            self.show_spare_at(index);
         }
-        self.show_spare(fits);
     }
 }
 
@@ -725,6 +745,7 @@ enum TextPaintPass {
     Foreground,
 }
 
+#[derive(Clone)]
 struct TextLayoutInner {
     len: usize,
     lines: SmallVec<[WrappedLine; 1]>,
@@ -778,8 +799,14 @@ impl TextLayout {
             .filter(|earlier| earlier.measures_as(&memo))
             .map(|earlier| {
                 if !Rc::ptr_eq(&earlier.layout.0, &self.0) {
-                    let layouts = mem::take(&mut *earlier.layout.0.borrow_mut());
-                    *self.0.borrow_mut() = layouts;
+                    let mut earlier = earlier.layout.0.borrow_mut();
+                    // A handle the earlier frame gave out, as a visible tooltip's callback
+                    // holds, still reads the layout that frame showed.
+                    let shown = TextLayoutCell {
+                        current: earlier.current.clone(),
+                        spares: SmallVec::new(),
+                    };
+                    *self.0.borrow_mut() = mem::replace(&mut *earlier, shown);
                 }
             })
             .is_some();
@@ -1527,5 +1554,83 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+
+    #[test]
+    fn settling_shows_the_layout_measured_closest_to_the_bounds() {
+        use crate::size;
+
+        let wrapped_at = |width: f32| TextLayoutInner {
+            len: 0,
+            lines: SmallVec::new(),
+            line_height: px(10.),
+            wrap_width: Some(px(width)),
+            truncate_width: None,
+            size: Some(size(px(width), px(10.))),
+            bounds: None,
+        };
+        let mut cell = TextLayoutCell::default();
+        cell.show(wrapped_at(100.));
+        cell.show(wrapped_at(80.));
+        cell.show(wrapped_at(100.5));
+        cell.settle(size(px(100.), px(10.)), px(1.));
+        assert_eq!(
+            cell.as_ref().and_then(|layout| layout.wrap_width),
+            Some(px(100.))
+        );
+        cell.settle(size(px(100.4), px(10.)), px(1.));
+        assert_eq!(
+            cell.as_ref().and_then(|layout| layout.wrap_width),
+            Some(px(100.5))
+        );
+        cell.settle(size(px(60.), px(10.)), px(1.));
+        assert_eq!(
+            cell.as_ref().and_then(|layout| layout.wrap_width),
+            Some(px(100.5)),
+            "a layout further off than the slack is never shown"
+        );
+    }
+
+    /// Shows one text and keeps the layout handle of the first frame that drew it, as a
+    /// tooltip's callback keeps the one of the frame that showed the tooltip.
+    #[derive(Default)]
+    struct Kept {
+        first: Option<TextLayout>,
+    }
+
+    impl crate::Render for Kept {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::{ParentElement as _, Styled as _, div};
+
+            let text = StyledText::new("a text drawn the same on every frame");
+            self.first.get_or_insert_with(|| text.layout().clone());
+            div().size_full().child(text)
+        }
+    }
+
+    #[crate::test]
+    fn an_earlier_frames_layout_stays_readable(cx: &mut crate::TestAppContext) {
+        use crate::{AppContext as _, point, px, size};
+
+        let window = cx.open_window(size(px(400.), px(100.)), |_, _| Kept::default());
+        let root = window.root(cx).expect("the window has a root");
+        let draw = |cx: &mut crate::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .expect("the window is open");
+        };
+        draw(cx);
+        let first = root.update(cx, |kept, _| kept.first.clone().expect("drawn once"));
+        let before = first.index_for_position(point(px(20.), px(5.)));
+        for _ in 0..2 {
+            root.update(cx, |_, cx| cx.notify());
+            draw(cx);
+        }
+        assert_eq!(first.index_for_position(point(px(20.), px(5.))), before);
     }
 }

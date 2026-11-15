@@ -442,7 +442,7 @@ impl LineLayout {
 }
 
 /// A line of text that has been shaped, decorated, and wrapped by the text layout system.
-#[derive(Default, Debug, Deref, DerefMut)]
+#[derive(Clone, Default, Debug, Deref, DerefMut)]
 pub struct WrappedLine {
     #[deref]
     #[deref_mut]

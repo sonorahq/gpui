@@ -98,9 +98,13 @@ pub struct TaffyLayoutEngine {
     transient: Vec<LayoutId>,
     /// Counts frames, to tell the nodes this frame asked for from the ones it did not.
     frame: u64,
-    /// Nodes whose style [`Self::stretch_auto_size_to_fill`] rewrote, so the style Taffy holds
-    /// is not the one their fingerprint stands for, and a request compares them in full.
-    stretched: FxHashSet<LayoutId>,
+    /// Nodes whose style [`Self::stretch_auto_size_to_fill`] rewrote, with the axes it
+    /// stretched. Taffy holds the stretched style, which a request whose fingerprint matches
+    /// leaves in place, so a window root that keeps its size is not written to twice a frame.
+    stretched: FxHashMap<LayoutId, Size<bool>>,
+    /// Kept nodes that lost a child outside their own request, when [`Self::compute_layout`]
+    /// laid that child out as a root, so their children fingerprint no longer holds.
+    uprooted: FxHashSet<LayoutId>,
     retain: bool,
     /// How many nodes the frame being drawn made or wrote to, which is what lays a tree out
     /// again. Tests read it to check that an unchanged frame leaves every node alone.
@@ -129,7 +133,8 @@ impl TaffyLayoutEngine {
             retained: FxHashMap::default(),
             transient: Vec::new(),
             frame: 0,
-            stretched: FxHashSet::default(),
+            stretched: FxHashMap::default(),
+            uprooted: FxHashSet::default(),
             retain: *RETAIN,
             #[cfg(test)]
             writes: 0,
@@ -159,13 +164,14 @@ impl TaffyLayoutEngine {
         let frame = self.frame;
         let taffy = &mut self.taffy;
         let stretched = &mut self.stretched;
+        let uprooted = &mut self.uprooted;
         for id in self.transient.drain(..) {
-            Self::release(taffy, stretched, id);
+            Self::release(taffy, stretched, uprooted, id);
         }
         self.retained.retain(|_, node| {
             let keep = node.claimed == frame;
             if !keep {
-                Self::release(taffy, stretched, node.id);
+                Self::release(taffy, stretched, uprooted, node.id);
             }
             keep
         });
@@ -176,10 +182,12 @@ impl TaffyLayoutEngine {
     /// again.
     fn release(
         taffy: &mut TaffyTree<NodeContext>,
-        stretched: &mut FxHashSet<LayoutId>,
+        stretched: &mut FxHashMap<LayoutId, Size<bool>>,
+        uprooted: &mut FxHashSet<LayoutId>,
         id: LayoutId,
     ) {
         stretched.remove(&id);
+        uprooted.remove(&id);
         if let Some(parent) = taffy.parent(id.0) {
             taffy.mark_dirty(parent).expect(EXPECT_MESSAGE);
         }
@@ -206,7 +214,7 @@ impl TaffyLayoutEngine {
     ) -> LayoutId {
         let frame = self.frame;
         let taffy = &mut self.taffy;
-        let stretched = &self.stretched;
+        let stretched = &mut self.stretched;
         let children_print = children_fingerprint(children);
         let mut writes = 0;
 
@@ -216,12 +224,18 @@ impl TaffyLayoutEngine {
             Some(Entry::Occupied(entry)) if entry.get().claimed != frame => {
                 let node = entry.into_mut();
                 node.claimed = frame;
-                let same = node.style == fingerprint && !stretched.contains(&node.id);
+                let same = node.style == fingerprint;
                 debug_assert!(
-                    !same || *taffy.style(node.id.0).expect(EXPECT_MESSAGE) == style(),
+                    !same
+                        || unstretched(
+                            taffy.style(node.id.0).expect(EXPECT_MESSAGE),
+                            stretched.get(&node.id)
+                        ) == style(),
                     "a style that fingerprints the same converts to the same Taffy style"
                 );
                 if !same {
+                    // The stretch is made again from the new style, if the node is still a root.
+                    stretched.remove(&node.id);
                     let style = style();
                     if *taffy.style(node.id.0).expect(EXPECT_MESSAGE) != style {
                         taffy.set_style(node.id.0, style).expect(EXPECT_MESSAGE);
@@ -252,11 +266,13 @@ impl TaffyLayoutEngine {
             }
         };
 
-        // A node's children change only through its own request, and a child only leaves a
-        // parent whose next request no longer lists it, so a fingerprint that matches the
-        // last request's matches the children Taffy holds.
+        // A node's children change only through its own request, a child only leaves a parent
+        // whose next request no longer lists it, and a parent a root was taken from is
+        // compared in full, so a fingerprint that matches the last request's matches the
+        // children Taffy holds.
+        let uprooted = self.uprooted.remove(&id);
         let same_children = match &record {
-            Some(node) if kept && node.children == children_print => {
+            Some(node) if kept && !uprooted && node.children == children_print => {
                 debug_assert!(
                     taffy
                         .child_ids(id.0)
@@ -425,24 +441,33 @@ impl TaffyLayoutEngine {
         size: Size<Pixels>,
         scale_factor: f32,
     ) {
-        let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
-        let stretch_width = style.size.width.is_auto();
-        let stretch_height = style.size.height.is_auto();
-        if !stretch_width && !stretch_height {
+        let current = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
+        // A kept root still holds last frame's stretch, so its authored axes are remembered.
+        let axes = self.stretched.get(&id).copied().unwrap_or(Size {
+            width: current.size.width.is_auto(),
+            height: current.size.height.is_auto(),
+        });
+        if !axes.width && !axes.height {
             return;
         }
-        let mut style = style.clone();
-        if stretch_width {
+        let mut style = current.clone();
+        if axes.width {
             style.size.width =
                 taffy::style::Dimension::length(round_to_device_pixel(size.width.0, scale_factor));
         }
-        if stretch_height {
+        if axes.height {
             style.size.height =
                 taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
         }
-        self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+        if style != *current {
+            self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+            #[cfg(test)]
+            {
+                self.writes += 1;
+            }
+        }
         if self.retain {
-            self.stretched.insert(id);
+            self.stretched.insert(id, axes);
         }
     }
 
@@ -518,6 +543,7 @@ impl TaffyLayoutEngine {
             && let Some(parent) = self.taffy.parent(id.0)
         {
             self.taffy.remove_child(parent, id.0).expect(EXPECT_MESSAGE);
+            self.uprooted.insert(LayoutId(parent));
         }
 
         if !self.computed_layouts.insert(id) {
@@ -910,6 +936,21 @@ fn layout_fingerprint(style: &Style, rem_size: Pixels, grid: Grid) -> u64 {
         None => 0u8.hash(h),
     }
     hasher.finish()
+}
+
+/// `style` with the axes [`TaffyLayoutEngine::stretch_auto_size_to_fill`] stretched set back to
+/// `auto`, which is the style the node's request asked for.
+fn unstretched(style: &taffy::style::Style, axes: Option<&Size<bool>>) -> taffy::style::Style {
+    let mut style = style.clone();
+    if let Some(axes) = axes {
+        if axes.width {
+            style.size.width = taffy::style::Dimension::auto();
+        }
+        if axes.height {
+            style.size.height = taffy::style::Dimension::auto();
+        }
+    }
+    style
 }
 
 /// A hash of a node's children in order.
@@ -1341,8 +1382,8 @@ mod tests {
             };
             let first_row = usize::from(self.scrolled);
             let label = usize::from(self.relabeled);
+            // Sized by nothing, so the window stretches it to fill on every frame.
             div()
-                .size_full()
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -1414,6 +1455,9 @@ mod tests {
         };
         painted(kept.into(), cx);
         let mut written = writes(cx);
+        // With retention turned off every frame builds the tree anew, which only the drawing
+        // comparison applies to.
+        let retained = *RETAIN;
         // Coprime with the field count, so every field is flipped on and off beside every
         // setting of its neighbours.
         for step in 0..Shown::FIELDS * 12 {
@@ -1434,7 +1478,7 @@ mod tests {
                 "after flipping field {field} at step {step}"
             );
             assert!(
-                writes(cx) > written,
+                !retained || writes(cx) > written,
                 "flipping field {field} writes to the nodes it changes"
             );
             written = writes(cx);
@@ -1443,11 +1487,46 @@ mod tests {
                 expected,
                 "drawn again at step {step}"
             );
-            assert_eq!(
-                writes(cx),
-                written,
-                "a frame that changes nothing leaves every node alone, at step {step}"
-            );
+            if retained {
+                assert_eq!(
+                    writes(cx),
+                    written,
+                    "a frame that changes nothing leaves every node alone, at step {step}"
+                );
+            }
         }
+    }
+
+    #[crate::test]
+    fn a_parent_gets_back_a_child_laid_out_as_a_root(cx: &mut crate::TestAppContext) {
+        use crate::{px, size};
+
+        let window = cx.open_window(size(px(100.), px(100.)), |_, _| Shown::default());
+        window
+            .update(cx, |_, window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                engine.retain = true;
+                let space = size(px(100.), px(100.)).into();
+                let mut request = |engine: &mut TaffyLayoutEngine, key, children: &[LayoutId]| {
+                    engine.request_layout(Some(key), Style::default(), px(16.), 1., children)
+                };
+
+                let child = request(&mut engine, 1, &[]);
+                let parent = request(&mut engine, 2, &[child]);
+                engine.compute_layout(parent, space, window, cx);
+                engine.clear();
+
+                let kept_child = request(&mut engine, 1, &[]);
+                assert_eq!(kept_child, child, "the child is kept");
+                engine.compute_layout(child, space, window, cx);
+                let kept_parent = request(&mut engine, 2, &[child]);
+                engine.compute_layout(kept_parent, space, window, cx);
+                assert_eq!(
+                    engine.taffy.children(parent.0).expect(EXPECT_MESSAGE),
+                    [child.0],
+                    "the parent lists its child again"
+                );
+            })
+            .expect("the window is open");
     }
 }
