@@ -2161,6 +2161,9 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+        // A tick that presents is not idle, even with nothing dirty: gpui goes on presenting
+        // unchanged frames for a second after high-rate input to hold the refresh rate up.
+        this.frame_wanted = true;
     }
 
     fn schedule_frame(&self) {
@@ -2168,8 +2171,14 @@ impl PlatformWindow for MacWindow {
     }
 
     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
-        let state = self.0.clone();
-        Some(Rc::new(move || state.lock().want_frame()))
+        // Weak, since gpui keeps this waker in the invalidator that the window's own
+        // request-frame callback holds, and a strong handle would keep the state alive forever.
+        let state = Arc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if let Some(state) = state.upgrade() {
+                state.lock().want_frame();
+            }
+        }))
     }
 
     fn can_release_idle_gpu_memory(&self) -> bool {
