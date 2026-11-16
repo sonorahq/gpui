@@ -4932,10 +4932,23 @@ impl Window {
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             // The spread grows the rounded corners with the box, as CSS does, so a ring drawn
-            // with a spread keeps one width around the corners. A square corner stays square.
-            let spread = |radius: Pixels| match radius > Pixels::ZERO {
-                true => (radius + shadow.spread_radius).max(Pixels::ZERO),
-                false => radius,
+            // with a spread keeps one width around the corners. A square corner stays square,
+            // and a corner rounded less than the spread grows by less, so it does not jump to
+            // the full spread.
+            let spread = |radius: Pixels| {
+                let reach = shadow.spread_radius;
+                if radius <= Pixels::ZERO {
+                    return radius;
+                }
+                if reach <= Pixels::ZERO {
+                    return (radius + reach).max(Pixels::ZERO);
+                }
+                let ratio = radius / reach;
+                let grow = match ratio < 1. {
+                    true => reach * (1. + (ratio - 1.).powi(3)),
+                    false => reach,
+                };
+                radius + grow
             };
             let shadow_corner_radii = Corners {
                 top_left: spread(corner_radii.top_left),
