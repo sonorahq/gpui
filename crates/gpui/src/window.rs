@@ -4931,12 +4931,24 @@ impl Window {
                 continue;
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            // The spread grows the rounded corners with the box, as CSS does, so a ring drawn
+            // with a spread keeps one width around the corners. A square corner stays square.
+            let spread = |radius: Pixels| match radius > Pixels::ZERO {
+                true => (radius + shadow.spread_radius).max(Pixels::ZERO),
+                false => radius,
+            };
+            let shadow_corner_radii = Corners {
+                top_left: spread(corner_radii.top_left),
+                top_right: spread(corner_radii.top_right),
+                bottom_right: spread(corner_radii.bottom_right),
+                bottom_left: spread(corner_radii.bottom_left),
+            };
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: shadow_corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
