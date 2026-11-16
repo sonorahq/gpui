@@ -5,16 +5,24 @@
 use std::any::TypeId;
 use std::sync::Arc;
 
-use collections::{FxHashSet, IndexMap};
+use collections::{FxHashMap, FxHashSet};
 
 use crate::{App, ImageId, RenderImage, Window};
 
 #[derive(Default)]
 pub(crate) struct DecodedImages {
-    /// By asset key, least recently drawn first.
-    held: IndexMap<(TypeId, u64), Arc<RenderImage>>,
+    held: FxHashMap<(TypeId, u64), Held>,
+    /// Pictures a key held before it was drawn with a newer one, such as after an asset was
+    /// removed and loaded again, whose atlas tiles wait to be let go.
+    replaced: Vec<Arc<RenderImage>>,
+    draws: u64,
     bytes: usize,
     budget: Option<usize>,
+}
+
+struct Held {
+    image: Arc<RenderImage>,
+    last_drawn: u64,
 }
 
 /// What a picture costs once drawn: its pixels, and the texture of the same size a window
@@ -32,13 +40,25 @@ impl DecodedImages {
         if self.budget.is_none() {
             return;
         }
-        match self.held.shift_remove(&key) {
+        self.draws += 1;
+        let last_drawn = self.draws;
+        match self.held.get_mut(&key) {
+            Some(held) if held.image.id == image.id => held.last_drawn = last_drawn,
             Some(held) => {
-                self.held.insert(key, held);
+                self.bytes = self.bytes - size_of(&held.image) + size_of(image);
+                let old = std::mem::replace(&mut held.image, image.clone());
+                held.last_drawn = last_drawn;
+                self.replaced.push(old);
             }
             None => {
                 self.bytes += size_of(image);
-                self.held.insert(key, image.clone());
+                self.held.insert(
+                    key,
+                    Held {
+                        image: image.clone(),
+                        last_drawn,
+                    },
+                );
             }
         }
     }
@@ -69,26 +89,57 @@ impl App {
         let Some(budget) = self.decoded_images.budget else {
             return;
         };
-        if self.decoded_images.bytes <= budget {
+        let over_budget = self.decoded_images.bytes > budget;
+        if !over_budget && self.decoded_images.replaced.is_empty() {
+            return;
+        }
+        // A window drawing inside another's update, as `open_window` does, cannot see what
+        // that window shows, so this waits for a frame drawn on its own.
+        let windows_in_update = self
+            .windows
+            .values()
+            .filter(|window| window.is_none())
+            .count();
+        if windows_in_update > 1 {
             return;
         }
         let mut shown: FxHashSet<ImageId> = current.shown_images();
         for window in self.windows.values().flatten() {
             shown.extend(window.shown_images());
         }
-        let mut bytes = self.decoded_images.bytes;
+
         let mut dropped = Vec::new();
-        self.decoded_images.held.retain(|key, image| {
-            if bytes <= budget || shown.contains(&image.id) {
+        self.decoded_images.replaced.retain(|image| {
+            if shown.contains(&image.id) {
                 return true;
             }
-            bytes -= size_of(image);
-            dropped.push((*key, image.clone()));
+            dropped.push(image.clone());
             false
         });
-        self.decoded_images.bytes = bytes;
-        for (key, image) in dropped {
-            self.loading_assets.remove(&key);
+
+        if over_budget {
+            let mut evictable: Vec<_> = self
+                .decoded_images
+                .held
+                .iter()
+                .filter(|(_, held)| !shown.contains(&held.image.id))
+                .map(|(key, held)| (held.last_drawn, *key))
+                .collect();
+            evictable.sort_unstable_by_key(|(last_drawn, _)| *last_drawn);
+            for (_, key) in evictable {
+                if self.decoded_images.bytes <= budget {
+                    break;
+                }
+                let Some(held) = self.decoded_images.held.remove(&key) else {
+                    continue;
+                };
+                self.decoded_images.bytes -= size_of(&held.image);
+                self.loading_assets.remove(&key);
+                dropped.push(held.image);
+            }
+        }
+
+        for image in dropped {
             self.drop_image(image, Some(current));
         }
     }
