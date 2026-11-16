@@ -1523,6 +1523,11 @@ fragment float4 kawase_up_fragment(
   return total / 12.0;
 }
 
+// Wipes the scissored part of a layer target, so a layer only clears what it will be read from.
+fragment float4 clear_fragment(FilterFragmentInput input [[stage_in]]) {
+  return float4(0.0);
+}
+
 fragment float4 blit_fragment(
     FilterFragmentInput input [[stage_in]],
     texture2d<float> source [[texture(FilterInputIndex_Source)]]) {
