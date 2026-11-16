@@ -328,6 +328,14 @@ impl TextSystem {
 
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
+        if font.letter_spacing != LetterSpacing::default() || font.scale != FontScale::default() {
+            return self.font_id(&Font {
+                letter_spacing: LetterSpacing::default(),
+                scale: FontScale::default(),
+                ..font.clone()
+            });
+        }
+
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
             match font_id {
                 Ok(font_id) => Ok(*font_id),
@@ -1235,7 +1243,8 @@ pub struct LetterSpacing(pub f32);
 
 impl Hash for LetterSpacing {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u32(self.0.to_bits());
+        // Adding zero turns -0.0 into 0.0, so values that compare equal hash alike.
+        state.write_u32((self.0 + 0.).to_bits());
     }
 }
 
@@ -1254,7 +1263,8 @@ impl Default for FontScale {
 
 impl Hash for FontScale {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u32(self.0.to_bits());
+        // Adding zero turns -0.0 into 0.0, so values that compare equal hash alike.
+        state.write_u32((self.0 + 0.).to_bits());
     }
 }
 

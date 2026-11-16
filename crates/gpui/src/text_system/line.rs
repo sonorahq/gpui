@@ -619,7 +619,9 @@ fn paint_line(
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            max_glyph_size = text_system
+                .bounding_box(run.font_id, run.font_size.unwrap_or(layout.font_size))
+                .size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -895,7 +897,9 @@ fn paint_line_background(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            max_glyph_size = text_system
+                .bounding_box(run.font_id, run.font_size.unwrap_or(layout.font_size))
+                .size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -1166,10 +1170,11 @@ fn paint_bidi_line(
                     window.paint_strikethrough(point(from, strikethrough_y), to - from, &style);
                 }
 
+                let font_size = run.font_size.unwrap_or(layout.font_size);
                 let glyph_origin = point(x, top);
                 let max_glyph_bounds = Bounds {
                     origin: glyph_origin,
-                    size: text_system.bounding_box(run.font_id, layout.font_size).size,
+                    size: text_system.bounding_box(run.font_id, font_size).size,
                 };
                 if !max_glyph_bounds.intersects(&window.content_mask().bounds) {
                     continue;
@@ -1177,10 +1182,8 @@ fn paint_bidi_line(
                 let at = glyph_origin + baseline + point(px(0.), glyph.position.y);
                 match glyph.is_emoji {
                     true if tint.is_some() => {}
-                    true => window.paint_emoji(at, run.font_id, glyph.id, layout.font_size)?,
-                    false => {
-                        window.paint_glyph(at, run.font_id, glyph.id, layout.font_size, color)?
-                    }
+                    true => window.paint_emoji(at, run.font_id, glyph.id, font_size)?,
+                    false => window.paint_glyph(at, run.font_id, glyph.id, font_size, color)?,
                 }
             }
             if let Some((from, to, style)) = underline {
