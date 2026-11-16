@@ -1113,7 +1113,7 @@ impl MetalRenderer {
                 let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
 
                 command_encoder.end_encoding();
-                let onto = self.close_layer(
+                command_encoder = self.close_layer(
                     command_buffer,
                     layer,
                     clip,
@@ -1121,8 +1121,6 @@ impl MetalRenderer {
                     &main_texture,
                     viewport_size,
                 );
-                command_encoder =
-                    new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
             }
 
             for index in wanted.iter().skip(shared + usize::from(merged)) {
@@ -1294,7 +1292,7 @@ impl MetalRenderer {
             let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
 
             command_encoder.end_encoding();
-            let onto = self.close_layer(
+            command_encoder = self.close_layer(
                 command_buffer,
                 layer,
                 clip,
@@ -1302,8 +1300,6 @@ impl MetalRenderer {
                 &main_texture,
                 viewport_size,
             );
-            command_encoder =
-                new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
         }
 
         command_encoder.end_encoding();
@@ -1327,15 +1323,15 @@ impl MetalRenderer {
     /// Blurs a filtered layer that has just closed, when its filter asks for a blur, composites
     /// it into its parent and returns the parent, so the caller can resume drawing there.
     /// `depth` is the closed layer's own nesting depth.
-    fn close_layer(
+    fn close_layer<'a>(
         &mut self,
-        command_buffer: &metal::CommandBufferRef,
+        command_buffer: &'a metal::CommandBufferRef,
         layer: LayerEffect,
         clip: Bounds<ScaledPixels>,
         depth: usize,
         main_texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
-    ) -> metal::Texture {
+    ) -> &'a metal::RenderCommandEncoderRef {
         let source = self.filter_texture(
             FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)),
             viewport_size,
@@ -1358,8 +1354,9 @@ impl MetalRenderer {
             ),
             false => source,
         };
-        self.composite_layer(command_buffer, &blurred, &onto, layer, clip, viewport_size);
-        onto
+        let encoder = new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
+        self.composite_layer(encoder, &blurred, layer, clip, viewport_size);
+        encoder
     }
 
     /// Clamps a region to the target it is drawn into, shrunk to the blur step it runs at.
@@ -1561,9 +1558,8 @@ impl MetalRenderer {
     /// Draws a filtered layer back into its parent, clipped to the layer's bounds.
     fn composite_layer(
         &self,
-        command_buffer: &metal::CommandBufferRef,
+        encoder: &metal::RenderCommandEncoderRef,
         source: &metal::TextureRef,
-        onto: &metal::TextureRef,
         layer: LayerEffect,
         clip: Bounds<ScaledPixels>,
         viewport_size: Size<DevicePixels>,
@@ -1573,7 +1569,6 @@ impl MetalRenderer {
             return;
         };
         let masked = layer.filter.fades();
-        let encoder = new_command_encoder_for_texture(command_buffer, onto, viewport_size, None);
         encoder.set_render_pipeline_state(match masked {
             true => &self.masked_pipeline_state,
             false => &self.composite_pipeline_state,
@@ -1592,7 +1587,12 @@ impl MetalRenderer {
         );
         encoder.set_scissor_rect(within);
         encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
-        encoder.end_encoding();
+        encoder.set_scissor_rect(metal::MTLScissorRect {
+            x: 0,
+            y: 0,
+            width: i32::from(viewport_size.width).max(0) as u64,
+            height: i32::from(viewport_size.height).max(0) as u64,
+        });
     }
 
     /// Flattens open layers in source coordinates without changing their eventual composites.
