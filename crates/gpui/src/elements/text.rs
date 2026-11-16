@@ -527,9 +527,19 @@ impl StyledText {
     /// Opens a space of each width before its byte index, so the element can draw something of
     /// its own inside the text there, such as an icon, at the place
     /// [`TextLayout::position_for_index`] gives for the index, less the width. The indices must
-    /// be sorted and fall on character boundaries; the text and its indices stay as they were.
+    /// fall on character boundaries, and any that don't are dropped; the text and its indices stay
+    /// as they were.
     pub fn with_gaps(mut self, gaps: impl IntoIterator<Item = (usize, Pixels)>) -> Self {
-        self.gaps = gaps.into_iter().collect();
+        let mut gaps: Vec<_> = gaps
+            .into_iter()
+            .filter(|(index, _)| {
+                let on_boundary = self.text.is_char_boundary(*index);
+                debug_assert!(on_boundary, "gap at {index} is inside a character");
+                on_boundary
+            })
+            .collect();
+        gaps.sort_by_key(|(index, _)| *index);
+        self.gaps = gaps.into();
         self
     }
 
@@ -1643,6 +1653,31 @@ mod tests {
                 gapped[0].gap_origin(3, px(20.)),
                 Some(crate::point(x(&plain, 3) + px(10.), px(0.)))
             );
+        });
+    }
+
+    #[crate::test]
+    fn a_gap_on_a_third_line_opens_where_its_index_is(cx: &mut crate::TestAppContext) {
+        use crate::px;
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            let text = SharedString::from("a\nbbb\ncc");
+            let runs = [window.text_style().to_run(text.len())];
+            let shaped = |gaps: &[(usize, Pixels)]| {
+                window
+                    .text_system()
+                    .shape_text_with_gaps(text.clone(), px(16.), &runs, gaps, None, None)
+                    .expect("shaped")
+            };
+            let (plain, gapped) = (shaped(&[]), shaped(&[(7, px(10.))]));
+            let x = |lines: &SmallVec<[crate::WrappedLine; 1]>, index| {
+                lines[2]
+                    .position_for_index(index, px(20.))
+                    .expect("a place")
+                    .x
+            };
+            assert_eq!(x(&gapped, 0), x(&plain, 0));
+            assert_eq!(x(&gapped, 1), x(&plain, 1) + px(10.));
         });
     }
 

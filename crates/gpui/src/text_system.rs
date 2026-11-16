@@ -888,24 +888,13 @@ impl WindowTextSystem {
             && let Some(second_line) = split_lines.next()
         {
             let mut line_start = 0;
-            process_line(
-                SharedString::new(first_line),
-                line_start,
-                line_start + first_line.len(),
-            );
-            line_start += first_line.len() + '\n'.len_utf8();
-            process_line(
-                SharedString::new(second_line),
-                line_start,
-                line_start + second_line.len(),
-            );
-            for line_text in split_lines {
-                line_start += line_text.len() + '\n'.len_utf8();
+            for line_text in [first_line, second_line].into_iter().chain(split_lines) {
                 process_line(
                     SharedString::new(line_text),
                     line_start,
                     line_start + line_text.len(),
                 );
+                line_start += line_text.len() + '\n'.len_utf8();
             }
         } else {
             let end = text.len();
