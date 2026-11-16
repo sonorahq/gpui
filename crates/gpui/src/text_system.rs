@@ -777,14 +777,16 @@ impl WindowTextSystem {
 
                 let run_len_within_line = cmp::min(line_end - run_start, run.len);
 
-                let decoration_changed = if let Some(last_run) = decoration_runs.last_mut()
+                let decorated_alike = decoration_runs.last().is_some_and(|last_run| {
+                    last_run.underline == run.underline
+                        && last_run.strikethrough == run.strikethrough
+                        && last_run.background_color == run.background_color
+                });
+                if let Some(last_run) = decoration_runs.last_mut()
+                    && decorated_alike
                     && last_run.color == run.color
-                    && last_run.underline == run.underline
-                    && last_run.strikethrough == run.strikethrough
-                    && last_run.background_color == run.background_color
                 {
                     last_run.len += run_len_within_line as u32;
-                    false
                 } else {
                     decoration_runs.push(DecorationRun {
                         len: run_len_within_line as u32,
@@ -793,14 +795,17 @@ impl WindowTextSystem {
                         underline: run.underline,
                         strikethrough: run.strikethrough,
                     });
-                    true
-                };
+                }
 
+                // Colour is painted over the glyphs' byte ranges, so text in one font shapes as one
+                // run however many colours it has; a ligature across a colour change takes the
+                // first colour. Underlines, strikethroughs and backgrounds are painted from the
+                // glyph that starts them, so a change in those still splits the run.
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
                     && run.font.letter_spacing == font_run.letter_spacing
-                    && !decoration_changed
+                    && decorated_alike
                 {
                     font_run.len += run_len_within_line;
                 } else {
