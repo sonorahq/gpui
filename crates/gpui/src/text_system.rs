@@ -291,9 +291,11 @@ impl TextSystem {
     }
 
     /// Thins light glyphs by raising their coverage to `exponent`, or by less as their color
-    /// darkens, so light text on a dark ground draws as light as WebKit draws it. `None` turns
-    /// it off. Screens below 2x are left unthinned, as the curve strips their soft edges.
+    /// darkens, so light text on a dark ground draws as light as WebKit draws it. `None`, or an
+    /// exponent that is not finite, turns it off. Screens below 2x are left unthinned, as the
+    /// curve strips their soft edges.
     pub fn set_light_text_curve(&self, exponent: Option<f32>) {
+        let exponent = exponent.filter(|exponent| exponent.is_finite());
         self.light_text_curve
             .store(exponent.map_or(0, f32::to_bits), Ordering::Relaxed);
     }
@@ -600,7 +602,7 @@ impl TextSystem {
         let (size, mut bytes) = self
             .platform_text_system
             .rasterize_glyph(params, raster_bounds)?;
-        if params.thinning > 0 && !params.is_emoji && !params.subpixel_rendering {
+        if params.thinning > 0 && !params.is_emoji {
             let full = f32::from_bits(self.light_text_curve.load(Ordering::Relaxed));
             let exponent = 1. + (full - 1.) * f32::from(params.thinning) / 4.;
             let curve: [u8; 256] = std::array::from_fn(|coverage| {
