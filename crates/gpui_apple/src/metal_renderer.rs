@@ -186,6 +186,8 @@ pub struct MetalRenderer {
     kawase_down_pipeline_state: metal::RenderPipelineState,
     kawase_up_pipeline_state: metal::RenderPipelineState,
     blit_pipeline_state: metal::RenderPipelineState,
+    /// Writes transparent black under a scissor, for wiping the part of a layer target in use.
+    clear_pipeline_state: metal::RenderPipelineState,
     composite_pipeline_state: metal::RenderPipelineState,
     masked_pipeline_state: metal::RenderPipelineState,
     /// A pipeline per custom shader, built from its MSL translation the first time a frame draws
@@ -541,6 +543,15 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             FilterBlend::Replace,
         );
+        let clear_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "clear",
+            "filter_vertex",
+            "clear_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Replace,
+        );
         let composite_pipeline_state = build_filter_pipeline_state(
             &device,
             &library,
@@ -605,6 +616,7 @@ impl MetalRenderer {
             kawase_down_pipeline_state,
             kawase_up_pipeline_state,
             blit_pipeline_state,
+            clear_pipeline_state,
             composite_pipeline_state,
             masked_pipeline_state,
             custom_pipeline_states: FxHashMap::default(),
@@ -1078,6 +1090,9 @@ impl MetalRenderer {
         // What each open layer will be composited through: neighbours that ask for the same filter
         // share one target, so a list of separately blurred rows costs one pass, not one per row.
         let mut spans: Vec<Bounds<ScaledPixels>> = Vec::new();
+        // The part of each open layer's target that was wiped when it opened. A neighbour may only
+        // share the target when everything it draws lands inside it.
+        let mut wiped: Vec<Bounds<ScaledPixels>> = Vec::new();
 
         for batch in scene.batches() {
             let wanted = filtered
@@ -1100,7 +1115,11 @@ impl MetalRenderer {
                 {
                     let next = scene.effects[wanted[shared]];
                     let layer = scene.effects[*open];
-                    if layer.can_merge_with(&next) {
+                    if layer.can_merge_with(&next)
+                        && wiped
+                            .last()
+                            .is_some_and(|wiped| covers(*wiped, layer_wipe(next)))
+                    {
                         *open = wanted[shared];
                         *span = span.union(&next.destination_clip());
                         merged = true;
@@ -1111,6 +1130,7 @@ impl MetalRenderer {
                 let index = stack.pop().expect("the stack is not empty");
                 let layer = scene.effects[index];
                 let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
+                wiped.pop();
 
                 command_encoder.end_encoding();
                 command_encoder = self.close_layer(
@@ -1132,14 +1152,15 @@ impl MetalRenderer {
 
                 command_encoder.end_encoding();
                 let target = self.filter_texture(FilterTarget::Layer(depth), viewport_size);
-                command_encoder = new_command_encoder_for_texture(
-                    command_buffer,
-                    &target,
-                    viewport_size,
-                    Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
-                );
+                // Clearing the whole target writes every tile of a window-sized texture, which
+                // on a tiled GPU costs more than most layers draw. Only the source area, and the
+                // margin a blur reads past it, is ever read back, so only that is wiped.
+                command_encoder =
+                    new_discarding_command_encoder(command_buffer, &target, viewport_size);
+                self.clear_within(command_encoder, layer_wipe(layer), viewport_size);
                 stack.push(*index);
                 spans.push(layer.destination_clip());
+                wiped.push(layer_wipe(layer));
             }
 
             match batch {
@@ -1244,7 +1265,7 @@ impl MetalRenderer {
                     let source = self.backdrop_source(
                         command_buffer,
                         &main_texture,
-                        stack.len(),
+                        &wiped,
                         viewport_size,
                         clip.map(|clip| clip.dilate(BlurPasses::for_sigma(sigma).source_margin())),
                     );
@@ -1290,6 +1311,7 @@ impl MetalRenderer {
         while let Some(index) = stack.pop() {
             let layer = scene.effects[index];
             let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
+            wiped.pop();
 
             command_encoder.end_encoding();
             command_encoder = self.close_layer(
@@ -1320,9 +1342,9 @@ impl MetalRenderer {
         Ok(command_buffer.to_owned())
     }
 
-    /// Blurs a filtered layer that has just closed, when its filter asks for a blur, composites
-    /// it into its parent and returns the parent, so the caller can resume drawing there.
-    /// `depth` is the closed layer's own nesting depth.
+    /// Blurs a filtered layer that has just closed, when its filter asks for a blur, and
+    /// composites it as the first draw of a pass that resumes its parent. The caller carries on
+    /// drawing through the encoder it returns. `depth` is the closed layer's own nesting depth.
     fn close_layer<'a>(
         &mut self,
         command_buffer: &'a metal::CommandBufferRef,
@@ -1357,6 +1379,23 @@ impl MetalRenderer {
         let encoder = new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
         self.composite_layer(encoder, &blurred, layer, clip, viewport_size);
         encoder
+    }
+
+    /// Writes transparent black over `bounds` of the encoder's target and lifts the scissor
+    /// again, so the draws after it see the whole target.
+    fn clear_within(
+        &self,
+        encoder: &metal::RenderCommandEncoderRef,
+        bounds: Bounds<ScaledPixels>,
+        viewport_size: Size<DevicePixels>,
+    ) {
+        let Some(within) = Self::scissor(bounds, viewport_size, 1) else {
+            return;
+        };
+        encoder.set_render_pipeline_state(&self.clear_pipeline_state);
+        encoder.set_scissor_rect(within);
+        encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+        encoder.set_scissor_rect(whole_scissor(viewport_size));
     }
 
     /// Clamps a region to the target it is drawn into, shrunk to the blur step it runs at.
@@ -1555,7 +1594,8 @@ impl MetalRenderer {
         settled.clone()
     }
 
-    /// Draws a filtered layer back into its parent, clipped to the layer's bounds.
+    /// Draws a filtered layer back into its parent through `encoder`, clipped to the layer's bounds,
+    /// and leaves the encoder open with the scissor lifted for the parent's own draws.
     fn composite_layer(
         &self,
         encoder: &metal::RenderCommandEncoderRef,
@@ -1587,12 +1627,7 @@ impl MetalRenderer {
         );
         encoder.set_scissor_rect(within);
         encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
-        encoder.set_scissor_rect(metal::MTLScissorRect {
-            x: 0,
-            y: 0,
-            width: i32::from(viewport_size.width).max(0) as u64,
-            height: i32::from(viewport_size.height).max(0) as u64,
-        });
+        encoder.set_scissor_rect(whole_scissor(viewport_size));
     }
 
     /// Flattens open layers in source coordinates without changing their eventual composites.
@@ -1600,10 +1635,11 @@ impl MetalRenderer {
         &mut self,
         command_buffer: &metal::CommandBufferRef,
         frame: &metal::TextureRef,
-        depth: usize,
+        wiped: &[Bounds<ScaledPixels>],
         viewport_size: Size<DevicePixels>,
         clip: Option<Bounds<ScaledPixels>>,
     ) -> metal::Texture {
+        let depth = wiped.len();
         if depth == 0 {
             return frame.to_owned();
         }
@@ -1621,19 +1657,25 @@ impl MetalRenderer {
             scale: 1.,
             ..Default::default()
         };
-        let mut sources = vec![frame.to_owned()];
-        sources.extend(
-            (0..depth).map(|level| self.filter_texture(FilterTarget::Layer(level), viewport_size)),
-        );
+        // Each open layer is read only where it was wiped when it opened, since the rest of its
+        // target still holds whatever an earlier layer left there.
+        let mut sources = vec![(frame.to_owned(), clip)];
+        sources.extend((0..depth).map(|level| {
+            let within = match clip {
+                Some(clip) => clip.intersect(&wiped[level]),
+                None => wiped[level],
+            };
+            (
+                self.filter_texture(FilterTarget::Layer(level), viewport_size),
+                Some(within),
+            )
+        }));
         let encoder = new_command_encoder_for_texture(
             command_buffer,
             &target,
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
         );
-        if let Some(within) = clip.and_then(|clip| Self::scissor(clip, viewport_size, 1)) {
-            encoder.set_scissor_rect(within);
-        }
         encoder.set_render_pipeline_state(&self.composite_pipeline_state);
         encoder.set_fragment_bytes(
             FilterInputIndex::ViewportSize as u64,
@@ -1645,7 +1687,15 @@ impl MetalRenderer {
             mem::size_of_val(&params) as u64,
             &params as *const _ as *const _,
         );
-        for source in sources {
+        for (source, within) in sources {
+            let scissor = match within {
+                Some(within) => match Self::scissor(within, viewport_size, 1) {
+                    Some(scissor) => scissor,
+                    None => continue,
+                },
+                None => whole_scissor(viewport_size),
+            };
+            encoder.set_scissor_rect(scissor);
             encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(&source));
             encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
         }
@@ -2266,6 +2316,34 @@ impl MetalRenderer {
 fn filters_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GPUI_FILTERS").as_deref() != Ok("0"))
+}
+
+/// Whether `outer` holds all of `inner`.
+fn covers(outer: Bounds<ScaledPixels>, inner: Bounds<ScaledPixels>) -> bool {
+    outer.origin.x <= inner.origin.x
+        && outer.origin.y <= inner.origin.y
+        && outer.bottom_right().x >= inner.bottom_right().x
+        && outer.bottom_right().y >= inner.bottom_right().y
+}
+
+/// The part of a layer's target that has to start transparent: its source area and, for a blurred
+/// layer, as far again as the blur reads past it, plus a pixel for the rounding of the scissor.
+fn layer_wipe(layer: LayerEffect) -> Bounds<ScaledPixels> {
+    let margin = match layer.filter.blurs() {
+        true => BlurPasses::for_sigma(layer.filter.blur).source_margin(),
+        false => ScaledPixels(0.),
+    };
+    layer.source_bounds.dilate(margin + ScaledPixels(1.))
+}
+
+/// A scissor over the whole target, for lifting one that was set for a single draw.
+fn whole_scissor(viewport_size: Size<DevicePixels>) -> metal::MTLScissorRect {
+    metal::MTLScissorRect {
+        x: 0,
+        y: 0,
+        width: i32::from(viewport_size.width).max(0) as u64,
+        height: i32::from(viewport_size.height).max(0) as u64,
+    }
 }
 
 /// Starts a render pass into `texture`. The pass descriptor retains the texture, so it may be a
