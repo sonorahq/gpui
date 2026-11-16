@@ -470,6 +470,7 @@ impl DirectWriteState {
             weight,
             style,
             letter_spacing: _,
+            scale: _,
         }: &Font,
         collection: &IDWriteFontCollection1,
         factory: &IDWriteFactory5,
@@ -1647,7 +1648,11 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             false => origin + extent,
         };
         context.width = context.width.max(right_edge);
-        context.runs.push(ShapedRun { font_id, glyphs });
+        context.runs.push(ShapedRun {
+            font_id,
+            glyphs,
+            font_size: None,
+        });
         Ok(())
     }
 
@@ -1819,6 +1824,7 @@ fn font_face_to_font(font_face: &IDWriteFontFace3, locale: &HSTRING) -> Option<F
         style: font_style_from_dwrite(style),
         fallbacks: None,
         letter_spacing: Default::default(),
+        scale: Default::default(),
     })
 }
 

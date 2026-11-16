@@ -328,6 +328,14 @@ impl TextSystem {
 
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
+        if font.letter_spacing != LetterSpacing::default() || font.scale != FontScale::default() {
+            return self.font_id(&Font {
+                letter_spacing: LetterSpacing::default(),
+                scale: FontScale::default(),
+                ..font.clone()
+            });
+        }
+
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
             match font_id {
                 Ok(font_id) => Ok(*font_id),
@@ -455,6 +463,8 @@ impl TextSystem {
                     len: buffer.len(),
                     font_id,
                     letter_spacing: LetterSpacing::default(),
+                    scale: FontScale::default(),
+                    leading: Default::default(),
                 }],
             )
             .width
@@ -757,6 +767,21 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_gaps(text, font_size, runs, &[], wrap_width, line_clamp)
+    }
+
+    /// Shapes the text as [`Self::shape_text`] does, with a space of each width opened before
+    /// its byte index, sorted, for an element to draw something inside the text there. The
+    /// text itself is unchanged, so its indices still mean what they did.
+    pub fn shape_text_with_gaps(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        gaps: &[(usize, Pixels)],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -775,7 +800,16 @@ impl WindowTextSystem {
                     break;
                 };
 
-                let run_len_within_line = cmp::min(line_end - run_start, run.len);
+                let gap_at = |at: usize| gaps.iter().find(|(index, _)| *index == at);
+                let next_gap = gaps
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .find(|index| *index > run_start && *index < line_end);
+                let run_len_within_line = cmp::min(line_end - run_start, run.len)
+                    .min(next_gap.map_or(usize::MAX, |gap| gap - run_start));
+                let leading = gap_at(run_start).map_or(LetterSpacing::default(), |(_, width)| {
+                    LetterSpacing(*width / font_size)
+                });
 
                 let decoration_changed = if let Some(last_run) = decoration_runs.last_mut()
                     && last_run.color == run.color
@@ -800,7 +834,9 @@ impl WindowTextSystem {
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
                     && run.font.letter_spacing == font_run.letter_spacing
+                    && run.font.scale == font_run.scale
                     && !decoration_changed
+                    && leading.0 == 0.
                 {
                     font_run.len += run_len_within_line;
                 } else {
@@ -808,6 +844,8 @@ impl WindowTextSystem {
                         len: run_len_within_line,
                         font_id,
                         letter_spacing: run.font.letter_spacing,
+                        scale: run.font.scale,
+                        leading,
                     });
                 }
 
@@ -850,24 +888,13 @@ impl WindowTextSystem {
             && let Some(second_line) = split_lines.next()
         {
             let mut line_start = 0;
-            process_line(
-                SharedString::new(first_line),
-                line_start,
-                line_start + first_line.len(),
-            );
-            line_start += first_line.len() + '\n'.len_utf8();
-            process_line(
-                SharedString::new(second_line),
-                line_start,
-                line_start + second_line.len(),
-            );
-            for line_text in split_lines {
-                line_start += line_text.len() + '\n'.len_utf8();
+            for line_text in [first_line, second_line].into_iter().chain(split_lines) {
                 process_line(
                     SharedString::new(line_text),
                     line_start,
                     line_start + line_text.len(),
                 );
+                line_start += line_text.len() + '\n'.len_utf8();
             }
         } else {
             let end = text.len();
@@ -916,6 +943,7 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && run.font.letter_spacing == font_run.letter_spacing
+                && run.font.scale == font_run.scale
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -924,6 +952,8 @@ impl WindowTextSystem {
                     len: run.len,
                     font_id,
                     letter_spacing: run.font.letter_spacing,
+                    scale: run.font.scale,
+                    leading: Default::default(),
                 });
             }
         }
@@ -952,6 +982,8 @@ impl WindowTextSystem {
                     len: buffer.len(),
                     font_id,
                     letter_spacing: LetterSpacing::default(),
+                    scale: FontScale::default(),
+                    leading: Default::default(),
                 }],
                 None,
             )
@@ -1001,6 +1033,7 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && run.font.letter_spacing == font_run.letter_spacing
+                && run.font.scale == font_run.scale
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -1009,6 +1042,8 @@ impl WindowTextSystem {
                     len: run.len,
                     font_id,
                     letter_spacing: run.font.letter_spacing,
+                    scale: run.font.scale,
+                    leading: Default::default(),
                 });
             }
         }
@@ -1065,6 +1100,7 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && run.font.letter_spacing == font_run.letter_spacing
+                && run.font.scale == font_run.scale
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -1073,6 +1109,8 @@ impl WindowTextSystem {
                     len: run.len,
                     font_id,
                     letter_spacing: run.font.letter_spacing,
+                    scale: run.font.scale,
+                    leading: Default::default(),
                 });
             }
         }
@@ -1225,11 +1263,32 @@ pub struct LetterSpacing(pub f32);
 
 impl Hash for LetterSpacing {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u32(self.0.to_bits());
+        // Adding zero turns -0.0 into 0.0, so values that compare equal hash alike.
+        state.write_u32((self.0 + 0.).to_bits());
     }
 }
 
 impl Eq for LetterSpacing {}
+
+/// A run's font size as a share of the text's, like CSS `font-size` in ems.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct FontScale(pub f32);
+
+impl Default for FontScale {
+    fn default() -> Self {
+        FontScale(1.)
+    }
+}
+
+impl Hash for FontScale {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Adding zero turns -0.0 into 0.0, so values that compare equal hash alike.
+        state.write_u32((self.0 + 0.).to_bits());
+    }
+}
+
+impl Eq for FontScale {}
 
 /// Allows italic or oblique faces to be selected.
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, Serialize, Deserialize, JsonSchema)]
@@ -1335,6 +1394,9 @@ pub struct Font {
 
     /// The space added after each character.
     pub letter_spacing: LetterSpacing,
+
+    /// The size of the run's characters, as a share of the text's.
+    pub scale: FontScale,
 }
 
 impl Default for Font {
@@ -1352,6 +1414,7 @@ pub fn font(family: impl Into<SharedString>) -> Font {
         style: FontStyle::default(),
         fallbacks: None,
         letter_spacing: LetterSpacing::default(),
+        scale: FontScale::default(),
     }
 }
 

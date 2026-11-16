@@ -424,6 +424,7 @@ impl CosmicTextSystemState {
                         weight: gpui::FontWeight(f32::from(weight.0)),
                         style: gpui::FontStyle::Normal,
                         letter_spacing: Default::default(),
+                        scale: Default::default(),
                     };
                     let Some(&fb_id) = find_best_match(&wanted, &fb_ids, self)
                         .ok()
@@ -960,6 +961,7 @@ impl CosmicTextSystemState {
                 runs.push(ShapedRun {
                     font_id,
                     glyphs: vec![shaped_glyph],
+                    font_size: None,
                 });
             }
         }
@@ -1088,6 +1090,8 @@ fn clip_font_runs(font_runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontR
                 len: end - start,
                 font_id: run.font_id,
                 letter_spacing: run.letter_spacing,
+                scale: run.scale,
+                leading: Default::default(),
             });
         }
     }
@@ -1427,6 +1431,8 @@ mod tests {
             len: text.len(),
             font_id,
             letter_spacing: Default::default(),
+            scale: Default::default(),
+            leading: Default::default(),
         }];
         Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
     }
@@ -1500,6 +1506,8 @@ mod tests {
             len: text.len(),
             font_id,
             letter_spacing: Default::default(),
+            scale: Default::default(),
+            leading: Default::default(),
         }];
 
         let missing_glyphs = text_system
@@ -1630,11 +1638,15 @@ mod tests {
                 len: "ab\u{001c}\u{05d0}".len(),
                 font_id,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             },
             FontRun {
                 len: "\u{05d1}".len(),
                 font_id,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             },
         ];
         let layout = text_system.layout_line(text, gpui::px(14.0), &runs);
@@ -1733,11 +1745,15 @@ mod tests {
                 len: 3,
                 font_id: fid(1),
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             },
             FontRun {
                 len: 4,
                 font_id: fid(2),
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             },
         ];
 
@@ -1749,11 +1765,15 @@ mod tests {
                     len: 1,
                     font_id: fid(1),
                     letter_spacing: Default::default(),
+                    scale: Default::default(),
+                    leading: Default::default(),
                 },
                 FontRun {
                     len: 2,
                     font_id: fid(2),
                     letter_spacing: Default::default(),
+                    scale: Default::default(),
+                    leading: Default::default(),
                 },
             ]
         );
@@ -1763,6 +1783,8 @@ mod tests {
                 len: 4,
                 font_id: fid(2),
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             }]
         );
         assert!(clip_font_runs(&runs, 5..5).is_empty());
