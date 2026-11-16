@@ -698,6 +698,7 @@ struct MacWindowState {
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
     modifier_sides: ModifierSides,
+    dispatched_modifier_sides: ModifierSides,
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
     external_files_dragged: bool,
@@ -1171,6 +1172,7 @@ impl MacWindow {
                     .is_none_or(|titlebar| titlebar.appears_transparent),
                 previous_modifiers_changed_event: None,
                 modifier_sides: ModifierSides::default(),
+                dispatched_modifier_sides: ModifierSides::default(),
                 keystroke_for_do_command: None,
                 do_command_handled: None,
                 external_files_dragged: false,
@@ -3004,11 +3006,13 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                 })) = &lock.previous_modifiers_changed_event
                     && prev_modifiers == modifiers
                     && prev_capslock == capslock
+                    && lock.dispatched_modifier_sides == lock.modifier_sides
                 {
                     return;
                 }
 
                 lock.previous_modifiers_changed_event = Some(event.clone());
+                lock.dispatched_modifier_sides = lock.modifier_sides;
             }
 
             _ => {}
@@ -3226,8 +3230,12 @@ fn report_display_change(window_state: &Arc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
     let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
+    let mut lock = window_state.lock();
     let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
+
+    // Keys released while another window was key never reach this one, and AppKit gives no
+    // sides for what is held on return, so the sides wait for the next modifier event.
+    lock.modifier_sides = ModifierSides::default();
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
