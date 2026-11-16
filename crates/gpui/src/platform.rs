@@ -1227,6 +1227,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn resize(&mut self, size: Size<Pixels>);
     fn scale_factor(&self) -> f32;
+    /// Draws at `scale_factor` from now on, for a platform that cannot report the scale of the
+    /// display a window is on. Only X11 is one.
+    fn set_scale_factor(&self, _scale_factor: f32) {}
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
