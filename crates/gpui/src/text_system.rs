@@ -328,6 +328,14 @@ impl TextSystem {
 
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
+        if font.letter_spacing != LetterSpacing::default() || font.scale != FontScale::default() {
+            return self.font_id(&Font {
+                letter_spacing: LetterSpacing::default(),
+                scale: FontScale::default(),
+                ..font.clone()
+            });
+        }
+
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
             match font_id {
                 Ok(font_id) => Ok(*font_id),
@@ -455,6 +463,7 @@ impl TextSystem {
                     len: buffer.len(),
                     font_id,
                     letter_spacing: LetterSpacing::default(),
+                    scale: FontScale::default(),
                 }],
             )
             .width
@@ -800,6 +809,7 @@ impl WindowTextSystem {
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
                     && run.font.letter_spacing == font_run.letter_spacing
+                    && run.font.scale == font_run.scale
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -808,6 +818,7 @@ impl WindowTextSystem {
                         len: run_len_within_line,
                         font_id,
                         letter_spacing: run.font.letter_spacing,
+                        scale: run.font.scale,
                     });
                 }
 
@@ -916,6 +927,7 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && run.font.letter_spacing == font_run.letter_spacing
+                && run.font.scale == font_run.scale
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -924,6 +936,7 @@ impl WindowTextSystem {
                     len: run.len,
                     font_id,
                     letter_spacing: run.font.letter_spacing,
+                    scale: run.font.scale,
                 });
             }
         }
@@ -952,6 +965,7 @@ impl WindowTextSystem {
                     len: buffer.len(),
                     font_id,
                     letter_spacing: LetterSpacing::default(),
+                    scale: FontScale::default(),
                 }],
                 None,
             )
@@ -1001,6 +1015,7 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && run.font.letter_spacing == font_run.letter_spacing
+                && run.font.scale == font_run.scale
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -1009,6 +1024,7 @@ impl WindowTextSystem {
                     len: run.len,
                     font_id,
                     letter_spacing: run.font.letter_spacing,
+                    scale: run.font.scale,
                 });
             }
         }
@@ -1065,6 +1081,7 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && run.font.letter_spacing == font_run.letter_spacing
+                && run.font.scale == font_run.scale
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -1073,6 +1090,7 @@ impl WindowTextSystem {
                     len: run.len,
                     font_id,
                     letter_spacing: run.font.letter_spacing,
+                    scale: run.font.scale,
                 });
             }
         }
@@ -1225,11 +1243,32 @@ pub struct LetterSpacing(pub f32);
 
 impl Hash for LetterSpacing {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u32(self.0.to_bits());
+        // Adding zero turns -0.0 into 0.0, so values that compare equal hash alike.
+        state.write_u32((self.0 + 0.).to_bits());
     }
 }
 
 impl Eq for LetterSpacing {}
+
+/// A run's font size as a share of the text's, like CSS `font-size` in ems.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct FontScale(pub f32);
+
+impl Default for FontScale {
+    fn default() -> Self {
+        FontScale(1.)
+    }
+}
+
+impl Hash for FontScale {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Adding zero turns -0.0 into 0.0, so values that compare equal hash alike.
+        state.write_u32((self.0 + 0.).to_bits());
+    }
+}
+
+impl Eq for FontScale {}
 
 /// Allows italic or oblique faces to be selected.
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, Serialize, Deserialize, JsonSchema)]
@@ -1335,6 +1374,9 @@ pub struct Font {
 
     /// The space added after each character.
     pub letter_spacing: LetterSpacing,
+
+    /// The size of the run's characters, as a share of the text's.
+    pub scale: FontScale,
 }
 
 impl Default for Font {
@@ -1352,6 +1394,7 @@ pub fn font(family: impl Into<SharedString>) -> Font {
         style: FontStyle::default(),
         fallbacks: None,
         letter_spacing: LetterSpacing::default(),
+        scale: FontScale::default(),
     }
 }
 

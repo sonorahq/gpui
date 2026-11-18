@@ -74,16 +74,19 @@ fn bench_layout_line(c: &mut Criterion) {
         len: text.len(),
         font_id: font_id_no_fallback,
         letter_spacing: Default::default(),
+        scale: Default::default(),
     }];
     let runs_with_fallback = vec![FontRun {
         len: text.len(),
         font_id: font_id_with_fallback,
         letter_spacing: Default::default(),
+        scale: Default::default(),
     }];
     let runs_mixed_direction = vec![FontRun {
         len: text_mixed_direction.len(),
         font_id: font_id_no_fallback,
         letter_spacing: Default::default(),
+        scale: Default::default(),
     }];
 
     let mut group = c.benchmark_group("layout_line");
