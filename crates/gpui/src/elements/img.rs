@@ -546,12 +546,22 @@ impl ImageSource {
                 if let Some(cache) = cache {
                     cache.load(resource, window, cx)
                 } else {
-                    window.use_asset::<ImgResourceLoader>(resource, cx)
+                    let image = window.use_asset::<ImgResourceLoader>(resource, cx);
+                    if let Some(Ok(image)) = &image {
+                        cx.decoded_image_drawn::<ImgResourceLoader>(resource, image);
+                    }
+                    image
                 }
             }
             ImageSource::Custom(loading_fn) => loading_fn(window, cx),
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
-            ImageSource::Image(data) => window.use_asset::<AssetLogger<ImageDecoder>>(data, cx),
+            ImageSource::Image(data) => {
+                let image = window.use_asset::<AssetLogger<ImageDecoder>>(data, cx);
+                if let Some(Ok(image)) = &image {
+                    cx.decoded_image_drawn::<AssetLogger<ImageDecoder>>(data, image);
+                }
+                image
+            }
         }
     }
 
