@@ -298,10 +298,12 @@ struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
-    /// Clamps to the edge, for filter and compositing passes. A blur tap past the bottom of a
-    /// target would otherwise wrap to its top, and the transparent rows it reads there show the
-    /// desktop through an edge the blurred element touches.
+    /// Clamps to the edge, for compositing and blit passes.
     filter_sampler: Option<ID3D11SamplerState>,
+    /// Mirrors past the edge, for blur passes. A blur tap past the bottom of a target would
+    /// otherwise repeat the single border row across the whole kernel, making elements leaving
+    /// the window flicker and snap out along the edge.
+    blur_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -738,7 +740,13 @@ impl DirectXRenderer {
                 },
             )
         };
-        let (device, device_context, sampler, batch_params) = self.pipeline_handles()?;
+        let (device, device_context, _, batch_params) = self.pipeline_handles()?;
+        let sampler = self
+            .globals
+            .blur_sampler
+            .as_ref()
+            .context("missing blur sampler")?
+            .clone();
 
         unsafe {
             device_context.OMSetRenderTargets(Some(slice::from_ref(&view)), None);
@@ -2037,12 +2045,14 @@ impl DirectXGlobalElements {
 
         let sampler = create_sampler(device, D3D11_TEXTURE_ADDRESS_WRAP)?;
         let filter_sampler = create_sampler(device, D3D11_TEXTURE_ADDRESS_CLAMP)?;
+        let blur_sampler = create_sampler(device, D3D11_TEXTURE_ADDRESS_MIRROR)?;
 
         Ok(Self {
             global_params_buffer,
             batch_params_buffer,
             sampler,
             filter_sampler,
+            blur_sampler,
         })
     }
 }

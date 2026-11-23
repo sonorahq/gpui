@@ -1455,7 +1455,7 @@ fragment float4 gaussian_fragment(
     constant BlurParams *params [[buffer(FilterInputIndex_Params)]],
     texture2d<float> source [[texture(FilterInputIndex_Source)]]) {
   constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
-                                   address::clamp_to_edge);
+                                   address::mirrored_repeat);
   float2 texel = float2(params->direction[0], params->direction[1]) /
                  float2(source.get_width(), source.get_height());
   float sigma = max(params->radius, 0.0001);
@@ -1487,7 +1487,7 @@ fragment float4 kawase_down_fragment(
     constant BlurParams *params [[buffer(FilterInputIndex_Params)]],
     texture2d<float> source [[texture(FilterInputIndex_Source)]]) {
   constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
-                                   address::clamp_to_edge);
+                                   address::mirrored_repeat);
   float2 half_step =
       0.5 * params->radius / float2(source.get_width(), source.get_height());
   float2 flipped = float2(half_step.x, -half_step.y);
@@ -1505,7 +1505,7 @@ fragment float4 kawase_up_fragment(
     constant BlurParams *params [[buffer(FilterInputIndex_Params)]],
     texture2d<float> source [[texture(FilterInputIndex_Source)]]) {
   constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
-                                   address::clamp_to_edge);
+                                   address::mirrored_repeat);
   float2 half_step =
       0.25 * params->radius / float2(source.get_width(), source.get_height());
   float2 flipped = float2(half_step.x, -half_step.y);

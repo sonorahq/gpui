@@ -275,11 +275,20 @@ impl Scene {
             return;
         }
 
+        // A backdrop blur samples past its own bounds by `source_margin`, so it must order after
+        // primitives painted before it inside that margin and before primitives painted after it
+        // inside the same margin.
+        let order_bounds = match &primitive {
+            Primitive::Backdrop(backdrop) if backdrop.blur > 0.0 => {
+                clipped_bounds.dilate(BlurPasses::for_sigma(backdrop.blur).source_margin())
+            }
+            _ => clipped_bounds,
+        };
         let order = self
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .unwrap_or_else(|| self.primitive_bounds.insert(order_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;

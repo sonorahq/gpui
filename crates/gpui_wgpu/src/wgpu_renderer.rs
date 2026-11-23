@@ -221,6 +221,10 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
+    /// Mirrors past the frame's edges for blur passes, so a backdrop touching a window edge
+    /// reflects the pixels beside it rather than stretching the single border row across the
+    /// whole kernel.
+    blur_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -1405,7 +1409,12 @@ impl WgpuRendererCore {
             return;
         }
 
-        let texture = self.create_texture_bind_group("layer_bind_group", source);
+        let texture = match composite {
+            Composite::Blurred => self.create_blur_texture_bind_group("layer_bind_group", source),
+            Composite::Plain | Composite::Masked => {
+                self.create_texture_bind_group("layer_bind_group", source)
+            }
+        };
         let resources = self.resources();
         pass.set_pipeline(match composite {
             Composite::Plain => &resources.pipelines.composite,
@@ -1522,11 +1531,12 @@ impl WgpuRendererCore {
         };
         let gaussian = self.resources().pipelines.gaussian.clone();
         let within = clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(1.)), 1));
+        let texture = self.create_blur_texture_bind_group("gaussian_down_texture", &scratch);
         self.fullscreen_pass(
             encoder,
             "gaussian_down",
             &gaussian,
-            &scratch,
+            &texture,
             &settled,
             &down,
             within,
@@ -1557,11 +1567,12 @@ impl WgpuRendererCore {
         let gaussian = self.resources().pipelines.gaussian.clone();
         let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
         let within = clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(reach)), 1));
+        let texture = self.create_blur_texture_bind_group("gaussian_across_texture", source);
         self.fullscreen_pass(
             encoder,
             "gaussian_across",
             &gaussian,
-            source,
+            &texture,
             &scratch,
             &across,
             within,
@@ -1605,11 +1616,12 @@ impl WgpuRendererCore {
 
         let mut from = source;
         for (level, to) in (1..).zip(&levels) {
+            let texture = self.create_blur_texture_bind_group("kawase_down_texture", from);
             self.fullscreen_pass(
                 encoder,
                 "kawase_down",
                 &down,
-                from,
+                &texture,
                 to,
                 &params,
                 within(level),
@@ -1617,11 +1629,12 @@ impl WgpuRendererCore {
             from = to;
         }
         let settled = &levels[kawase.settled - 1];
+        let texture = self.create_blur_texture_bind_group("kawase_up_texture", from);
         self.fullscreen_pass(
             encoder,
             "kawase_up",
             &up,
-            from,
+            &texture,
             settled,
             &params,
             within(kawase.settled),
@@ -1629,19 +1642,19 @@ impl WgpuRendererCore {
         Ok(settled.clone())
     }
 
-    /// Draws one full-screen pass from `source` into `target`, within `within` when it is given.
-    /// The target is loaded rather than cleared, since the pass writes every texel it covers.
+    /// Draws one full-screen pass sampling `texture` into `target`, within `within` when it is
+    /// given. The target is loaded rather than cleared, since the pass writes every texel it
+    /// covers.
     fn fullscreen_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         label: &str,
         pipeline: &wgpu::RenderPipeline,
-        source: &wgpu::TextureView,
+        texture: &wgpu::BindGroup,
         target: &wgpu::TextureView,
         instances: &InstanceBinding,
         within: Option<[u32; 4]>,
     ) {
-        let texture = self.create_texture_bind_group("backdrop_texture_bind_group", source);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1660,7 +1673,7 @@ impl WgpuRendererCore {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.set_bind_group(2, &texture, &[]);
+        pass.set_bind_group(2, texture, &[]);
         if let Some([left, top, width, height]) = within {
             pass.set_scissor_rect(left, top, width, height);
         }
@@ -2062,6 +2075,15 @@ impl WgpuRendererCore {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let blur_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blur_sampler"),
+            address_mode_u: wgpu::AddressMode::MirrorRepeat,
+            address_mode_v: wgpu::AddressMode::MirrorRepeat,
+            address_mode_w: wgpu::AddressMode::MirrorRepeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
@@ -2165,6 +2187,7 @@ impl WgpuRendererCore {
                 pipelines,
                 bind_group_layouts,
                 atlas_sampler,
+                blur_sampler,
                 atlas_texture_bind_groups: FxHashMap::default(),
                 globals_buffer,
                 globals_bind_group,
@@ -2591,11 +2614,12 @@ impl WgpuRendererCore {
                 &[BlurParams::default()],
             )?;
             let blit = self.resources().pipelines.blit.clone();
+            let texture = self.create_texture_bind_group("frame_blit_texture", &main_view);
             self.fullscreen_pass(
                 &mut encoder,
                 "frame_blit",
                 &blit,
-                &main_view,
+                &texture,
                 frame_view,
                 &plain,
                 None,
@@ -2727,6 +2751,34 @@ impl WgpuRendererCore {
         texture_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         let resources = self.resources();
+        Self::create_sampled_texture_bind_group(
+            resources,
+            label,
+            texture_view,
+            &resources.atlas_sampler,
+        )
+    }
+
+    fn create_blur_texture_bind_group(
+        &self,
+        label: &str,
+        texture_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        let resources = self.resources();
+        Self::create_sampled_texture_bind_group(
+            resources,
+            label,
+            texture_view,
+            &resources.blur_sampler,
+        )
+    }
+
+    fn create_sampled_texture_bind_group(
+        resources: &WgpuResources,
+        label: &str,
+        texture_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
         resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2739,7 +2791,7 @@ impl WgpuRendererCore {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
             })
