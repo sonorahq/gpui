@@ -1846,9 +1846,15 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
                 let Some((size, bytes)) = build()? else {
                     return Ok(None);
                 };
-                let tile = self
-                    .backend
-                    .insert(entry.key().texture_kind(), size, &bytes)?;
+                let kind = entry.key().texture_kind();
+                let tile = match entry.key() {
+                    AtlasKey::Svg(_) => {
+                        let (padded_size, padded) = pad_alpha_mask(size, &bytes);
+                        let tile = self.backend.insert(kind, padded_size, &padded)?;
+                        inset_tile(tile, SVG_TILE_PADDING)
+                    }
+                    _ => self.backend.insert(kind, size, &bytes)?,
+                };
                 entry.insert(tile);
                 Ok(Some(tile))
             }
@@ -1859,6 +1865,51 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
         if let Some(tile) = self.tiles_by_key.remove(key) {
             self.backend.remove(tile);
         }
+    }
+}
+
+/// Transparent texels kept around every SVG tile. An SVG can be drawn rotated, scaled or at a
+/// fractional offset, and the linear sampler then reads up to one texel past the tile's edge,
+/// which would otherwise blend in whatever glyph or icon the allocator packed next to it.
+const SVG_TILE_PADDING: i32 = 1;
+
+/// Copies a one-byte-per-texel alpha mask into the middle of a buffer that is
+/// [`SVG_TILE_PADDING`] larger on every side, leaving the border transparent.
+fn pad_alpha_mask(size: Size<DevicePixels>, bytes: &[u8]) -> (Size<DevicePixels>, Vec<u8>) {
+    let width = size.width.0.max(0) as usize;
+    let height = size.height.0.max(0) as usize;
+    let pad = SVG_TILE_PADDING as usize;
+    let padded_width = width + 2 * pad;
+    let padded_height = height + 2 * pad;
+    let mut padded = vec![0u8; padded_width * padded_height];
+    if width > 0 {
+        for (row, source) in bytes.chunks_exact(width).take(height).enumerate() {
+            let start = (row + pad) * padded_width + pad;
+            padded[start..start + width].copy_from_slice(source);
+        }
+    }
+    let padded_size = Size {
+        width: DevicePixels(padded_width as i32),
+        height: DevicePixels(padded_height as i32),
+    };
+    (padded_size, padded)
+}
+
+/// Shrinks a tile allocated with `padding` texels on every side to the content inside them.
+fn inset_tile(tile: AtlasTile, padding: i32) -> AtlasTile {
+    AtlasTile {
+        padding: padding as u32,
+        bounds: Bounds {
+            origin: Point {
+                x: tile.bounds.origin.x + DevicePixels(padding),
+                y: tile.bounds.origin.y + DevicePixels(padding),
+            },
+            size: Size {
+                width: tile.bounds.size.width - DevicePixels(2 * padding),
+                height: tile.bounds.size.height - DevicePixels(2 * padding),
+            },
+        },
+        ..tile
     }
 }
 
