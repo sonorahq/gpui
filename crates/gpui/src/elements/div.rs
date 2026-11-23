@@ -3233,6 +3233,23 @@ impl Interactivity {
                     .get_or_insert_with(Default::default)
                     .clone();
 
+                // The prepaint check below sees only bounds, so a tooltip shown before something
+                // covered its element would stay up under a resting pointer. Drop it at paint.
+                let covered = pending_mouse_down.borrow().is_none()
+                    && hitbox.bounds.contains(&window.mouse_position())
+                    && !hitbox.is_hovered(window);
+                let stale = matches!(
+                    active_tooltip.borrow().as_ref(),
+                    Some(ActiveTooltip::Visible {
+                        is_hoverable: false,
+                        ..
+                    })
+                );
+                if covered && stale {
+                    active_tooltip.borrow_mut().take();
+                    window.defer(cx, |window, _| window.refresh());
+                }
+
                 let tooltip_is_hoverable = tooltip_builder.hoverable;
                 let build_tooltip = Rc::new(move |window: &mut Window, cx: &mut App| {
                     Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
