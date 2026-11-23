@@ -993,6 +993,27 @@ impl Platform for WindowsPlatform {
         }
     }
 
+    fn show_cursor(&self) {
+        if self
+            .inner
+            .state
+            .cursor_visible
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+
+        for handle in self.raw_window_handles.read().iter() {
+            let Some(window) = window_from_hwnd(handle.as_raw()) else {
+                continue;
+            };
+            if window.state.hovered.get() {
+                unsafe { SetCursor(window.state.current_cursor.get()) };
+                break;
+            }
+        }
+    }
+
     fn is_cursor_visible(&self) -> bool {
         self.inner.state.cursor_visible.load(Ordering::Relaxed)
     }

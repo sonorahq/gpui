@@ -1329,6 +1329,12 @@ impl App {
         self.platform.hide_cursor_until_mouse_moves();
     }
 
+    /// Brings back a cursor that [`App::hide_cursor`] hid, for a stage that wakes on a click
+    /// rather than on motion.
+    pub fn show_cursor(&self) {
+        self.platform.show_cursor();
+    }
+
     /// Returns whether non-essential animations (e.g. loading spinners) should
     /// be rendered in a static state instead of animating.
     pub fn reduce_motion(&self) -> bool {

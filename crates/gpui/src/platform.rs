@@ -571,6 +571,10 @@ pub trait Platform: 'static {
     /// this application's windows.
     fn hide_cursor_until_mouse_moves(&self);
 
+    /// Shows a cursor that [`Platform::hide_cursor_until_mouse_moves`] hid, without waiting for
+    /// the mouse to move. Does nothing while the cursor is visible.
+    fn show_cursor(&self);
+
     /// Returns whether the mouse cursor is currently visible.
     fn is_cursor_visible(&self) -> bool;
 

@@ -1215,6 +1215,16 @@ impl Platform for MacPlatform {
         }
     }
 
+    fn show_cursor(&self) {
+        let cursor_visible = self.0.lock().cursor_visible.clone();
+        if cursor_visible.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        unsafe {
+            let _: () = msg_send![class!(NSCursor), setHiddenUntilMouseMoves: NO];
+        }
+    }
+
     fn is_cursor_visible(&self) -> bool {
         self.0.lock().cursor_visible.load(Ordering::Relaxed)
     }
