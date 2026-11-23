@@ -2879,6 +2879,17 @@ impl Interactivity {
             });
             let current_view = window.current_view();
 
+            // Layout reads this stored state rather than the hitbox, so without this check a
+            // hover style that changes text stays stale under a resting pointer until it moves.
+            // Only a stale hover clears here, since entering on paint could flip forever when a
+            // hover style moves the hitbox off the pointer.
+            if let Some(hover_state) = &hover_state {
+                if hover_state.borrow().element && !hitbox.is_hovered(window) {
+                    hover_state.borrow_mut().element = false;
+                    window.defer(cx, move |_, cx| cx.notify(current_view));
+                }
+            }
+
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = hitbox.is_hovered(window);
                 let was_hovered = hover_state

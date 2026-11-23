@@ -214,6 +214,10 @@ impl Platform for VisualTestPlatform {
         self.platform.hide_cursor_until_mouse_moves();
     }
 
+    fn show_cursor(&self) {
+        self.platform.show_cursor();
+    }
+
     fn is_cursor_visible(&self) -> bool {
         self.platform.is_cursor_visible()
     }

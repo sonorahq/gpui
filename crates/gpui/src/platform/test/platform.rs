@@ -742,6 +742,8 @@ impl Platform for TestPlatform {
 
     fn hide_cursor_until_mouse_moves(&self) {}
 
+    fn show_cursor(&self) {}
+
     fn is_cursor_visible(&self) -> bool {
         true
     }

@@ -1215,6 +1215,15 @@ impl Platform for MacPlatform {
         }
     }
 
+    fn show_cursor(&self) {
+        // A mouse down marks the cursor visible before it is dispatched while AppKit keeps it
+        // hidden, so the flag cannot tell whether to unhide.
+        self.0.lock().cursor_visible.store(true, Ordering::Relaxed);
+        unsafe {
+            let _: () = msg_send![class!(NSCursor), setHiddenUntilMouseMoves: NO];
+        }
+    }
+
     fn is_cursor_visible(&self) -> bool {
         self.0.lock().cursor_visible.load(Ordering::Relaxed)
     }

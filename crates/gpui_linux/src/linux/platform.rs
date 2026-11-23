@@ -1021,6 +1021,10 @@ impl Platform for LinuxPlatform {
         self.connection.borrow().hide_cursor_until_mouse_moves()
     }
 
+    fn show_cursor(&self) {
+        self.connection.borrow().show_cursor()
+    }
+
     fn is_cursor_visible(&self) -> bool {
         self.connection.borrow().is_cursor_visible()
     }
