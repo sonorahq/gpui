@@ -1543,6 +1543,13 @@ fn blur_inside(at: vec2<f32>, extent: vec2<f32>) -> f32 {
     return span.x * span.y;
 }
 
+// How much of a texel wide span centred at `at`, in texels, lies within `0..limit` along one
+// axis. A gaussian pass reads along one axis only, so a texel's coverage across it is the same
+// for every tap and must not weigh the taps against the centre.
+fn blur_along(at: f32, limit: f32) -> f32 {
+    return saturate(min(at + 0.5, limit) - max(at - 0.5, 0.0));
+}
+
 // Pairs neighbouring taps into one bilinear fetch placed between them by their weights, which
 // halves the fetches of a plain gaussian. It relies on sampling a texture of the same size as the
 // target, so every pair lands between two texel centres along the axis.
@@ -1552,26 +1559,29 @@ fn fs_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
     return gaussian_pass(input.uv, blur.direction, blur.radius, blur_extent(blur.level));
 }
 
-// One gaussian pass along `direction` at `uv`, with `radius` as its standard deviation. A tap
-// past `extent` drops out of the pair it belongs to, and the pass divides by what is left.
+// One gaussian pass along `direction` at `uv`, with `radius` as its standard deviation. Every
+// tap, the centre too, counts by how much of it lies within `extent` along `direction`: a tap
+// past it drops out of the pair it belongs to, and the pass divides by what is left.
 fn gaussian_pass(uv: vec2<f32>, direction: vec2<f32>, radius: f32, extent: vec2<f32>) -> vec4<f32> {
     let size = vec2<f32>(textureDimensions(t_sprite));
     let texel = direction / size;
-    let centre = uv * size;
+    let axis = dot(uv * size, direction);
+    let limit = dot(extent, direction);
     let sigma = max(radius, 0.0001);
     let reach = min(ceil(sigma * 3.0), 24.0);
     let spread = 2.0 * sigma * sigma;
 
-    var total = textureSample(t_sprite, s_sprite, uv);
-    var weight = 1.0;
+    let own = blur_along(axis, limit);
+    var total = own * textureSample(t_sprite, s_sprite, uv);
+    var weight = own;
     var inner = 1.0;
     while (inner <= reach) {
         let outer = inner + 1.0;
         let inner_weight = exp(-inner * inner / spread);
         let outer_weight = select(0.0, exp(-outer * outer / spread), outer <= reach);
         for (var side = -1.0; side <= 1.0; side += 2.0) {
-            let inner_tap = inner_weight * blur_inside(centre + direction * inner * side, extent);
-            let outer_tap = outer_weight * blur_inside(centre + direction * outer * side, extent);
+            let inner_tap = inner_weight * blur_along(axis + inner * side, limit);
+            let outer_tap = outer_weight * blur_along(axis + outer * side, limit);
             let pair = inner_tap + outer_tap;
             let at = texel * (side * (inner * inner_tap + outer * outer_tap) / max(pair, 0.0001));
             total += pair * textureSample(t_sprite, s_sprite, uv + at);
@@ -1580,7 +1590,7 @@ fn gaussian_pass(uv: vec2<f32>, direction: vec2<f32>, radius: f32, extent: vec2<
         inner += 2.0;
     }
 
-    return total / weight;
+    return total / max(weight, 0.0001);
 }
 
 // Four taps at `centre` plus each of `offsets` and their mirror images, in texels of the texture
@@ -1672,19 +1682,21 @@ fn fs_mask_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
     let spread = 2.0 * sigma * sigma;
 
     // the taps past the frame's edge drop out, as in `gaussian_pass`
-    var total = textureSample(t_sprite, s_sprite, uv);
-    var weight = 1.0;
+    let limit = globals.viewport_size.y;
+    let own = blur_along(centre.y, limit);
+    var total = own * textureSample(t_sprite, s_sprite, uv);
+    var weight = own;
     var tap = 1.0;
     while (tap <= reach) {
         let tap_weight = exp(-tap * tap / spread);
-        let below = tap_weight * blur_inside(centre + vec2<f32>(0.0, tap), globals.viewport_size);
-        let above = tap_weight * blur_inside(centre - vec2<f32>(0.0, tap), globals.viewport_size);
+        let below = tap_weight * blur_along(centre.y + tap, limit);
+        let above = tap_weight * blur_along(centre.y - tap, limit);
         total += below * textureSample(t_sprite, s_sprite, uv + texel * tap);
         total += above * textureSample(t_sprite, s_sprite, uv - texel * tap);
         weight += below + above;
         tap += 1.0;
     }
-    return total / weight * coverage;
+    return total / max(weight, 0.0001) * coverage;
 }
 
 // Where a destination pixel of a layer reads its source, undoing the layer's transform.

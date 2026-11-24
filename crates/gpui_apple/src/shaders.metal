@@ -1457,11 +1457,19 @@ float blur_inside(float2 at, float2 extent) {
   return span.x * span.y;
 }
 
+// How much of a texel wide span centred at `at`, in texels, lies within `0..limit` along one
+// axis. A gaussian pass reads along one axis only, so a texel's coverage across it is the same
+// for every tap and must not weigh the taps against the centre.
+float blur_along(float at, float limit) {
+  return saturate(min(at + 0.5, limit) - max(at - 0.5, 0.0));
+}
+
 // A narrow blur runs `gaussian_fragment` across and then down at full resolution, with `radius`
 // as its standard deviation, and a wide one runs it across and down the deepest level of a
 // pyramid. It pairs neighbouring taps into one bilinear fetch placed between them by their
 // weights, which halves the fetches, and relies on sampling a texture of the same size as the
-// target, so every pair lands between two texel centres along the axis. A tap past the frame's
+// target, so every pair lands between two texel centres along the axis. Every tap, the centre
+// too, counts by how much of it lies inside the frame along the axis, so a tap past the frame's
 // edge drops out of the pair it belongs to.
 fragment float4 gaussian_fragment(
     FilterFragmentInput input [[stage_in]],
@@ -1473,20 +1481,22 @@ fragment float4 gaussian_fragment(
   float2 direction = float2(params->direction[0], params->direction[1]);
   float2 extent = float2(params->extent[0], params->extent[1]);
   float2 texel = direction / size;
-  float2 centre = input.uv * size;
+  float axis = dot(input.uv * size, direction);
+  float limit = dot(extent, direction);
   float sigma = max(params->radius, 0.0001);
   float reach = min(ceil(sigma * 3.0), 24.0);
   float spread = 2.0 * sigma * sigma;
 
-  float4 total = source.sample(source_sampler, input.uv);
-  float weight = 1.0;
+  float own = blur_along(axis, limit);
+  float4 total = own * source.sample(source_sampler, input.uv);
+  float weight = own;
   for (float inner = 1.0; inner <= reach; inner += 2.0) {
     float outer = inner + 1.0;
     float inner_weight = exp(-inner * inner / spread);
     float outer_weight = outer <= reach ? exp(-outer * outer / spread) : 0.0;
     for (float side = -1.0; side <= 1.0; side += 2.0) {
-      float inner_tap = inner_weight * blur_inside(centre + direction * inner * side, extent);
-      float outer_tap = outer_weight * blur_inside(centre + direction * outer * side, extent);
+      float inner_tap = inner_weight * blur_along(axis + inner * side, limit);
+      float outer_tap = outer_weight * blur_along(axis + outer * side, limit);
       float pair = inner_tap + outer_tap;
       float2 at = texel * (side * (inner * inner_tap + outer * outer_tap) / max(pair, 0.0001));
       total += pair * source.sample(source_sampler, input.uv + at);
@@ -1494,7 +1504,7 @@ fragment float4 gaussian_fragment(
     }
   }
 
-  return total / weight;
+  return total / max(weight, 0.0001);
 }
 
 // Four bilinear taps at `centre` plus `offset` mirrored into each quadrant, in texels of

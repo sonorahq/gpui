@@ -1491,11 +1491,19 @@ float blur_inside(float2 at, float2 extent) {
     return span.x * span.y;
 }
 
+// How much of a texel wide span centred at `at`, in texels, lies within `0..limit` along one
+// axis. A gaussian pass reads along one axis only, so a texel's coverage across it is the same
+// for every tap and must not weigh the taps against the centre.
+float blur_along(float at, float limit) {
+    return saturate(min(at + 0.5, limit) - max(at - 0.5, 0.0));
+}
+
 // A narrow blur runs `gaussian_fragment` across and then down at full resolution, with `radius`
 // as its standard deviation, and a wide one runs it across and down the deepest level of a
 // pyramid. It pairs neighbouring taps into one bilinear fetch placed between them by their
 // weights, which halves the fetches, and relies on sampling a texture of the same size as the
-// target, so every pair lands between two texel centres along the axis. A tap past the frame's
+// target, so every pair lands between two texel centres along the axis. Every tap, the centre
+// too, counts by how much of it lies inside the frame along the axis, so a tap past the frame's
 // edge drops out of the pair it belongs to.
 float4 gaussian_fragment(FilterFragmentInput input): SV_Target {
     FilterParams params = filter_params[batch_start_index];
@@ -1504,13 +1512,15 @@ float4 gaussian_fragment(FilterFragmentInput input): SV_Target {
     t_sprite.GetDimensions(width, height);
     float2 size = float2(width, height);
     float2 texel = params.direction / size;
-    float2 centre = input.uv * size;
+    float axis = dot(input.uv * size, params.direction);
+    float limit = dot(params.extent, params.direction);
     float sigma = max(params.radius, 0.0001);
     float reach = min(ceil(sigma * 3.0), 24.0);
     float spread = 2.0 * sigma * sigma;
 
-    float4 total = t_sprite.Sample(s_sprite, input.uv);
-    float weight = 1.0;
+    float own = blur_along(axis, limit);
+    float4 total = own * t_sprite.Sample(s_sprite, input.uv);
+    float weight = own;
     for (float inner = 1.0; inner <= reach; inner += 2.0) {
         float outer = inner + 1.0;
         float inner_weight = exp(-inner * inner / spread);
@@ -1518,8 +1528,8 @@ float4 gaussian_fragment(FilterFragmentInput input): SV_Target {
         [unroll]
         for (int i = 0; i < 2; i++) {
             float side = i == 0 ? -1.0 : 1.0;
-            float inner_tap = inner_weight * blur_inside(centre + params.direction * inner * side, params.extent);
-            float outer_tap = outer_weight * blur_inside(centre + params.direction * outer * side, params.extent);
+            float inner_tap = inner_weight * blur_along(axis + inner * side, limit);
+            float outer_tap = outer_weight * blur_along(axis + outer * side, limit);
             float pair = inner_tap + outer_tap;
             float2 at = texel * (side * (inner * inner_tap + outer * outer_tap) / max(pair, 0.0001));
             total += pair * t_sprite.Sample(s_sprite, input.uv + at);
@@ -1527,7 +1537,7 @@ float4 gaussian_fragment(FilterFragmentInput input): SV_Target {
         }
     }
 
-    return total / weight;
+    return total / max(weight, 0.0001);
 }
 
 // Four bilinear taps at `centre` plus `offset` mirrored into each quadrant, in texels of the
