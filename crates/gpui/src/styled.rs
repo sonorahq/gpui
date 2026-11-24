@@ -824,6 +824,7 @@ pub trait Styled: Sized {
             weight,
             style,
             letter_spacing,
+            scale,
         } = font;
 
         let text_style = self.text_style();
@@ -833,6 +834,7 @@ pub trait Styled: Sized {
         text_style.font_style = Some(style);
         text_style.font_fallbacks = fallbacks;
         text_style.letter_spacing = Some(letter_spacing);
+        text_style.font_scale = Some(scale);
 
         self
     }
