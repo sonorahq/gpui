@@ -63,7 +63,8 @@ const IDLE_RELEASE: Duration = Duration::from_secs(2);
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
 
-/// The widest and tallest a frame drawn offscreen may be, which every Metal GPU can allocate.
+/// The widest and tallest the overscan may grow a frame drawn offscreen to, which every Metal GPU
+/// can allocate. A window already larger keeps its size and gets no overscan.
 const MAX_FRAME: i32 = 16384;
 /// How long a frame may stay on the GPU before the window draws again without waiting for it, so a
 /// completion that never arrives cannot freeze the window.
@@ -1085,10 +1086,13 @@ impl MetalRenderer {
         };
         let overscanned = overscan.width.0 > 0 || overscan.height.0 > 0;
         let mirrored = (filtered && !scene.backdrops.is_empty()) || overscanned;
+        let grow = |side: DevicePixels, past: DevicePixels| {
+            DevicePixels(side.0 + past.0.clamp(0, (MAX_FRAME - side.0).max(0)))
+        };
         let viewport_size = match mirrored {
             true => size(
-                DevicePixels((viewport_size.width.0 + overscan.width.0.max(0)).min(MAX_FRAME)),
-                DevicePixels((viewport_size.height.0 + overscan.height.0.max(0)).min(MAX_FRAME)),
+                grow(viewport_size.width, overscan.width),
+                grow(viewport_size.height, overscan.height),
             ),
             false => viewport_size,
         };
