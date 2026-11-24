@@ -221,6 +221,7 @@ impl FilterTargets {
             .chain(std::iter::once(&mut self.backdrop))
             .chain(self.layers.iter_mut())
             .chain(self.levels.iter_mut())
+            .chain(self.spreads.iter_mut())
             .chain(std::iter::once(&mut self.scratch));
         for slot in slots {
             if slot
