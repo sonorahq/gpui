@@ -3581,11 +3581,9 @@ fn create_sampler(
     Ok(output)
 }
 
-/// The size in texels of a target `shrink` times smaller than the frame. Blur levels are made at
-/// exactly this size, so every pass draws over the whole texture and no row or column is left
-/// unwritten at the frame's edge.
-/// The size of a blur level, the frame's halved `shrink` times and rounded up, so the level
-/// covers the whole frame.
+/// The size in texels of a target `shrink` times smaller than the frame, rounded up so the level
+/// covers the whole frame. Blur levels are made at exactly this size, so every pass draws over
+/// the whole texture and no row or column is left unwritten at the frame's edge.
 fn level_size(viewport: &D3D11_VIEWPORT, shrink: u32) -> (u32, u32) {
     (
         (viewport.Width as u32).div_ceil(shrink),
