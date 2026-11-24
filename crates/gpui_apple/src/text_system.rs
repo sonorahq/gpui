@@ -600,6 +600,7 @@ impl AppleTextSystemState {
                     runs.push(ShapedRun {
                         font_id,
                         glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
+                        font_size: None,
                     });
                     &mut runs.last_mut().unwrap().glyphs
                 }
@@ -796,6 +797,8 @@ mod tests {
                 font_id: configured_id,
                 len: 6,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             }],
         );
         assert_eq!(layout.len, 6);
@@ -811,6 +814,8 @@ mod tests {
             font_id,
             len: line.len(),
             letter_spacing: Default::default(),
+            scale: Default::default(),
+            leading: Default::default(),
         };
 
         let layout = fonts.layout_line(line, px(16.), &[style]);
@@ -833,11 +838,15 @@ mod tests {
                 len: "\u{feff}".len(),
                 font_id,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             },
             FontRun {
                 len: "ab".len(),
                 font_id,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             },
         ];
         let layout = fonts.layout_line(line, px(16.), font_runs);
@@ -860,11 +869,15 @@ mod tests {
                 font_id,
                 len: 5,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             }, // "hello"
             FontRun {
                 font_id,
                 len: 6,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             }, // " world"
         ];
 
@@ -889,12 +902,16 @@ mod tests {
                 font_id,
                 len: 5,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             }, // "hello"
             // " world"
             FontRun {
                 font_id: font_id2,
                 len: 6,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             },
         ];
 
@@ -923,6 +940,8 @@ mod tests {
             font_id,
             len: 5,
             letter_spacing: Default::default(),
+            scale: Default::default(),
+            leading: Default::default(),
         }];
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, text.len());
@@ -933,16 +952,22 @@ mod tests {
                 font_id,
                 len: 1,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             }, // "a"
             FontRun {
                 font_id,
                 len: 1,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             }, // "b"
             FontRun {
                 font_id,
                 len: 1,
                 letter_spacing: Default::default(),
+                scale: Default::default(),
+                leading: Default::default(),
             }, // "c"
         ];
         let layout = fonts.layout_line(text, px(16.), font_runs);

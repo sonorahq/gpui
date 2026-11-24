@@ -271,7 +271,7 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let layout_id = state.layout(SharedString::from(*self), None, Rc::from([]), window, cx);
         (layout_id, state)
     }
 
@@ -345,7 +345,7 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, window, cx);
+        let layout_id = state.layout(self.clone(), None, Rc::from([]), window, cx);
         (layout_id, state)
     }
 
@@ -393,6 +393,7 @@ pub struct StyledText {
     runs: Option<Vec<TextRun>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
+    gaps: Rc<[(usize, Pixels)]>,
     layout: TextLayout,
 }
 
@@ -404,6 +405,7 @@ impl StyledText {
             runs: None,
             delayed_highlights: None,
             delayed_font_family_overrides: None,
+            gaps: Rc::from([]),
             layout: TextLayout::default(),
         }
     }
@@ -522,6 +524,25 @@ impl StyledText {
         }
     }
 
+    /// Opens a space of each width before its byte index, so the element can draw something of
+    /// its own inside the text there, such as an icon, at the place
+    /// [`TextLayout::position_for_index`] gives for the index, less the width. The indices must
+    /// fall on character boundaries, and any that don't are dropped; the text and its indices stay
+    /// as they were.
+    pub fn with_gaps(mut self, gaps: impl IntoIterator<Item = (usize, Pixels)>) -> Self {
+        let mut gaps: Vec<_> = gaps
+            .into_iter()
+            .filter(|(index, _)| {
+                let on_boundary = self.text.is_char_boundary(*index);
+                debug_assert!(on_boundary, "gap at {index} is inside a character");
+                on_boundary
+            })
+            .collect();
+        gaps.sort_by_key(|(index, _)| *index);
+        self.gaps = gaps.into();
+        self
+    }
+
     /// Set the text runs for this piece of text.
     pub fn with_runs(mut self, runs: Vec<TextRun>) -> Self {
         let mut text = &*self.text;
@@ -571,7 +592,9 @@ impl Element for StyledText {
             Self::apply_font_family_overrides(runs, overrides);
         }
 
-        let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
+        let layout_id = self
+            .layout
+            .layout(self.text.clone(), runs, self.gaps.clone(), window, cx);
         (layout_id, ())
     }
 
@@ -765,6 +788,7 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        gaps: Rc<[(usize, Pixels)]>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -934,10 +958,11 @@ impl TextLayout {
 
                 let Some(lines) = window
                     .text_system()
-                    .shape_text(
+                    .shape_text_with_gaps(
                         text,
                         font_size,
                         &runs,
+                        &gaps,
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.
                     )
@@ -1137,6 +1162,33 @@ impl TextLayout {
             }
         }
 
+        None
+    }
+
+    /// Where the space [`StyledText::with_gaps`] opened before `index` is drawn, in the
+    /// window: the top left of the box the element draws its own content in.
+    pub fn gap_origin(&self, index: usize) -> Option<Point<Pixels>> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+        let line_height = element_state.line_height;
+        let mut line_origin = bounds.origin;
+        let mut line_start_ix = 0;
+        for line in &element_state.lines {
+            let line_end_ix = line_start_ix + line.len();
+            if index < line_start_ix {
+                break;
+            } else if index > line_end_ix {
+                line_origin.y += line.size(line_height).height;
+                line_start_ix = line_end_ix + 1;
+            } else {
+                return Some(line_origin + line.gap_origin(index - line_start_ix, line_height)?);
+            }
+        }
         None
     }
 
@@ -1542,6 +1594,91 @@ mod tests {
         let _ = div().child("String".to_string());
         let _ = div().child(Cow::Borrowed("Cow"));
         let _ = div().child(SharedString::from("SharedString"));
+    }
+
+    #[crate::test]
+    fn a_gap_opens_space_before_its_index_and_leaves_the_text_as_it_was(
+        cx: &mut crate::TestAppContext,
+    ) {
+        use crate::px;
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            let text = SharedString::from("ab cd");
+            let runs = [window.text_style().to_run(text.len())];
+            let size = px(16.);
+            let shaped = |gaps: &[(usize, Pixels)]| {
+                window
+                    .text_system()
+                    .shape_text_with_gaps(text.clone(), size, &runs, gaps, None, None)
+                    .expect("shaped")
+            };
+            let (plain, gapped) = (shaped(&[]), shaped(&[(0, px(10.)), (3, px(20.))]));
+            let x = |lines: &SmallVec<[crate::WrappedLine; 1]>, index| {
+                lines[0]
+                    .position_for_index(index, px(20.))
+                    .expect("a place")
+                    .x
+            };
+            assert_eq!(x(&gapped, 0), x(&plain, 0) + px(10.));
+            assert_eq!(x(&gapped, 2), x(&plain, 2) + px(10.));
+            assert_eq!(x(&gapped, 3), x(&plain, 3) + px(30.));
+            assert_eq!(gapped[0].width(), plain[0].width() + px(30.));
+            assert_eq!(gapped[0].text, plain[0].text);
+
+            let text = SharedString::from("aa bb");
+            let wrapped = window
+                .text_system()
+                .shape_text_with_gaps(text, size, &runs, &[(3, px(20.))], Some(px(45.)), None)
+                .expect("shaped");
+            assert_eq!(
+                wrapped[0].wrap_boundaries().len(),
+                1,
+                "it wraps once, before the gap"
+            );
+            assert_eq!(
+                wrapped[0].gap_origin(3, px(20.)),
+                Some(crate::point(px(0.), px(20.))),
+                "a row that wraps at a gap starts with it"
+            );
+            let after = wrapped[0]
+                .position_for_index(4, px(20.))
+                .expect("a place")
+                .x;
+            assert!((after - (px(20.) + x(&plain, 4) - x(&plain, 3))).abs() < px(0.01));
+            assert_eq!(
+                gapped[0].gap_origin(0, px(20.)),
+                Some(crate::point(px(0.), px(0.)))
+            );
+            assert_eq!(
+                gapped[0].gap_origin(3, px(20.)),
+                Some(crate::point(x(&plain, 3) + px(10.), px(0.)))
+            );
+        });
+    }
+
+    #[crate::test]
+    fn a_gap_on_a_third_line_opens_where_its_index_is(cx: &mut crate::TestAppContext) {
+        use crate::px;
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            let text = SharedString::from("a\nbbb\ncc");
+            let runs = [window.text_style().to_run(text.len())];
+            let shaped = |gaps: &[(usize, Pixels)]| {
+                window
+                    .text_system()
+                    .shape_text_with_gaps(text.clone(), px(16.), &runs, gaps, None, None)
+                    .expect("shaped")
+            };
+            let (plain, gapped) = (shaped(&[]), shaped(&[(7, px(10.))]));
+            let x = |lines: &SmallVec<[crate::WrappedLine; 1]>, index| {
+                lines[2]
+                    .position_for_index(index, px(20.))
+                    .expect("a place")
+                    .x
+            };
+            assert_eq!(x(&gapped, 0), x(&plain, 0));
+            assert_eq!(x(&gapped, 1), x(&plain, 1) + px(10.));
+        });
     }
 
     #[test]
