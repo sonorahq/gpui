@@ -6144,7 +6144,12 @@ impl Window {
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let content_mask = self.content_mask();
+        // A hitbox answers only where the window shows it, never in the overscan past its edges,
+        // which a pointer dragged out of the window could otherwise reach.
+        let visible = Bounds::new(Point::default(), self.viewport_size);
+        let content_mask = ContentMask {
+            bounds: self.content_mask().bounds.intersect(&visible),
+        };
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
@@ -10612,6 +10617,63 @@ mod tests {
             )
             .size_full()
         }
+    }
+
+    #[gpui::test]
+    fn test_hitboxes_stop_at_the_window_edge_over_overscan(cx: &mut TestAppContext) {
+        struct EdgeBlurView;
+
+        impl Render for EdgeBlurView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .relative()
+                    // a clickable row that runs on past the bottom edge
+                    .child(
+                        div()
+                            .id("row")
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom(px(-40.))
+                            .h(px(80.))
+                            .on_click(|_, _, _| {}),
+                    )
+                    // a frosted bar along the bottom edge, which draws the frame past it
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(px(20.))
+                            .backdrop_blur(px(12.)),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| EdgeBlurView);
+        // The first frame finds the backdrop and the next one draws with the overscan.
+        for _ in 0..2 {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(window.backdrop_overscan.height.0 > 0);
+            let bottom = window.viewport_size.height;
+            let inside = window
+                .rendered_frame
+                .hit_test(point(px(10.), bottom - px(5.)));
+            assert!(!inside.ids.is_empty());
+            let past = window
+                .rendered_frame
+                .hit_test(point(px(10.), bottom + px(5.)));
+            assert!(
+                past.ids.is_empty(),
+                "a pointer past the window edge must not reach a hitbox in the overscan"
+            );
+        })
+        .unwrap();
     }
 
     fn test_underline_paint_at_scales(
