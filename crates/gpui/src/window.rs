@@ -4698,15 +4698,18 @@ impl Window {
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
-        self.content_mask_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| ContentMask {
-                bounds: Bounds {
-                    origin: Point::default(),
-                    size: self.viewport_size + self.backdrop_overscan_pixels(),
-                },
-            })
+        let frame = Bounds {
+            origin: Point::default(),
+            size: self.viewport_size + self.backdrop_overscan_pixels(),
+        };
+        match self.content_mask_stack.last() {
+            // A mask an ancestor carried past the edges stops at them inside a scaled layer.
+            Some(mask) if self.overscan_suppressed > 0 => ContentMask {
+                bounds: mask.bounds.intersect(&frame),
+            },
+            Some(mask) => *mask,
+            None => ContentMask { bounds: frame },
+        }
     }
 
     /// How far past the right and bottom edges the frame is drawn, in logical pixels. Nothing
