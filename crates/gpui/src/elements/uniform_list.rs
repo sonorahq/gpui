@@ -470,14 +470,17 @@ impl Element for UniformList {
                         scroll_offset = *updated_scroll_offset
                     }
 
+                    // A list reaching the bottom edge draws on into the overscan below it.
+                    let past_bottom =
+                        (window.past_edges(bounds).bottom() - bounds.bottom()).to_f64();
                     let scroll_top = -scroll_offset.y.to_f64();
                     let item_height_f64 = item_height.to_f64();
                     let first_visible_element_ix =
                         ((scroll_top - padding.top.to_f64()) / item_height_f64).floor() as usize;
-                    let last_visible_element_ix = ((scroll_top
-                        + padded_bounds.size.height.to_f64())
-                        / item_height_f64)
-                        .ceil() as usize;
+                    let last_visible_element_ix =
+                        ((scroll_top + padded_bounds.size.height.to_f64() + past_bottom)
+                            / item_height_f64)
+                            .ceil() as usize;
 
                     let visible_range = first_visible_element_ix
                         ..cmp::min(last_visible_element_ix, self.item_count);

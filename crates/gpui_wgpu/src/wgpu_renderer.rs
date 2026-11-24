@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, BlurPasses, Bounds, DevicePixels, GAUSSIAN_REACH, GpuSpecs,
-    KAWASE_LEVELS, Kawase, LayerEffect, Path, Point, PrimitiveBatch, ScaledPixels, Scene, ShaderId,
+    AtlasTextureId, BLUR_LEVELS, Background, BlurPasses, Bounds, DevicePixels, GAUSSIAN_REACH,
+    GpuSpecs, LayerEffect, Path, Point, PrimitiveBatch, Pyramid, ScaledPixels, Scene, ShaderId,
     Size, get_gamma_correction_ratios, point, size,
 };
 use log::warn;
@@ -143,8 +143,8 @@ struct WgpuPipelines {
     backdrops: wgpu::RenderPipeline,
     backdrop_punch: wgpu::RenderPipeline,
     gaussian: wgpu::RenderPipeline,
-    kawase_down: wgpu::RenderPipeline,
-    kawase_up: wgpu::RenderPipeline,
+    pyramid_down: wgpu::RenderPipeline,
+    pyramid_up: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     masked: wgpu::RenderPipeline,
@@ -259,7 +259,9 @@ struct MaskParams {
 struct BlurParams {
     direction: [f32; 2],
     radius: f32,
-    pad: u32,
+    /// How many times the texture the pass reads is halved, which tells it how much of that
+    /// texture holds the frame.
+    level: u32,
 }
 
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
@@ -321,18 +323,21 @@ enum FilterTarget {
     Frame,
     /// The target a filtered layer is drawn into, by nesting depth.
     Layer(usize),
-    /// One blur level, the frame's size halved as many times as its index. Level zero holds a
-    /// finished gaussian.
+    /// One blur level, the frame's size halved as many times as its index and rounded up, so the
+    /// last texel of a level can hang past the frame's edge. Level zero holds a finished blur.
     Level(usize),
     /// Where a gaussian keeps its pass across before the pass down.
     Scratch,
+    /// Where the gaussian at the deepest level of a pyramid keeps its pass across, at that
+    /// level's size.
+    Spread(usize),
 }
 
 impl FilterTarget {
     /// How many times smaller than the frame the target is on each side.
     fn shrink(self) -> u32 {
         match self {
-            Self::Level(level) => 1 << level,
+            Self::Level(level) | Self::Spread(level) => 1 << level,
             Self::Frame | Self::Layer(_) | Self::Scratch | Self::Backdrop => 1,
         }
     }
@@ -344,6 +349,7 @@ impl FilterTarget {
             Self::Layer(depth) => format!("filter_layer_{depth}"),
             Self::Level(level) => format!("blur_{level}"),
             Self::Scratch => "blur_scratch".into(),
+            Self::Spread(level) => format!("blur_spread_{level}"),
         }
     }
 }
@@ -356,7 +362,8 @@ struct FilterTargets {
     frame: Option<Scratch>,
     backdrop: Option<Scratch>,
     layers: [Option<Scratch>; LAYER_DEPTH],
-    levels: [Option<Scratch>; KAWASE_LEVELS + 1],
+    levels: [Option<Scratch>; BLUR_LEVELS + 1],
+    spreads: [Option<Scratch>; BLUR_LEVELS + 1],
     scratch: Option<Scratch>,
 }
 
@@ -368,6 +375,7 @@ impl FilterTargets {
             FilterTarget::Layer(depth) => &mut self.layers[depth],
             FilterTarget::Level(level) => &mut self.levels[level],
             FilterTarget::Scratch => &mut self.scratch,
+            FilterTarget::Spread(level) => &mut self.spreads[level],
         }
     }
 
@@ -376,6 +384,7 @@ impl FilterTargets {
             .chain(std::iter::once(&mut self.backdrop))
             .chain(self.layers.iter_mut())
             .chain(self.levels.iter_mut())
+            .chain(self.spreads.iter_mut())
             .chain(std::iter::once(&mut self.scratch))
     }
 }
@@ -1076,10 +1085,10 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let kawase_down = create_pipeline(
-            "kawase_down",
+        let pyramid_down = create_pipeline(
+            "pyramid_down",
             "vs_blur",
-            "fs_kawase_down",
+            "fs_pyramid_down",
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
@@ -1089,10 +1098,10 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let kawase_up = create_pipeline(
-            "kawase_up",
+        let pyramid_up = create_pipeline(
+            "pyramid_up",
             "vs_blur",
-            "fs_kawase_up",
+            "fs_pyramid_up",
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
@@ -1319,8 +1328,8 @@ impl WgpuRendererCore {
             backdrops,
             backdrop_punch,
             gaussian,
-            kawase_down,
-            kawase_up,
+            pyramid_down,
+            pyramid_up,
             blit,
             composite,
             masked,
@@ -1364,9 +1373,9 @@ impl WgpuRendererCore {
 
     /// A bounds rectangle as a scissor for a target shrunk by the given factor.
     fn scissor(&self, bounds: Bounds<ScaledPixels>, shrink: u32) -> [u32; 4] {
+        let (width, height) = shrunk(self.frame_size, shrink);
+        let (width, height) = (width as f32, height as f32);
         let shrink = shrink as f32;
-        let width = (self.frame_size.0 as f32 / shrink).floor();
-        let height = (self.frame_size.1 as f32 / shrink).floor();
         let left = (bounds.origin.x.0 / shrink).floor().clamp(0., width);
         let top = (bounds.origin.y.0 / shrink).floor().clamp(0., height);
         let right = ((bounds.origin.x.0 + bounds.size.width.0) / shrink)
@@ -1471,10 +1480,9 @@ impl WgpuRendererCore {
         Ok(target)
     }
 
-    /// Blurs a source and returns the target holding the result. A narrow blur comes back at
-    /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
-    /// stretches it back up. A `spare` source is a layer nothing reads again, so a gaussian
-    /// writes its result back into it rather than into a full-size target of its own.
+    /// Blurs a source and returns the target holding the result, at full size. A `spare` source
+    /// is a layer nothing reads again, so the blur writes its result back into it rather than
+    /// into a full-size target of its own.
     fn blur_source(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1488,8 +1496,8 @@ impl WgpuRendererCore {
             BlurPasses::Gaussian(sigma) => {
                 self.gaussian_blur(encoder, source, spare, sigma, clip, instance_offset)
             }
-            BlurPasses::Kawase(kawase) => {
-                self.kawase_blur(encoder, source, kawase, clip, instance_offset)
+            BlurPasses::Pyramid(pyramid) => {
+                self.pyramid_blur(encoder, source, spare, pyramid, clip, instance_offset)
             }
         }
     }
@@ -1513,7 +1521,7 @@ impl WgpuRendererCore {
             &[BlurParams {
                 direction: [0., 1.],
                 radius: sigma,
-                pad: 0,
+                level: 0,
             }],
         )?;
         let settled = match spare {
@@ -1550,7 +1558,7 @@ impl WgpuRendererCore {
             &[BlurParams {
                 direction: [1., 0.],
                 radius: sigma,
-                pad: 0,
+                level: 0,
             }],
         )?;
         let scratch = self.filter_view(FilterTarget::Scratch);
@@ -1569,64 +1577,100 @@ impl WgpuRendererCore {
         Ok(scratch)
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the level it settled at.
-    fn kawase_blur(
+    /// Blurs a source with a [`Pyramid`]: down to the deepest level, a gaussian across and down
+    /// there, and back up to full size. Returns the target holding the result: level zero, or a
+    /// `spare` source.
+    fn pyramid_blur(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         source: &wgpu::TextureView,
-        kawase: Kawase,
+        spare: bool,
+        pyramid: Pyramid,
         clip: Option<Bounds<ScaledPixels>>,
         instance_offset: &mut u64,
     ) -> Result<wgpu::TextureView> {
-        let params = self.write_instance_binding(
-            "kawase_bind_group",
-            instance_offset,
-            &[BlurParams {
-                direction: [0., 0.],
-                radius: kawase.offset,
-                pad: 0,
-            }],
-        )?;
-        let levels: Vec<wgpu::TextureView> = (1..=kawase.levels)
-            .map(|level| self.filter_view(FilterTarget::Level(level)))
+        let deepest = pyramid.levels;
+        // A pass reads a level of its own, so each gets its own parameters, which name it.
+        let mut params = |label: &str, level: usize, direction: [f32; 2], radius: f32| {
+            self.write_instance_binding(
+                label,
+                instance_offset,
+                &[BlurParams {
+                    direction,
+                    radius,
+                    level: level as u32,
+                }],
+            )
+        };
+        let reads = (0..=deepest)
+            .map(|level| params("pyramid_bind_group", level, [0., 0.], 0.))
+            .collect::<Result<Vec<_>>>()?;
+        let across = params("pyramid_across", deepest, [1., 0.], pyramid.sigma)?;
+        let along = params("pyramid_along", deepest, [0., 1.], pyramid.sigma)?;
+        let levels: Vec<wgpu::TextureView> = (0..=deepest)
+            .map(|level| match (level, spare) {
+                (0, true) => source.clone(),
+                _ => self.filter_view(FilterTarget::Level(level)),
+            })
             .collect();
-        let down = self.resources().pipelines.kawase_down.clone();
-        let up = self.resources().pipelines.kawase_up.clone();
+        let spread = self.filter_view(FilterTarget::Spread(deepest));
+        let resources = self.resources();
+        let down = resources.pipelines.pyramid_down.clone();
+        let up = resources.pipelines.pyramid_up.clone();
+        let gaussian = resources.pipelines.gaussian.clone();
 
-        // Every pass covers the clip grown by what all the passes together read. The targets are
-        // never cleared, so a pass reads stale texels past the edge of what the one before it
-        // wrote, but they only creep inwards by what the later passes read, which this margin
-        // already holds. A texel more keeps the final bilinear sample on the clip's edge clean.
-        let reach = kawase.reach();
-        let within = |level: usize| {
-            let shrink = 1u32 << level;
-            clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(reach + shrink as f32)), shrink))
+        // The targets are never cleared, so a pass reads stale texels past what the one before
+        // it wrote. Each pass writes the clip grown by everything the passes after it read, which
+        // keeps those stale texels out of the clip.
+        let within = |level: usize, margin: f32| {
+            clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(margin)), 1 << level))
         };
 
-        let mut from = source;
-        for (level, to) in (1..).zip(&levels) {
+        for level in 1..=deepest {
+            let from = match level {
+                1 => source,
+                _ => &levels[level - 1],
+            };
             self.fullscreen_pass(
                 encoder,
-                "kawase_down",
+                "pyramid_down",
                 &down,
                 from,
-                to,
-                &params,
-                within(level),
+                &levels[level],
+                &reads[level - 1],
+                within(level, pyramid.down_margin(level)),
             );
-            from = to;
         }
-        let settled = &levels[kawase.settled - 1];
         self.fullscreen_pass(
             encoder,
-            "kawase_up",
-            &up,
-            from,
-            settled,
-            &params,
-            within(kawase.settled),
+            "pyramid_across",
+            &gaussian,
+            &levels[deepest],
+            &spread,
+            &across,
+            within(deepest, pyramid.across_margin()),
         );
-        Ok(settled.clone())
+        self.fullscreen_pass(
+            encoder,
+            "pyramid_along",
+            &gaussian,
+            &spread,
+            &levels[deepest],
+            &along,
+            within(deepest, pyramid.along_margin()),
+        );
+        for level in (0..deepest).rev() {
+            self.fullscreen_pass(
+                encoder,
+                "pyramid_up",
+                &up,
+                &levels[level + 1],
+                &levels[level],
+                &reads[level + 1],
+                within(level, pyramid.up_margin(level)),
+            );
+        }
+        Ok(levels[0].clone())
     }
 
     /// Draws one full-screen pass from `source` into `target`, within `within` when it is given.
@@ -1694,9 +1738,9 @@ impl WgpuRendererCore {
     /// no frame has drawn through it since it was last released.
     fn filter_view(&mut self, target: FilterTarget) -> wgpu::TextureView {
         let format = self.target_format;
-        let size = (
-            self.frame_size.0.max(1) / target.shrink(),
-            self.frame_size.1.max(1) / target.shrink(),
+        let size = shrunk(
+            (self.frame_size.0.max(1), self.frame_size.1.max(1)),
+            target.shrink(),
         );
         let now = self.frame_time;
         let resources = self.resources_mut();
@@ -2223,7 +2267,22 @@ impl WgpuRendererCore {
             self.max_texture_size
         );
 
-        let frame_size = (size.width.0 as u32, size.height.0 as u32);
+        // A backdrop near the right or bottom edge reads what the scene drew past it, so the
+        // frame is drawn that much larger and only the window's part of it is shown. A frame
+        // drawn straight into the window has nowhere to put it.
+        let overscan = match self.uses_webgl_instance_data {
+            true => (0, 0),
+            false => (
+                (scene.overscan.width.0.max(0) as u32)
+                    .min(self.max_texture_size - size.width.0 as u32),
+                (scene.overscan.height.0.max(0) as u32)
+                    .min(self.max_texture_size - size.height.0 as u32),
+            ),
+        };
+        let frame_size = (
+            size.width.0 as u32 + overscan.0,
+            size.height.0 as u32 + overscan.1,
+        );
         if frame_size != self.frame_size {
             self.resources.invalidate_intermediate_textures();
             self.frame_size = frame_size;
@@ -2238,7 +2297,7 @@ impl WgpuRendererCore {
             _pad: 0,
         };
         let globals = GlobalParams {
-            viewport_size: [size.width.0 as f32, size.height.0 as f32],
+            viewport_size: [frame_size.0 as f32, frame_size.1 as f32],
             premultiplied_alpha: premultiplied_alpha as u32,
             pad: 0,
         };
@@ -2262,7 +2321,8 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        let overscanned = overscan != (0, 0);
+        self.record_frame(scene, target_view, clear_color, overscanned)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -2274,6 +2334,7 @@ impl WgpuRendererCore {
         scene: &Scene,
         frame_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
+        overscanned: bool,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
         let filtered = !(scene.backdrops.is_empty() && scene.effects.is_empty())
@@ -2302,8 +2363,9 @@ impl WgpuRendererCore {
                 });
 
         // Layers composite into whatever they are drawn over, so only a backdrop — which samples
-        // the frame itself — is worth routing the whole frame through a texture for.
-        let mirrored = filtered && !scene.backdrops.is_empty();
+        // the frame itself — is worth routing the whole frame through a texture for, and an
+        // overscan, which the window has no room for.
+        let mirrored = (filtered && !scene.backdrops.is_empty()) || overscanned;
         let main_view = match mirrored {
             true => self.filter_view(FilterTarget::Frame),
             false => frame_view.clone(),
@@ -3786,6 +3848,11 @@ fn mask_params(layer: LayerEffect, destination_span: Bounds<ScaledPixels>) -> Ma
         fade_right: layer.filter.fade_right,
         pad: 0.0,
     }
+}
+
+/// A frame size divided by `shrink` and rounded up, so a blur level covers the whole frame.
+fn shrunk(size: (u32, u32), shrink: u32) -> (u32, u32) {
+    (size.0.div_ceil(shrink), size.1.div_ceil(shrink))
 }
 
 fn instance_range(range: Range<usize>) -> Range<u32> {

@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+    Pixels, Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point,
 };
 use collections::FxHashMap;
 use std::{
@@ -67,6 +67,10 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// How far past the window's right and bottom edges the frame is drawn, in device pixels,
+    /// so a backdrop blur near those edges reads what lies there instead of nothing. The
+    /// renderer draws the frame this much larger and shows only the window's part of it.
+    pub overscan: Size<DevicePixels>,
 }
 
 #[expect(missing_docs)]
@@ -89,6 +93,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.overscan = Size::default();
     }
 
     pub fn len(&self) -> usize {
@@ -537,42 +542,28 @@ pub struct Filter {
 }
 
 /// The widest blur, as a standard deviation in scaled pixels, that runs as a gaussian at full
-/// resolution. A Kawase blur this narrow would pass through half resolution with too little
-/// spread to hide it, and a thin line comes back from there visibly stepped.
+/// resolution. Anything wider goes through [`Pyramid`], whose first level halves the image.
 pub const GAUSSIAN_SIGMA: f32 = 4.;
 
 /// How far a gaussian pass reads to either side, in texels, before its weights stop mattering.
 pub const GAUSSIAN_REACH: f32 = 3.;
 
-/// How many times a dual Kawase blur can halve the image. Every level doubles the radius, so six
-/// reach close to a hundred scaled pixels.
-pub const KAWASE_LEVELS: usize = 6;
+/// How many times a pyramid blur can halve the image. The gaussian at the deepest level spreads
+/// up to four of its texels, so six reach a standard deviation of about 250 scaled pixels.
+pub const BLUR_LEVELS: usize = 6;
 
-/// The fewest levels a Kawase blur uses, since the gaussian covers everything narrower.
-const KAWASE_SHALLOWEST: usize = 2;
+/// The spread a gaussian at the deepest level of a pyramid starts from, in its texels. It takes
+/// the fewest levels that leave the gaussian at least this wide, since a narrower one leaves the
+/// level's texel grid showing through the passes back up.
+const PYRAMID_SPREAD: f32 = 2.;
 
-/// The distance between the offsets [`KAWASE_SPREAD`] was measured at.
-const KAWASE_STEP: f32 = 0.25;
+/// The variance a pass down adds, in squared texels of the level it reads: four bilinear taps,
+/// one on each corner around the texel it writes, average the four by four texels under it.
+const DOWN_VARIANCE: f32 = 1.25;
 
-/// The standard deviation a dual Kawase blur spreads a point to, divided by `2^levels`, measured
-/// at offsets of `0, 0.25, 0.5, ...` with the one up pass and the bilinear stretch the blur ends
-/// on. Rows are the level counts `2` and `3`, and the last row serves every deeper count, since
-/// the ratio stops moving by then. Each row ends where its kernel would go hollow in the middle
-/// and show the blurred shape twice.
-const KAWASE_SPREAD: [&[f32]; 3] = [
-    &[
-        0.484, 0.484, 0.484, 0.505, 0.525, 0.651, 0.741, 0.825, 0.896, 0.958, 1.015, 1.077, 1.136,
-        1.242, 1.335, 1.423, 1.502,
-    ],
-    &[
-        0.48, 0.48, 0.48, 0.501, 0.522, 0.659, 0.749, 0.831, 0.9, 0.962, 1.02, 1.085, 1.145, 1.251,
-        1.343, 1.434, 1.516,
-    ],
-    &[
-        0.479, 0.479, 0.479, 0.5, 0.521, 0.667, 0.756, 0.835, 0.901, 0.962, 1.02, 1.085, 1.148,
-        1.253, 1.346, 1.437, 1.52,
-    ],
-];
+/// The variance a pass up adds, in squared texels of the level it reads: four bilinear taps half
+/// a texel out on each diagonal, a box of one texel on top of the bilinear tent.
+const UP_VARIANCE: f32 = 1. / 6. + 1. / 4.;
 
 /// How a renderer blurs by a given standard deviation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -580,16 +571,16 @@ pub enum BlurPasses {
     /// Two separable gaussian passes at full resolution, across and then down, with this
     /// standard deviation in scaled pixels.
     Gaussian(f32),
-    /// A dual Kawase blur.
-    Kawase(Kawase),
+    /// A gaussian at a level of a pyramid.
+    Pyramid(Pyramid),
 }
 
 impl BlurPasses {
-    /// The source margin needed around a clipped blur, including downsample alignment.
+    /// The source margin needed around a clipped blur.
     pub fn source_margin(self) -> ScaledPixels {
         ScaledPixels(match self {
             Self::Gaussian(sigma) => (sigma * GAUSSIAN_REACH).ceil() + 1.,
-            Self::Kawase(kawase) => kawase.reach() + (1u32 << kawase.levels) as f32,
+            Self::Pyramid(pyramid) => pyramid.source_margin(),
         })
     }
 
@@ -598,68 +589,91 @@ impl BlurPasses {
     pub fn for_sigma(sigma: f32) -> Self {
         match sigma <= GAUSSIAN_SIGMA {
             true => Self::Gaussian(sigma.max(0.)),
-            false => Self::Kawase(Kawase::for_sigma(sigma)),
+            false => Self::Pyramid(Pyramid::for_sigma(sigma)),
         }
     }
 }
 
-/// The passes of a dual Kawase blur. It halves the image `levels` times with a five tap filter and
-/// grows it back one level with an eight tap one, leaving the rest of the way to the bilinear
-/// sample that composites it, so its cost barely grows with the radius.
+/// A wide blur. It halves the image `levels` times, blurs the deepest level with a separable
+/// gaussian, and grows it back level by level to full size, so its cost barely grows with the
+/// radius. Every pass is separable, so the blur stays round, and the gaussian carries most of
+/// the spread, so it keeps the gaussian's soft falloff. A dual Kawase blur spread a point into
+/// a square or a diamond depending on its radius, and stopping a level short of full size showed
+/// the deepest level's texels as a grid of soft squares.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Kawase {
-    /// How many times the image is halved, at least two.
+pub struct Pyramid {
+    /// How many times the image is halved, at least one.
     pub levels: usize,
-    /// How far the taps spread. A down pass puts its corner taps this many half texels out in
-    /// the texture it reads, and an up pass this many quarter texels out, which keeps its ring of
-    /// taps from going hollow.
-    pub offset: f32,
-    /// The level the blur ends on, one above the deepest, which the caller samples it from.
-    pub settled: usize,
+    /// The standard deviation of the gaussian at the deepest level, in its texels. The passes
+    /// down and up add the rest of the spread.
+    pub sigma: f32,
 }
 
-impl Kawase {
+impl Pyramid {
     /// The passes that spread a point as far as a gaussian of standard deviation `sigma`, in
-    /// scaled pixels. It takes the fewest levels that reach, since every level costs a pass, and a
-    /// radius past the deepest level is capped there. Anything under [`GAUSSIAN_SIGMA`] comes out
-    /// wider than asked, so go through [`BlurPasses::for_sigma`].
+    /// scaled pixels. A radius past the deepest level is capped there.
     pub fn for_sigma(sigma: f32) -> Self {
-        let sigma = sigma.max(0.);
-        let mut levels = KAWASE_SHALLOWEST;
-        loop {
-            let spread = KAWASE_SPREAD[(levels - KAWASE_SHALLOWEST).min(KAWASE_SPREAD.len() - 1)];
-            let scale = (1u32 << levels) as f32;
-            let widest = spread[spread.len() - 1] * scale;
-            if sigma <= widest || levels == KAWASE_LEVELS {
-                let target = sigma / scale;
-                let above = spread.partition_point(|&spread| spread < target);
-                let step = match above {
-                    0 => 0.,
-                    above if above == spread.len() => (spread.len() - 1) as f32,
-                    above => {
-                        let (low, high) = (spread[above - 1], spread[above]);
-                        (above - 1) as f32 + (target - low) / (high - low)
-                    }
-                };
-                return Self {
-                    levels,
-                    offset: step * KAWASE_STEP,
-                    settled: levels - 1,
-                };
-            }
-            levels += 1;
+        let sigma = sigma.max(GAUSSIAN_SIGMA);
+        let levels = ((sigma / PYRAMID_SPREAD).log2().floor() as usize).clamp(1, BLUR_LEVELS);
+        // Every pass adds its variance, scaled by the size of the texels it reads. What the
+        // gaussian leaves to them it does not have to spread itself.
+        let added: f32 = (1..=levels)
+            .map(|level| {
+                DOWN_VARIANCE * (1u32 << (2 * (level - 1))) as f32
+                    + UP_VARIANCE * (1u32 << (2 * level)) as f32
+            })
+            .sum();
+        let deepest = (1u32 << levels) as f32;
+        let rest = (sigma * sigma - added).max(0.);
+        Self {
+            levels,
+            sigma: (rest.sqrt() / deepest).min(PYRAMID_SPREAD * 2.),
         }
     }
 
-    /// How far the passes read past a texel, in scaled pixels of the frame, so a caller can grow
-    /// the region it blurs by this much and still have every tap land on written texels.
-    pub fn reach(&self) -> f32 {
-        // Every pass reaches half an offset and a bilinear texel out, in the texels it reads. The
-        // down passes read levels `0` to `levels - 1` and the up pass the deepest one, and a texel
-        // is `2^level` scaled pixels wide.
-        let tap = self.offset * 0.5 + 1.;
+    /// How far the gaussian reads past a texel, in texels of the deepest level.
+    fn spread(&self) -> f32 {
+        (self.sigma * GAUSSIAN_REACH).ceil() + 1.
+    }
+
+    /// How far around the clip, in scaled pixels of the frame, the pass up into `level` has to
+    /// write, so the passes up after it read only texels it wrote. Level zero gets a pixel more
+    /// than the clip for the sample that composites it.
+    pub fn up_margin(&self, level: usize) -> f32 {
+        // the pass into level `k - 1` reads two texels of level `k` out
+        1. + 2. * ((2u32 << level) - 2) as f32
+    }
+
+    /// How far around the clip the pass down the deepest level, the second half of the gaussian,
+    /// has to write.
+    pub fn along_margin(&self) -> f32 {
         let deepest = (1u32 << self.levels) as f32;
-        tap * (deepest * 2. - 1.)
+        self.up_margin(self.levels - 1) + 2. * deepest
+    }
+
+    /// How far around the clip the pass across the deepest level, the first half of the
+    /// gaussian, has to write.
+    pub fn across_margin(&self) -> f32 {
+        self.along_margin() + self.spread() * (1u32 << self.levels) as f32
+    }
+
+    /// How far around the clip the pass down into `level` has to write. The deepest level feeds
+    /// the gaussian, and every shallower one the pass down below it. The passes up write into
+    /// the same levels afterwards, but only once the passes down are done with them.
+    pub fn down_margin(&self, level: usize) -> f32 {
+        // the gaussian reads its spread out of the deepest level, and the pass into level
+        // `k + 1` two texels of level `k`
+        let deepest = (1u32 << self.levels) as f32;
+        let below: f32 = (level + 1..=self.levels)
+            .map(|deeper| (1u32 << deeper) as f32)
+            .sum();
+        self.across_margin() + self.spread() * deepest + below
+    }
+
+    /// How far around the clip the source has to hold what lies under it, which is what the
+    /// first pass down reads.
+    pub fn source_margin(&self) -> f32 {
+        self.down_margin(0)
     }
 }
 

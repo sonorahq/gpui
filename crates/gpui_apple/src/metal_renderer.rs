@@ -4,8 +4,8 @@ use block2::RcBlock;
 use collections::FxHashMap;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
-    KAWASE_LEVELS, Kawase, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
+    AtlasTextureId, BLUR_LEVELS, Background, BlurPasses, Bounds, ContentMask, DevicePixels,
+    GAUSSIAN_REACH, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, Pyramid, ScaledPixels,
     Scene, ShaderId, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -62,6 +62,9 @@ const INSTANCE_BUFFER_SETTLE: Duration = Duration::from_secs(5);
 const IDLE_RELEASE: Duration = Duration::from_secs(2);
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
+
+/// The widest and tallest a frame drawn offscreen may be, which every Metal GPU can allocate.
+const MAX_FRAME: i32 = 16384;
 /// How long a frame may stay on the GPU before the window draws again without waiting for it, so a
 /// completion that never arrives cannot freeze the window.
 const FRAME_STALL: Duration = Duration::from_millis(250);
@@ -183,8 +186,8 @@ pub struct MetalRenderer {
     backdrops_pipeline_state: metal::RenderPipelineState,
     backdrop_punch_pipeline_state: metal::RenderPipelineState,
     gaussian_pipeline_state: metal::RenderPipelineState,
-    kawase_down_pipeline_state: metal::RenderPipelineState,
-    kawase_up_pipeline_state: metal::RenderPipelineState,
+    pyramid_down_pipeline_state: metal::RenderPipelineState,
+    pyramid_up_pipeline_state: metal::RenderPipelineState,
     blit_pipeline_state: metal::RenderPipelineState,
     /// Writes transparent black under a scissor, for wiping the part of a layer target in use.
     clear_pipeline_state: metal::RenderPipelineState,
@@ -516,21 +519,21 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             FilterBlend::Replace,
         );
-        let kawase_down_pipeline_state = build_filter_pipeline_state(
+        let pyramid_down_pipeline_state = build_filter_pipeline_state(
             &device,
             &library,
-            "kawase_down",
+            "pyramid_down",
             "filter_vertex",
-            "kawase_down_fragment",
+            "pyramid_down_fragment",
             MTLPixelFormat::BGRA8Unorm,
             FilterBlend::Replace,
         );
-        let kawase_up_pipeline_state = build_filter_pipeline_state(
+        let pyramid_up_pipeline_state = build_filter_pipeline_state(
             &device,
             &library,
-            "kawase_up",
+            "pyramid_up",
             "filter_vertex",
-            "kawase_up_fragment",
+            "pyramid_up_fragment",
             MTLPixelFormat::BGRA8Unorm,
             FilterBlend::Replace,
         );
@@ -613,8 +616,8 @@ impl MetalRenderer {
             backdrops_pipeline_state,
             backdrop_punch_pipeline_state,
             gaussian_pipeline_state,
-            kawase_down_pipeline_state,
-            kawase_up_pipeline_state,
+            pyramid_down_pipeline_state,
+            pyramid_up_pipeline_state,
             blit_pipeline_state,
             clear_pipeline_state,
             composite_pipeline_state,
@@ -747,8 +750,9 @@ impl MetalRenderer {
             };
         }
         let shrink = target.shrink() as u64;
-        let width = (i32::from(viewport_size.width).max(1) as u64 / shrink).max(1);
-        let height = (i32::from(viewport_size.height).max(1) as u64 / shrink).max(1);
+        // A level rounds up, so it covers the whole frame and its last texel can hang past it.
+        let width = (i32::from(viewport_size.width).max(1) as u64).div_ceil(shrink);
+        let height = (i32::from(viewport_size.height).max(1) as u64).div_ceil(shrink);
         let now = self.frame_time;
         let device = &self.device;
         let scratch = self.filter_targets.slot(target).get_or_insert_with(|| {
@@ -1072,8 +1076,22 @@ impl MetalRenderer {
         let filtered =
             filters_enabled() && (!scene.effects.is_empty() || !scene.backdrops.is_empty());
         // Backdrops read what the frame has drawn so far, which a drawable cannot be sampled from,
-        // so a frame carrying them is drawn offscreen and blitted back at the end.
-        let mirrored = filtered && !scene.backdrops.is_empty();
+        // so a frame carrying them is drawn offscreen and blitted back at the end. A backdrop near
+        // the right or bottom edge reads what the scene drew past it too, so that frame is drawn
+        // larger by the overscan, and the blit leaves the overscan behind.
+        let overscan = match filters_enabled() {
+            true => scene.overscan,
+            false => Size::default(),
+        };
+        let overscanned = overscan.width.0 > 0 || overscan.height.0 > 0;
+        let mirrored = (filtered && !scene.backdrops.is_empty()) || overscanned;
+        let viewport_size = match mirrored {
+            true => size(
+                DevicePixels((viewport_size.width.0 + overscan.width.0.max(0)).min(MAX_FRAME)),
+                DevicePixels((viewport_size.height.0 + overscan.height.0.max(0)).min(MAX_FRAME)),
+            ),
+            false => viewport_size,
+        };
         let main_texture = match mirrored {
             true => self.filter_texture(FilterTarget::Frame, viewport_size),
             false => texture.to_owned(),
@@ -1405,8 +1423,8 @@ impl MetalRenderer {
         shrink: u32,
     ) -> Option<metal::MTLScissorRect> {
         let shrink = shrink as f32;
-        let width = (i32::from(viewport_size.width) as f32 / shrink).floor();
-        let height = (i32::from(viewport_size.height) as f32 / shrink).floor();
+        let width = (i32::from(viewport_size.width) as f32 / shrink).ceil();
+        let height = (i32::from(viewport_size.height) as f32 / shrink).ceil();
         let left = (bounds.origin.x.0 / shrink).floor().clamp(0., width);
         let top = (bounds.origin.y.0 / shrink).floor().clamp(0., height);
         let right = ((bounds.origin.x.0 + bounds.size.width.0) / shrink)
@@ -1469,10 +1487,9 @@ impl MetalRenderer {
         encoder.end_encoding();
     }
 
-    /// Blurs a source and returns the target holding the result. A narrow blur comes back at
-    /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
-    /// stretches it back up. A `spare` source is a layer nothing reads again, so a gaussian
-    /// writes its result back into it rather than into a full-size target of its own.
+    /// Blurs a source and returns the target holding the result, at full size. A `spare` source
+    /// is a layer nothing reads again, so the blur writes its result back into it rather than
+    /// into a full-size target of its own.
     fn blur_source(
         &mut self,
         command_buffer: &metal::CommandBufferRef,
@@ -1486,8 +1503,8 @@ impl MetalRenderer {
             BlurPasses::Gaussian(sigma) => {
                 self.gaussian_blur(command_buffer, source, spare, sigma, clip, viewport_size)
             }
-            BlurPasses::Kawase(kawase) => {
-                self.kawase_blur(command_buffer, source, kawase, clip, viewport_size)
+            BlurPasses::Pyramid(pyramid) => {
+                self.pyramid_blur(command_buffer, source, spare, pyramid, clip, viewport_size)
             }
         }
     }
@@ -1504,13 +1521,19 @@ impl MetalRenderer {
         clip: Option<Bounds<ScaledPixels>>,
         viewport_size: Size<DevicePixels>,
     ) -> metal::Texture {
+        let extent = [
+            i32::from(viewport_size.width) as f32,
+            i32::from(viewport_size.height) as f32,
+        ];
         let across = BlurParams {
             direction: [1., 0.],
+            extent,
             radius: sigma,
             pad: 0.,
         };
         let down = BlurParams {
             direction: [0., 1.],
+            extent,
             radius: sigma,
             pad: 0.,
         };
@@ -1543,55 +1566,95 @@ impl MetalRenderer {
         settled
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the level it settled at.
-    fn kawase_blur(
+    /// Blurs a source with a [`Pyramid`]: down to the deepest level, a gaussian across and down
+    /// there, and back up to full size. Returns the target holding the result: level zero, or a
+    /// `spare` source.
+    fn pyramid_blur(
         &mut self,
         command_buffer: &metal::CommandBufferRef,
         source: &metal::TextureRef,
-        kawase: Kawase,
+        spare: bool,
+        pyramid: Pyramid,
         clip: Option<Bounds<ScaledPixels>>,
         viewport_size: Size<DevicePixels>,
     ) -> metal::Texture {
-        let params = BlurParams {
-            direction: [0., 0.],
-            radius: kawase.offset,
-            pad: 0.,
+        let deepest = pyramid.levels;
+        let frame = (
+            i32::from(viewport_size.width) as f32,
+            i32::from(viewport_size.height) as f32,
+        );
+        // A pass reads a level of its own, so each gets its own parameters, which carry how
+        // much of that level holds the frame.
+        let params = |level: usize, direction: [f32; 2], radius: f32| {
+            let shrink = (1u32 << level) as f32;
+            BlurParams {
+                direction,
+                extent: [frame.0 / shrink, frame.1 / shrink],
+                radius,
+                pad: 0.,
+            }
         };
-        let levels: Vec<metal::Texture> = (1..=kawase.levels)
-            .map(|level| self.filter_texture(FilterTarget::Level(level), viewport_size))
+        let reads: Vec<BlurParams> = (0..=deepest)
+            .map(|level| params(level, [0., 0.], 0.))
             .collect();
-        // Every pass covers the clip grown by what all the passes together read, which is at
-        // least what the ones after it still need. A texel more keeps the bilinear taps on the
-        // clip's own edge off texels nothing has written.
-        let reach = kawase.reach();
-        let within = |level: usize| {
-            let shrink = 1u32 << level;
-            let grown = ScaledPixels(reach + shrink as f32);
-            clip.and_then(|clip| Self::scissor(clip.dilate(grown), viewport_size, shrink))
+        let across = params(deepest, [1., 0.], pyramid.sigma);
+        let along = params(deepest, [0., 1.], pyramid.sigma);
+        let levels: Vec<metal::Texture> = (0..=deepest)
+            .map(|level| match (level, spare) {
+                (0, true) => source.to_owned(),
+                _ => self.filter_texture(FilterTarget::Level(level), viewport_size),
+            })
+            .collect();
+        let spread = self.filter_texture(FilterTarget::Spread(deepest), viewport_size);
+        // A pass leaves what lies past its scissor undefined, so each writes the clip grown by
+        // everything the passes after it read.
+        let within = |level: usize, margin: f32| {
+            clip.and_then(|clip| {
+                Self::scissor(clip.dilate(ScaledPixels(margin)), viewport_size, 1 << level)
+            })
         };
 
-        let mut from: &metal::TextureRef = source;
-        for (level, to) in (1..).zip(&levels) {
+        for level in 1..=deepest {
+            let from: &metal::TextureRef = match level {
+                1 => source,
+                _ => &levels[level - 1],
+            };
             self.filter_pass(
                 command_buffer,
-                &self.kawase_down_pipeline_state,
+                &self.pyramid_down_pipeline_state,
                 from,
-                to,
-                Some(&params),
-                within(level),
+                &levels[level],
+                Some(&reads[level - 1]),
+                within(level, pyramid.down_margin(level)),
             );
-            from = to;
         }
-        let settled = &levels[kawase.settled - 1];
         self.filter_pass(
             command_buffer,
-            &self.kawase_up_pipeline_state,
-            from,
-            settled,
-            Some(&params),
-            within(kawase.settled),
+            &self.gaussian_pipeline_state,
+            &levels[deepest],
+            &spread,
+            Some(&across),
+            within(deepest, pyramid.across_margin()),
         );
-        settled.clone()
+        self.filter_pass(
+            command_buffer,
+            &self.gaussian_pipeline_state,
+            &spread,
+            &levels[deepest],
+            Some(&along),
+            within(deepest, pyramid.along_margin()),
+        );
+        for level in (0..deepest).rev() {
+            self.filter_pass(
+                command_buffer,
+                &self.pyramid_up_pipeline_state,
+                &levels[level + 1],
+                &levels[level],
+                Some(&reads[level + 1]),
+                within(level, pyramid.up_margin(level)),
+            );
+        }
+        levels[0].clone()
     }
 
     /// Draws a filtered layer back into its parent through `encoder`, clipped to the layer's bounds,
@@ -2454,18 +2517,21 @@ enum FilterTarget {
     Frame,
     /// The target a filtered layer is drawn into, by nesting depth.
     Layer(usize),
-    /// One blur level, the frame's size halved as many times as its index. Level zero holds a
-    /// finished gaussian.
+    /// One blur level, the frame's size halved as many times as its index and rounded up, so the
+    /// last texel of a level can hang past the frame's edge. Level zero holds a finished blur.
     Level(usize),
     /// Where a gaussian keeps its pass across before the pass down.
     Scratch,
+    /// Where the gaussian at the deepest level of a pyramid keeps its pass across, at that
+    /// level's size.
+    Spread(usize),
 }
 
 impl FilterTarget {
     /// How many times smaller than the frame the target is on each side.
     fn shrink(self) -> u32 {
         match self {
-            Self::Level(level) => 1 << level,
+            Self::Level(level) | Self::Spread(level) => 1 << level,
             Self::Frame | Self::Layer(_) | Self::Scratch | Self::Backdrop => 1,
         }
     }
@@ -2480,7 +2546,8 @@ struct FilterTargets {
     frame: Option<Scratch>,
     backdrop: Option<Scratch>,
     layers: [Option<Scratch>; LAYER_DEPTH],
-    levels: [Option<Scratch>; KAWASE_LEVELS + 1],
+    levels: [Option<Scratch>; BLUR_LEVELS + 1],
+    spreads: [Option<Scratch>; BLUR_LEVELS + 1],
     scratch: Option<Scratch>,
 }
 
@@ -2492,6 +2559,7 @@ impl FilterTargets {
             FilterTarget::Layer(depth) => &mut self.layers[depth],
             FilterTarget::Level(level) => &mut self.levels[level],
             FilterTarget::Scratch => &mut self.scratch,
+            FilterTarget::Spread(level) => &mut self.spreads[level],
         }
     }
 
@@ -2500,6 +2568,7 @@ impl FilterTargets {
             .chain(std::iter::once(&mut self.backdrop))
             .chain(self.layers.iter_mut())
             .chain(self.levels.iter_mut())
+            .chain(self.spreads.iter_mut())
             .chain(std::iter::once(&mut self.scratch))
     }
 }
@@ -2518,6 +2587,9 @@ struct PathTargets {
 #[derive(Clone, Copy, Default)]
 pub struct BlurParams {
     pub direction: [f32; 2],
+    /// How many texels of the texture the pass reads hold the frame. A blur level rounds its
+    /// size up, so its last texel can hang past the frame's edge.
+    pub extent: [f32; 2],
     pub radius: f32,
     pub pad: f32,
 }

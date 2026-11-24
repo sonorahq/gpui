@@ -118,18 +118,21 @@ enum FilterTarget {
     Frame,
     /// The target a filtered layer is drawn into, by nesting depth.
     Layer(usize),
-    /// One blur level, the frame's size halved as many times as its index. Level zero holds a
-    /// finished gaussian.
+    /// One blur level, the frame's size halved as many times as its index and rounded up, so the
+    /// last texel of a level can hang past the frame's edge. Level zero holds a finished blur.
     Level(usize),
     /// Where a gaussian keeps its pass across before the pass down.
     Scratch,
+    /// Where the gaussian at the deepest level of a pyramid keeps its pass across, at that
+    /// level's size.
+    Spread(usize),
 }
 
 impl FilterTarget {
     /// How many times smaller than the frame the target is on each side.
     fn shrink(self) -> u32 {
         match self {
-            Self::Level(level) => 1 << level,
+            Self::Level(level) | Self::Spread(level) => 1 << level,
             Self::Frame | Self::Layer(_) | Self::Scratch | Self::Backdrop => 1,
         }
     }
@@ -144,7 +147,8 @@ struct FilterTargets {
     frame: Option<Scratch>,
     backdrop: Option<Scratch>,
     layers: [Option<Scratch>; LAYER_DEPTH],
-    levels: [Option<Scratch>; KAWASE_LEVELS + 1],
+    levels: [Option<Scratch>; BLUR_LEVELS + 1],
+    spreads: [Option<Scratch>; BLUR_LEVELS + 1],
     scratch: Option<Scratch>,
 }
 
@@ -157,6 +161,7 @@ impl FilterTargets {
             backdrop: None,
             layers: std::array::from_fn(|_| None),
             levels: std::array::from_fn(|_| None),
+            spreads: std::array::from_fn(|_| None),
             scratch: None,
         }
     }
@@ -168,6 +173,7 @@ impl FilterTargets {
             FilterTarget::Layer(depth) => &mut self.layers[depth.min(LAYER_DEPTH - 1)],
             FilterTarget::Level(level) => &mut self.levels[level],
             FilterTarget::Scratch => &mut self.scratch,
+            FilterTarget::Spread(level) => &mut self.spreads[level],
         }
     }
 
@@ -180,6 +186,7 @@ impl FilterTargets {
             FilterTarget::Layer(depth) => &self.layers[depth.min(LAYER_DEPTH - 1)],
             FilterTarget::Level(level) => &self.levels[level],
             FilterTarget::Scratch => &self.scratch,
+            FilterTarget::Spread(level) => &self.spreads[level],
         };
         slot.as_ref()
             .map(|scratch| &scratch.texture)
@@ -195,7 +202,7 @@ impl FilterTargets {
         now: Instant,
     ) -> Result<RenderTexture> {
         let shrink = target.shrink();
-        let (width, height) = (self.width / shrink, self.height / shrink);
+        let (width, height) = (self.width.div_ceil(shrink), self.height.div_ceil(shrink));
         let slot = self.slot(target);
         if slot.is_none() {
             *slot = Some(Scratch {
@@ -249,10 +256,13 @@ struct FilterParams {
     fade_left: f32,
     fade_right: f32,
     translation: [f32; 2],
+    /// How many texels of the texture a blur pass reads hold the frame. A blur level rounds its
+    /// size up, so its last texel can hang past the frame's edge.
+    extent: [f32; 2],
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<FilterParams>() == 20 * std::mem::size_of::<f32>());
+    assert!(std::mem::size_of::<FilterParams>() == 22 * std::mem::size_of::<f32>());
     assert!(std::mem::offset_of!(FilterParams, source_bounds) == 0);
     assert!(std::mem::offset_of!(FilterParams, fade_bounds) == 16);
     assert!(std::mem::offset_of!(FilterParams, direction) == 32);
@@ -264,21 +274,22 @@ const _: () = {
     assert!(std::mem::offset_of!(FilterParams, fade_left) == 64);
     assert!(std::mem::offset_of!(FilterParams, fade_right) == 68);
     assert!(std::mem::offset_of!(FilterParams, translation) == 72);
+    assert!(std::mem::offset_of!(FilterParams, extent) == 80);
 };
 
 #[derive(Clone, Copy)]
 enum Pass {
     Gaussian,
-    KawaseDown,
-    KawaseUp,
+    PyramidDown,
+    PyramidUp,
 }
 
 struct DirectXRenderPipelines {
     backdrop_pipeline: PipelineState<Backdrop>,
     backdrop_punch: Shading,
     gaussian_pipeline: PipelineState<FilterParams>,
-    kawase_down_pipeline: PipelineState<FilterParams>,
-    kawase_up_pipeline: PipelineState<FilterParams>,
+    pyramid_down_pipeline: PipelineState<FilterParams>,
+    pyramid_up_pipeline: PipelineState<FilterParams>,
     blit_pipeline: PipelineState<FilterParams>,
     composite_pipeline: PipelineState<FilterParams>,
     mask_pipeline: PipelineState<FilterParams>,
@@ -603,11 +614,9 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Blurs a source and returns the target holding the result. A narrow blur comes back at
-    /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
-    /// stretches it back up. A source that is the layer at depth `spare` is read by nothing
-    /// else, so a gaussian writes its result back into it rather than into a full-size target of
-    /// its own.
+    /// Blurs a source and returns the target holding the result, at full size. A source that is
+    /// the layer at depth `spare` is read by nothing else, so the blur writes its result back
+    /// into it rather than into a full-size target of its own.
     fn blur_source(
         &mut self,
         source: Option<ID3D11ShaderResourceView>,
@@ -617,7 +626,7 @@ impl DirectXRenderer {
     ) -> Result<Option<ID3D11ShaderResourceView>> {
         match BlurPasses::for_sigma(sigma) {
             BlurPasses::Gaussian(sigma) => self.gaussian_blur(source, spare, sigma, clip),
-            BlurPasses::Kawase(kawase) => self.kawase_blur(source, kawase, clip),
+            BlurPasses::Pyramid(pyramid) => self.pyramid_blur(source, spare, pyramid, clip),
         }
     }
 
@@ -631,14 +640,20 @@ impl DirectXRenderer {
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
+        let extent = {
+            let resources = self.resources.as_ref().context("resources missing")?;
+            [resources.viewport.Width, resources.viewport.Height]
+        };
         let across = FilterParams {
             direction: [1., 0.],
             radius: sigma,
+            extent,
             ..Default::default()
         };
         let down = FilterParams {
             direction: [0., 1.],
             radius: sigma,
+            extent,
             ..Default::default()
         };
         let region = |renderer: &Self, margin: f32| match clip {
@@ -665,49 +680,82 @@ impl DirectXRenderer {
         )
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the level it settled at.
-    fn kawase_blur(
+    /// Blurs a source with a [`Pyramid`]: down to the deepest level, a gaussian across and down
+    /// there, and back up to full size. Returns what the last pass wrote: level zero, or the
+    /// `spare` layer it came from.
+    fn pyramid_blur(
         &mut self,
         source: Option<ID3D11ShaderResourceView>,
-        kawase: Kawase,
+        spare: Option<usize>,
+        pyramid: Pyramid,
         clip: Option<Bounds<ScaledPixels>>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
-        let params = FilterParams {
-            radius: kawase.offset,
-            ..Default::default()
+        let deepest = pyramid.levels;
+        let frame = {
+            let resources = self.resources.as_ref().context("resources missing")?;
+            (resources.viewport.Width, resources.viewport.Height)
         };
-        // Every pass covers the clip grown by what all the passes together read. The targets are
-        // never cleared, so a pass reads stale texels past the edge of what the one before it
-        // wrote, but they only creep inwards by what the later passes read, which this margin
-        // already holds. A texel more keeps the final bilinear sample on the clip's edge clean.
-        let reach = kawase.reach();
-        let region = |renderer: &Self, level: usize| match clip {
-            Some(clip) => {
-                let shrink = 1u32 << level;
-                renderer.scissor(clip.dilate(ScaledPixels(reach + shrink as f32)), shrink)
+        // A pass reads a level of its own, so each gets its own parameters, which carry how
+        // much of that level holds the frame.
+        let params = |level: usize, direction: [f32; 2], radius: f32| {
+            let shrink = (1u32 << level) as f32;
+            FilterParams {
+                direction,
+                radius,
+                extent: [frame.0 / shrink, frame.1 / shrink],
+                ..Default::default()
             }
+        };
+        // The targets are never cleared, so a pass reads stale texels past what the one before
+        // it wrote. Each pass writes the clip grown by everything the passes after it read, which
+        // keeps those stale texels out of the clip.
+        let region = |renderer: &Self, level: usize, margin: f32| match clip {
+            Some(clip) => renderer.scissor(clip.dilate(ScaledPixels(margin)), 1 << level),
             None => Ok(None),
         };
 
         let mut from = source;
-        for level in 1..=kawase.levels {
-            let within = region(self, level)?;
+        for level in 1..=deepest {
+            let within = region(self, level, pyramid.down_margin(level))?;
             from = self.filter_pass(
-                Pass::KawaseDown,
+                Pass::PyramidDown,
                 from,
                 FilterTarget::Level(level),
-                Some(params),
+                Some(params(level - 1, [0., 0.], 0.)),
                 within,
             )?;
         }
-        let within = region(self, kawase.settled)?;
-        self.filter_pass(
-            Pass::KawaseUp,
+        let within = region(self, deepest, pyramid.across_margin())?;
+        from = self.filter_pass(
+            Pass::Gaussian,
             from,
-            FilterTarget::Level(kawase.settled),
-            Some(params),
+            FilterTarget::Spread(deepest),
+            Some(params(deepest, [1., 0.], pyramid.sigma)),
             within,
-        )
+        )?;
+        let within = region(self, deepest, pyramid.along_margin())?;
+        from = self.filter_pass(
+            Pass::Gaussian,
+            from,
+            FilterTarget::Level(deepest),
+            Some(params(deepest, [0., 1.], pyramid.sigma)),
+            within,
+        )?;
+        for level in (0..deepest).rev() {
+            let within = region(self, level, pyramid.up_margin(level))?;
+            let target = match (level, spare) {
+                (0, Some(depth)) => FilterTarget::Layer(depth),
+                _ => FilterTarget::Level(level),
+            };
+            from = self.filter_pass(
+                Pass::PyramidUp,
+                from,
+                target,
+                Some(params(level + 1, [0., 0.], 0.)),
+                within,
+            )?;
+        }
+        Ok(from)
     }
 
     /// Draws one full-screen pass of a filter into a blur target, returning what it wrote. The
@@ -751,8 +799,8 @@ impl DirectXRenderer {
 
         let pipeline = match pass {
             Pass::Gaussian => &mut self.pipelines.gaussian_pipeline,
-            Pass::KawaseDown => &mut self.pipelines.kawase_down_pipeline,
-            Pass::KawaseUp => &mut self.pipelines.kawase_up_pipeline,
+            Pass::PyramidDown => &mut self.pipelines.pyramid_down_pipeline,
+            Pass::PyramidUp => &mut self.pipelines.pyramid_up_pipeline,
         };
         pipeline.update_buffer(&device, &device_context, &[params.unwrap_or_default()])?;
         pipeline.draw_range_with_texture(
@@ -1885,17 +1933,17 @@ impl DirectXRenderPipelines {
             1,
             create_blend_state_opaque(device)?,
         )?;
-        let kawase_down_pipeline = PipelineState::new(
+        let pyramid_down_pipeline = PipelineState::new(
             device,
-            "kawase_down_pipeline",
-            ShaderModule::KawaseDown,
+            "pyramid_down_pipeline",
+            ShaderModule::PyramidDown,
             1,
             create_blend_state_opaque(device)?,
         )?;
-        let kawase_up_pipeline = PipelineState::new(
+        let pyramid_up_pipeline = PipelineState::new(
             device,
-            "kawase_up_pipeline",
-            ShaderModule::KawaseUp,
+            "pyramid_up_pipeline",
+            ShaderModule::PyramidUp,
             1,
             create_blend_state_opaque(device)?,
         )?;
@@ -1988,8 +2036,8 @@ impl DirectXRenderPipelines {
             backdrop_pipeline,
             backdrop_punch,
             gaussian_pipeline,
-            kawase_down_pipeline,
-            kawase_up_pipeline,
+            pyramid_down_pipeline,
+            pyramid_up_pipeline,
             blit_pipeline,
             composite_pipeline,
             mask_pipeline,
@@ -3086,9 +3134,9 @@ pub(crate) mod shader_resources {
         /// Fragment only. `vertex_source` sends it to `Backdrop` for a vertex stage.
         BackdropPunch,
         Gaussian,
-        KawaseDown,
-        /// Fragment only. `vertex_source` sends it to `KawaseDown` for a vertex stage.
-        KawaseUp,
+        PyramidDown,
+        /// Fragment only. `vertex_source` sends it to `PyramidDown` for a vertex stage.
+        PyramidUp,
         Blit,
         Mask,
         Quad,
@@ -3123,7 +3171,7 @@ pub(crate) mod shader_resources {
         fn vertex_source(self) -> ShaderModule {
             match self {
                 ShaderModule::BackdropPunch => ShaderModule::Backdrop,
-                ShaderModule::KawaseUp => ShaderModule::KawaseDown,
+                ShaderModule::PyramidUp => ShaderModule::PyramidDown,
                 ShaderModule::SubpixelSpriteLayered => ShaderModule::SubpixelSprite,
                 module => module,
             }
@@ -3172,13 +3220,13 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => GAUSSIAN_VERTEX_BYTES,
                     ShaderTarget::Fragment => GAUSSIAN_FRAGMENT_BYTES,
                 },
-                ShaderModule::KawaseDown => match target {
-                    ShaderTarget::Vertex => KAWASE_DOWN_VERTEX_BYTES,
-                    ShaderTarget::Fragment => KAWASE_DOWN_FRAGMENT_BYTES,
+                ShaderModule::PyramidDown => match target {
+                    ShaderTarget::Vertex => PYRAMID_DOWN_VERTEX_BYTES,
+                    ShaderTarget::Fragment => PYRAMID_DOWN_FRAGMENT_BYTES,
                 },
-                ShaderModule::KawaseUp => match target {
-                    ShaderTarget::Vertex => KAWASE_DOWN_VERTEX_BYTES,
-                    ShaderTarget::Fragment => KAWASE_UP_FRAGMENT_BYTES,
+                ShaderModule::PyramidUp => match target {
+                    ShaderTarget::Vertex => PYRAMID_DOWN_VERTEX_BYTES,
+                    ShaderTarget::Fragment => PYRAMID_UP_FRAGMENT_BYTES,
                 },
                 ShaderModule::Blit => match target {
                     ShaderTarget::Vertex => BLIT_VERTEX_BYTES,
@@ -3309,8 +3357,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::Backdrop => "backdrop",
                 ShaderModule::BackdropPunch => "backdrop_punch",
                 ShaderModule::Gaussian => "gaussian",
-                ShaderModule::KawaseDown => "kawase_down",
-                ShaderModule::KawaseUp => "kawase_up",
+                ShaderModule::PyramidDown => "pyramid_down",
+                ShaderModule::PyramidUp => "pyramid_up",
                 ShaderModule::Blit => "blit",
                 ShaderModule::Mask => "mask",
                 ShaderModule::Quad => "quad",
@@ -3536,10 +3584,12 @@ fn create_sampler(
 /// The size in texels of a target `shrink` times smaller than the frame. Blur levels are made at
 /// exactly this size, so every pass draws over the whole texture and no row or column is left
 /// unwritten at the frame's edge.
+/// The size of a blur level, the frame's halved `shrink` times and rounded up, so the level
+/// covers the whole frame.
 fn level_size(viewport: &D3D11_VIEWPORT, shrink: u32) -> (u32, u32) {
     (
-        viewport.Width as u32 / shrink,
-        viewport.Height as u32 / shrink,
+        (viewport.Width as u32).div_ceil(shrink),
+        (viewport.Height as u32).div_ceil(shrink),
     )
 }
 

@@ -1439,6 +1439,8 @@ struct FilterParams {
     float fade_left;
     float fade_right;
     float2 translation;
+    // How many texels of the texture a blur pass reads hold the frame.
+    float2 extent;
 };
 
 struct FilterVertexOutput {
@@ -1466,7 +1468,7 @@ FilterVertexOutput gaussian_vertex(uint vertex_id: SV_VertexID) {
     return filter_vertex_impl(vertex_id);
 }
 
-FilterVertexOutput kawase_down_vertex(uint vertex_id: SV_VertexID) {
+FilterVertexOutput pyramid_down_vertex(uint vertex_id: SV_VertexID) {
     return filter_vertex_impl(vertex_id);
 }
 
@@ -1478,16 +1480,31 @@ FilterVertexOutput mask_vertex(uint vertex_id: SV_VertexID) {
     return filter_vertex_impl(vertex_id);
 }
 
+// How much of a texel wide footprint centred at `at`, in texels, lies within `0..extent` on both
+// axes. Nothing lies past the frame's edges, so every blur pass weighs its taps by this and
+// divides by the weight it kept, with `extent` as how many texels of the texture it reads hold
+// the frame. A blur against an edge then averages what is there instead of stretching the border
+// row across the kernel, which made every row that scrolled out under the edge flash through the
+// blur on its way.
+float blur_inside(float2 at, float2 extent) {
+    float2 span = saturate(min(at + 0.5, extent) - max(at - 0.5, float2(0.0, 0.0)));
+    return span.x * span.y;
+}
+
 // A narrow blur runs `gaussian_fragment` across and then down at full resolution, with `radius`
-// as its standard deviation. It pairs neighbouring taps into one bilinear fetch placed between
-// them by their weights, which halves the fetches, and relies on sampling a texture of the same
-// size as the target, so every pair lands between two texel centres along the axis.
+// as its standard deviation, and a wide one runs it across and down the deepest level of a
+// pyramid. It pairs neighbouring taps into one bilinear fetch placed between them by their
+// weights, which halves the fetches, and relies on sampling a texture of the same size as the
+// target, so every pair lands between two texel centres along the axis. A tap past the frame's
+// edge drops out of the pair it belongs to.
 float4 gaussian_fragment(FilterFragmentInput input): SV_Target {
     FilterParams params = filter_params[batch_start_index];
     float width;
     float height;
     t_sprite.GetDimensions(width, height);
-    float2 texel = params.direction / float2(width, height);
+    float2 size = float2(width, height);
+    float2 texel = params.direction / size;
+    float2 centre = input.uv * size;
     float sigma = max(params.radius, 0.0001);
     float reach = min(ceil(sigma * 3.0), 24.0);
     float spread = 2.0 * sigma * sigma;
@@ -1498,55 +1515,55 @@ float4 gaussian_fragment(FilterFragmentInput input): SV_Target {
         float outer = inner + 1.0;
         float inner_weight = exp(-inner * inner / spread);
         float outer_weight = outer <= reach ? exp(-outer * outer / spread) : 0.0;
-        float pair = inner_weight + outer_weight;
-        float2 at = texel * ((inner * inner_weight + outer * outer_weight) / pair);
-        total += pair * t_sprite.Sample(s_sprite, input.uv + at);
-        total += pair * t_sprite.Sample(s_sprite, input.uv - at);
-        weight += pair * 2.0;
+        [unroll]
+        for (int i = 0; i < 2; i++) {
+            float side = i == 0 ? -1.0 : 1.0;
+            float inner_tap = inner_weight * blur_inside(centre + params.direction * inner * side, params.extent);
+            float outer_tap = outer_weight * blur_inside(centre + params.direction * outer * side, params.extent);
+            float pair = inner_tap + outer_tap;
+            float2 at = texel * (side * (inner * inner_tap + outer * outer_tap) / max(pair, 0.0001));
+            total += pair * t_sprite.Sample(s_sprite, input.uv + at);
+            weight += pair;
+        }
     }
 
     return total / weight;
 }
 
-// A dual Kawase blur: `kawase_down_fragment` halves the image with five taps and
-// `kawase_up_fragment` grows it back with eight. The down pass takes the offset in half texels
-// of what it reads and the up pass in quarter texels, which keeps its ring of taps from going
-// hollow.
-float4 kawase_down_fragment(FilterFragmentInput input): SV_Target {
-    FilterParams params = filter_params[batch_start_index];
+// Four bilinear taps at `centre` plus `offset` mirrored into each quadrant, in texels of the
+// texture read, each weighed by how much of it falls within `extent`.
+float4 pyramid_taps(float2 centre, float2 offset, float2 extent) {
     float width;
     float height;
     t_sprite.GetDimensions(width, height);
-    float2 half_step = 0.5 * params.radius / float2(width, height);
-    float2 flipped = float2(half_step.x, -half_step.y);
-
-    float4 total = t_sprite.Sample(s_sprite, input.uv) * 4.0;
-    total += t_sprite.Sample(s_sprite, input.uv - half_step);
-    total += t_sprite.Sample(s_sprite, input.uv + half_step);
-    total += t_sprite.Sample(s_sprite, input.uv - flipped);
-    total += t_sprite.Sample(s_sprite, input.uv + flipped);
-    return total / 8.0;
+    float2 size = float2(width, height);
+    float4 total = float4(0.0, 0.0, 0.0, 0.0);
+    float weight = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; i++) {
+        float2 corner = float2((i & 1) ? 1.0 : -1.0, (i & 2) ? 1.0 : -1.0);
+        float2 at = centre + offset * corner;
+        float tap = blur_inside(at, extent);
+        total += tap * t_sprite.Sample(s_sprite, at / size);
+        weight += tap;
+    }
+    return total / max(weight, 0.0001);
 }
 
-float4 kawase_up_fragment(FilterFragmentInput input): SV_Target {
+// Halves the level it reads, the first passes of a pyramid. A target texel sits over the corner
+// of four source texels, and a bilinear tap on each of the four corners around that one averages
+// the four by four texels under it.
+float4 pyramid_down_fragment(FilterFragmentInput input): SV_Target {
     FilterParams params = filter_params[batch_start_index];
-    float width;
-    float height;
-    t_sprite.GetDimensions(width, height);
-    float2 half_step = 0.25 * params.radius / float2(width, height);
-    float2 flipped = float2(half_step.x, -half_step.y);
-    float2 across = float2(half_step.x * 2.0, 0.0);
-    float2 down = float2(0.0, half_step.y * 2.0);
+    return pyramid_taps(input.position.xy * 2.0, float2(1.0, 1.0), params.extent);
+}
 
-    float4 total = t_sprite.Sample(s_sprite, input.uv + across);
-    total += t_sprite.Sample(s_sprite, input.uv - across);
-    total += t_sprite.Sample(s_sprite, input.uv + down);
-    total += t_sprite.Sample(s_sprite, input.uv - down);
-    total += t_sprite.Sample(s_sprite, input.uv + half_step) * 2.0;
-    total += t_sprite.Sample(s_sprite, input.uv - half_step) * 2.0;
-    total += t_sprite.Sample(s_sprite, input.uv + flipped) * 2.0;
-    total += t_sprite.Sample(s_sprite, input.uv - flipped) * 2.0;
-    return total / 12.0;
+// Doubles the level it reads, back towards full size. Four bilinear taps half a texel out on
+// each diagonal lay a box of one texel over the bilinear tent, which rounds off the corners a
+// tent alone leaves at every texel of the level below and keeps its grid from showing.
+float4 pyramid_up_fragment(FilterFragmentInput input): SV_Target {
+    FilterParams params = filter_params[batch_start_index];
+    return pyramid_taps(input.position.xy * 0.5, float2(0.5, 0.5), params.extent);
 }
 
 

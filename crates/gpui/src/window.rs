@@ -31,6 +31,14 @@ use crate::interactive::TouchEvent;
 
 /// A gaussian is cut off after three standard deviations.
 const BLUR_REACH: f32 = 3.;
+/// The step the overscan past an edge grows and shrinks by, in device pixels, so the offscreen
+/// targets sized by it do not change with every pixel a blur's reach moves.
+const OVERSCAN_STEP: i32 = 32;
+/// The most the frame is drawn past an edge, in logical pixels.
+const OVERSCAN_MOST: f32 = 128.;
+/// How many frames a wider overscan is kept once nothing needs it, so a backdrop that comes and
+/// goes, a toast or a hover, does not resize the offscreen targets every time.
+const OVERSCAN_HOLD: u8 = 60;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -1343,6 +1351,14 @@ pub struct Window {
     /// a given rem size.
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
+    /// How far past the right and bottom edges the frame is drawn, in device pixels, so a
+    /// backdrop blur near them reads what lies there. See [`Scene::overscan`].
+    backdrop_overscan: Size<DevicePixels>,
+    /// Frames left before a wider overscan than the last frame needed shrinks.
+    overscan_hold_frames: u8,
+    /// How many scaled layers are open. Nothing inside one is drawn past the edges, since the
+    /// scale could carry it back into the window.
+    overscan_suppressed: usize,
     layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) layout_keys: LayoutKeys,
     pub(crate) root: Option<AnyView>,
@@ -2290,6 +2306,9 @@ impl Window {
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
+            backdrop_overscan: Size::default(),
+            overscan_hold_frames: 0,
+            overscan_suppressed: 0,
             layout_engine: Some(TaffyLayoutEngine::new()),
             layout_keys: LayoutKeys::default(),
             root: None,
@@ -3641,6 +3660,8 @@ impl Window {
                 self.rendered_frame.input_handlers.push(Some(input_handler));
             }
         }
+        self.settle_backdrop_overscan();
+        self.next_frame.scene.overscan = self.backdrop_overscan;
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
             #[cfg(feature = "profiler")]
@@ -3697,6 +3718,14 @@ impl Window {
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
         self.drawn_frames += 1;
+        // A backdrop that reaches past an edge for the first time draws once more with the
+        // frame grown to hold what lies there.
+        let needed = self.required_backdrop_overscan(&self.rendered_frame.scene);
+        if needed.width > self.backdrop_overscan.width
+            || needed.height > self.backdrop_overscan.height
+        {
+            self.invalidator.set_dirty(true);
+        }
         // Marked against the frame just drawn, whose dispatch tree holds their ancestors.
         if !self.faded_views.is_empty() {
             for view_id in mem::take(&mut self.faded_views) {
@@ -4503,7 +4532,11 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
+            // A clip that reaches an edge lets its content on past it, into the overscan.
+            let mask = ContentMask {
+                bounds: self.past_edges(mask.bounds),
+            }
+            .intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -4671,9 +4704,164 @@ impl Window {
             .unwrap_or_else(|| ContentMask {
                 bounds: Bounds {
                     origin: Point::default(),
-                    size: self.viewport_size,
+                    size: self.viewport_size + self.backdrop_overscan_pixels(),
                 },
             })
+    }
+
+    /// How far past the right and bottom edges the frame is drawn, in logical pixels. Nothing
+    /// is inside a scaled layer.
+    pub(crate) fn backdrop_overscan_pixels(&self) -> Size<Pixels> {
+        if self.overscan_suppressed > 0 {
+            return Size::default();
+        }
+        let scale = self.scale_factor().max(f32::EPSILON);
+        size(
+            px(self.backdrop_overscan.width.0 as f32 / scale),
+            px(self.backdrop_overscan.height.0 as f32 / scale),
+        )
+    }
+
+    /// `bounds` carried on into the overscan past every edge they reach, which is how far
+    /// whatever reaches an edge is drawn.
+    pub(crate) fn past_edges(&self, mut bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        let overscan = self.backdrop_overscan_pixels();
+        let viewport = self.viewport_size;
+        // half a device pixel, so an edge snapped to the pixel grid still counts as reaching
+        let slack = px(0.5 / self.scale_factor());
+        if overscan.height > Pixels::ZERO && bounds.bottom() >= viewport.height - slack {
+            bounds.size.height =
+                bounds.bottom().max(viewport.height + overscan.height) - bounds.top();
+        }
+        if overscan.width > Pixels::ZERO && bounds.right() >= viewport.width - slack {
+            bounds.size.width = bounds.right().max(viewport.width + overscan.width) - bounds.left();
+        }
+        bounds
+    }
+
+    /// Carries a solid quad that ends at the right or bottom edge on through the overscan, so
+    /// the panels and backgrounds a backdrop near that edge blurs go on past it as the window
+    /// would if it were larger. A quad shallower than the overscan is a row or a control that
+    /// only happens to end at the edge, and stays where it is. The strips go past the edge
+    /// only, so nothing in the window changes.
+    fn paint_quad_past_edges(&mut self, quad: &Quad) {
+        let overscan = self.backdrop_overscan;
+        if self.overscan_suppressed > 0 || (overscan.width.0 == 0 && overscan.height.0 == 0) {
+            return;
+        }
+        if quad.background.as_solid().is_none() {
+            return;
+        }
+        let scale = self.scale_factor();
+        let width = (self.viewport_size.width.0 * scale).round();
+        let height = (self.viewport_size.height.0 * scale).round();
+        let (past_right, past_bottom) = (overscan.width.0 as f32, overscan.height.0 as f32);
+        let bounds = quad.bounds;
+        let right = past_right > 0.
+            && (bounds.right().0 - width).abs() <= 0.5
+            && bounds.size.width.0 >= past_right;
+        let bottom = past_bottom > 0.
+            && (bounds.bottom().0 - height).abs() <= 0.5
+            && bounds.size.height.0 >= past_bottom;
+        let strip = |left: f32, top: f32, right: f32, bottom: f32| Quad {
+            bounds: Bounds::from_corners(
+                point(ScaledPixels(left), ScaledPixels(top)),
+                point(ScaledPixels(right), ScaledPixels(bottom)),
+            ),
+            border_widths: Edges::default(),
+            corner_radii: Corners::default(),
+            ..*quad
+        };
+        let mut strips = SmallVec::<[Quad; 3]>::new();
+        if right {
+            strips.push(strip(
+                width,
+                bounds.top().0,
+                width + past_right,
+                bounds.bottom().0,
+            ));
+        }
+        if bottom {
+            strips.push(strip(
+                bounds.left().0,
+                height,
+                bounds.right().0,
+                height + past_bottom,
+            ));
+        }
+        if right && bottom {
+            strips.push(strip(
+                width,
+                height,
+                width + past_right,
+                height + past_bottom,
+            ));
+        }
+        for strip in strips {
+            self.next_frame.scene.insert_primitive(strip);
+        }
+    }
+
+    /// Moves the overscan towards what the last frame's backdrops needed: at once when it has
+    /// to grow, and after [`OVERSCAN_HOLD`] frames when it can shrink. A change redraws every
+    /// view, since a cached one was painted for the old edges.
+    fn settle_backdrop_overscan(&mut self) {
+        let needed = self.required_backdrop_overscan(&self.rendered_frame.scene);
+        let current = self.backdrop_overscan;
+        let settled = if needed.width > current.width || needed.height > current.height {
+            self.overscan_hold_frames = OVERSCAN_HOLD;
+            size(
+                current.width.max(needed.width),
+                current.height.max(needed.height),
+            )
+        } else if needed == current {
+            self.overscan_hold_frames = OVERSCAN_HOLD;
+            current
+        } else if self.overscan_hold_frames > 0 {
+            self.overscan_hold_frames -= 1;
+            current
+        } else {
+            needed
+        };
+        if settled != current {
+            self.backdrop_overscan = settled;
+            self.refreshing = true;
+        }
+    }
+
+    /// How far past the right and bottom edges a scene's backdrops read, in device pixels,
+    /// rounded up to [`OVERSCAN_STEP`] and capped at [`OVERSCAN_MOST`].
+    fn required_backdrop_overscan(&self, scene: &Scene) -> Size<DevicePixels> {
+        let scale = self.scale_factor();
+        let width = (self.viewport_size.width.0 * scale).round();
+        let height = (self.viewport_size.height.0 * scale).round();
+        let visible = Bounds::new(
+            Point::default(),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        );
+        let mut right = 0f32;
+        let mut bottom = 0f32;
+        for backdrop in &scene.backdrops {
+            if backdrop.blur <= 0. || backdrop.opacity <= 0. {
+                continue;
+            }
+            let shown = backdrop
+                .bounds
+                .intersect(&backdrop.content_mask.bounds)
+                .intersect(&visible);
+            if shown.is_empty() {
+                continue;
+            }
+            let reach = (backdrop.blur * BLUR_REACH).ceil();
+            right = right.max(shown.right().0 + reach - width);
+            bottom = bottom.max(shown.bottom().0 + reach - height);
+        }
+        let most = (OVERSCAN_MOST * scale).ceil() as i32;
+        let step = |past: f32| {
+            let steps = (past / OVERSCAN_STEP as f32).ceil().max(0.) as i32;
+            DevicePixels((steps * OVERSCAN_STEP).min(most))
+        };
+        size(step(right), step(bottom))
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
@@ -5125,13 +5313,45 @@ impl Window {
             true => 0.,
             false => reach.0.max(0.) * scale_factor,
         };
-        let source_bounds = element_bounds.dilate(ScaledPixels(filter.blur * BLUR_REACH + reach));
+        let mut source_bounds =
+            element_bounds.dilate(ScaledPixels(filter.blur * BLUR_REACH + reach));
+        // A layer reaching an edge holds what its content draws past it too, unless it fades
+        // out towards that edge. A scaled one could carry the overscan back into the window, so
+        // nothing inside it goes past the edges.
+        let scaled = filter.scales();
+        if scaled {
+            self.overscan_suppressed += 1;
+        } else if self.overscan_suppressed == 0 {
+            let width = (self.viewport_size.width.0 * scale_factor).round();
+            let height = (self.viewport_size.height.0 * scale_factor).round();
+            let overscan = self.backdrop_overscan;
+            if overscan.height.0 > 0
+                && filter.fade_bottom <= 0.
+                && source_bounds.bottom().0 >= height - 0.5
+            {
+                let bottom = source_bounds
+                    .bottom()
+                    .0
+                    .max(height + overscan.height.0 as f32);
+                source_bounds.size.height.0 = bottom - source_bounds.origin.y.0;
+            }
+            if overscan.width.0 > 0
+                && filter.fade_right <= 0.
+                && source_bounds.right().0 >= width - 0.5
+            {
+                let right = source_bounds.right().0.max(width + overscan.width.0 as f32);
+                source_bounds.size.width.0 = right - source_bounds.origin.x.0;
+            }
+        }
         let content_mask = self.snapped_content_mask().bounds;
         self.next_frame
             .scene
             .push_filter(source_bounds, transform_origin, content_mask, filter);
         let result = f(self);
         self.next_frame.scene.pop_filter();
+        if scaled {
+            self.overscan_suppressed -= 1;
+        }
         result
     }
 
@@ -5195,13 +5415,23 @@ impl Window {
         }
 
         let scale_factor = self.scale_factor();
+        // A backdrop shows only in the window, never in the overscan another one reads.
+        let visible = Bounds::new(
+            Point::default(),
+            size(
+                ScaledPixels((self.viewport_size.width.0 * scale_factor).round()),
+                ScaledPixels((self.viewport_size.height.0 * scale_factor).round()),
+            ),
+        );
         self.next_frame.scene.insert_primitive(Backdrop {
             order: 0,
             corner_smoothing,
             blur: blur.0 * scale_factor,
             opacity: self.element_opacity(),
             bounds: self.snap_bounds(bounds),
-            content_mask: self.snapped_content_mask(),
+            content_mask: ContentMask {
+                bounds: self.snapped_content_mask().bounds.intersect(&visible),
+            },
             corner_radii: corner_radii.scale(scale_factor),
         });
     }
@@ -5278,6 +5508,7 @@ impl Window {
 
         if !quad.background.is_transparent() {
             self.next_frame.scene.insert_primitive(quad);
+            self.paint_quad_past_edges(&quad);
             return;
         }
 

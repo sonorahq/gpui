@@ -1501,14 +1501,18 @@ fn fs_backdrop_punch(input: BackdropVarying) -> @location(0) vec4<f32> {
 // --- blur --- //
 
 // A narrow blur runs `fs_gaussian` across and then down at full resolution, with `radius` as
-// its standard deviation. A wide one runs a dual Kawase blur: `fs_kawase_down` halves the image
-// with five taps and `fs_kawase_up` grows it back with eight, with `radius` as the offset, in
-// half texels of what the down pass reads and quarter texels of what the up pass reads, which
-// keeps the up pass's ring of taps from going hollow.
+// its standard deviation. A wide one runs a pyramid: `fs_pyramid_down` halves the image level by
+// level, `fs_gaussian` blurs the deepest level, and `fs_pyramid_up` grows it back level by level
+// to full size. Every pass takes `level` as how many times the texture it reads is halved.
+//
+// Nothing lies past the frame's edges, so every pass weighs its taps by how much of each falls
+// inside the frame and divides by the weight it kept. A blur against an edge then averages what
+// is there instead of stretching the border row across the kernel, which made every row that
+// scrolled out under the edge flash through the blur on its way.
 struct Blur {
     direction: vec2<f32>,
     radius: f32,
-    pad: u32,
+    level: u32,
 }
 
 struct BlurVarying {
@@ -1526,18 +1530,34 @@ fn vs_blur(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
     return out;
 }
 
+// How many texels of a texture halved `level` times hold the frame. A level rounds its size
+// up, so its last texel can hang past the frame's edge.
+fn blur_extent(level: u32) -> vec2<f32> {
+    return globals.viewport_size / f32(1u << level);
+}
+
+// How much of a texel wide footprint centred at `at`, in texels, lies within `0..extent` on both
+// axes.
+fn blur_inside(at: vec2<f32>, extent: vec2<f32>) -> f32 {
+    let span = saturate(min(at + 0.5, extent) - max(at - 0.5, vec2<f32>(0.0)));
+    return span.x * span.y;
+}
+
 // Pairs neighbouring taps into one bilinear fetch placed between them by their weights, which
 // halves the fetches of a plain gaussian. It relies on sampling a texture of the same size as the
 // target, so every pair lands between two texel centres along the axis.
 @fragment
 fn fs_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = load_blur(0u);
-    return gaussian_pass(input.uv, blur.direction, blur.radius);
+    return gaussian_pass(input.uv, blur.direction, blur.radius, blur_extent(blur.level));
 }
 
-// One gaussian pass along `direction` at `uv`, with `radius` as its standard deviation.
-fn gaussian_pass(uv: vec2<f32>, direction: vec2<f32>, radius: f32) -> vec4<f32> {
-    let texel = direction / vec2<f32>(textureDimensions(t_sprite));
+// One gaussian pass along `direction` at `uv`, with `radius` as its standard deviation. A tap
+// past `extent` drops out of the pair it belongs to, and the pass divides by what is left.
+fn gaussian_pass(uv: vec2<f32>, direction: vec2<f32>, radius: f32, extent: vec2<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(t_sprite));
+    let texel = direction / size;
+    let centre = uv * size;
     let sigma = max(radius, 0.0001);
     let reach = min(ceil(sigma * 3.0), 24.0);
     let spread = 2.0 * sigma * sigma;
@@ -1549,51 +1569,59 @@ fn gaussian_pass(uv: vec2<f32>, direction: vec2<f32>, radius: f32) -> vec4<f32> 
         let outer = inner + 1.0;
         let inner_weight = exp(-inner * inner / spread);
         let outer_weight = select(0.0, exp(-outer * outer / spread), outer <= reach);
-        let pair = inner_weight + outer_weight;
-        let at = texel * ((inner * inner_weight + outer * outer_weight) / pair);
-        total += pair * textureSample(t_sprite, s_sprite, uv + at);
-        total += pair * textureSample(t_sprite, s_sprite, uv - at);
-        weight += pair * 2.0;
+        for (var side = -1.0; side <= 1.0; side += 2.0) {
+            let inner_tap = inner_weight * blur_inside(centre + direction * inner * side, extent);
+            let outer_tap = outer_weight * blur_inside(centre + direction * outer * side, extent);
+            let pair = inner_tap + outer_tap;
+            let at = texel * (side * (inner * inner_tap + outer * outer_tap) / max(pair, 0.0001));
+            total += pair * textureSample(t_sprite, s_sprite, uv + at);
+            weight += pair;
+        }
         inner += 2.0;
     }
 
     return total / weight;
 }
 
-@fragment
-fn fs_kawase_down(input: BlurVarying) -> @location(0) vec4<f32> {
-    let blur = load_blur(0u);
-    let half = 0.5 * blur.radius / vec2<f32>(textureDimensions(t_sprite));
-    let flipped = vec2<f32>(half.x, -half.y);
-
-    var total = textureSample(t_sprite, s_sprite, input.uv) * 4.0;
-    total += textureSample(t_sprite, s_sprite, input.uv - half);
-    total += textureSample(t_sprite, s_sprite, input.uv + half);
-    total += textureSample(t_sprite, s_sprite, input.uv - flipped);
-    total += textureSample(t_sprite, s_sprite, input.uv + flipped);
-    return total / 8.0;
+// Four taps at `centre` plus each of `offsets` and their mirror images, in texels of the texture
+// read, each weighed by how much of it falls within `extent`.
+fn pyramid_taps(centre: vec2<f32>, offset: vec2<f32>, extent: vec2<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(t_sprite));
+    var total = vec4<f32>(0.0);
+    var weight = 0.0;
+    for (var i = 0u; i < 4u; i++) {
+        let corner = vec2<f32>(select(-1.0, 1.0, (i & 1u) != 0u), select(-1.0, 1.0, (i & 2u) != 0u));
+        let at = centre + offset * corner;
+        let tap = blur_inside(at, extent);
+        total += tap * textureSample(t_sprite, s_sprite, at / size);
+        weight += tap;
+    }
+    return total / max(weight, 0.0001);
 }
 
+// Halves the level it reads. A target texel sits over the corner of four source texels, and a
+// bilinear tap on each of the four corners around that one averages the four by four texels
+// under it.
 @fragment
-fn fs_kawase_up(input: BlurVarying) -> @location(0) vec4<f32> {
+fn fs_pyramid_down(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = load_blur(0u);
-    let half = 0.25 * blur.radius / vec2<f32>(textureDimensions(t_sprite));
-    let flipped = vec2<f32>(half.x, -half.y);
-
-    var total = textureSample(t_sprite, s_sprite, input.uv + vec2<f32>(half.x * 2.0, 0.0));
-    total += textureSample(t_sprite, s_sprite, input.uv - vec2<f32>(half.x * 2.0, 0.0));
-    total += textureSample(t_sprite, s_sprite, input.uv + vec2<f32>(0.0, half.y * 2.0));
-    total += textureSample(t_sprite, s_sprite, input.uv - vec2<f32>(0.0, half.y * 2.0));
-    total += textureSample(t_sprite, s_sprite, input.uv + half) * 2.0;
-    total += textureSample(t_sprite, s_sprite, input.uv - half) * 2.0;
-    total += textureSample(t_sprite, s_sprite, input.uv + flipped) * 2.0;
-    total += textureSample(t_sprite, s_sprite, input.uv - flipped) * 2.0;
-    return total / 12.0;
+    return pyramid_taps(input.position.xy * 2.0, vec2<f32>(1.0), blur_extent(blur.level));
 }
 
+// Doubles the level it reads, back towards full size. Four bilinear taps half a texel out on
+// each diagonal lay a box of one texel over the bilinear tent, which rounds off the corners a
+// tent alone leaves at every texel of the level below and keeps its grid from showing.
+@fragment
+fn fs_pyramid_up(input: BlurVarying) -> @location(0) vec4<f32> {
+    let blur = load_blur(0u);
+    return pyramid_taps(input.position.xy * 0.5, vec2<f32>(0.5), blur_extent(blur.level));
+}
+
+// Copies the frame into the window texel for texel. The frame can be larger than the window by
+// the overscan past its right and bottom edges, which the copy leaves behind.
 @fragment
 fn fs_blit(input: BlurVarying) -> @location(0) vec4<f32> {
-    return textureSample(t_sprite, s_sprite, input.uv);
+    return textureLoad(t_sprite, vec2<i32>(input.position.xy), 0);
 }
 
 // --- layer masks --- //
@@ -1635,20 +1663,25 @@ fn fs_mask_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
     if (coverage <= 0.0) {
         return vec4<f32>(0.0);
     }
-    let uv = mask_texel(mask, source_point) / globals.viewport_size;
-    let texel = vec2<f32>(0.0, 1.0) / vec2<f32>(textureDimensions(t_sprite));
+    let size = vec2<f32>(textureDimensions(t_sprite));
+    let centre = mask_texel(mask, source_point);
+    let uv = centre / globals.viewport_size;
+    let texel = vec2<f32>(0.0, 1.0) / size;
     let sigma = max(mask.pad, 0.0001);
     let reach = min(ceil(sigma * 3.0), 24.0);
     let spread = 2.0 * sigma * sigma;
 
+    // the taps past the frame's edge drop out, as in `gaussian_pass`
     var total = textureSample(t_sprite, s_sprite, uv);
     var weight = 1.0;
     var tap = 1.0;
     while (tap <= reach) {
         let tap_weight = exp(-tap * tap / spread);
-        total += tap_weight * textureSample(t_sprite, s_sprite, uv + texel * tap);
-        total += tap_weight * textureSample(t_sprite, s_sprite, uv - texel * tap);
-        weight += tap_weight * 2.0;
+        let below = tap_weight * blur_inside(centre + vec2<f32>(0.0, tap), globals.viewport_size);
+        let above = tap_weight * blur_inside(centre - vec2<f32>(0.0, tap), globals.viewport_size);
+        total += below * textureSample(t_sprite, s_sprite, uv + texel * tap);
+        total += above * textureSample(t_sprite, s_sprite, uv - texel * tap);
+        weight += below + above;
         tap += 1.0;
     }
     return total / weight * coverage;
