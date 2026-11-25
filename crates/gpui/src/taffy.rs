@@ -124,8 +124,8 @@ pub struct TaffyLayoutEngine {
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
-/// How far from a whole number of device pixels a length may sit and still count as whole, which
-/// covers the error layout arithmetic leaves in it.
+/// How far apart the distances of a box's two edges to the device pixel grid may sit and still
+/// count as one, which covers the error layout arithmetic leaves in them.
 const WHOLE_SLACK: f32 = 1e-3;
 
 impl TaffyLayoutEngine {
@@ -796,8 +796,9 @@ impl TaffyLayoutEngine {
     }
 
     /// How far the subtree rooted at `id` shifts as one to land on the device pixel grid. Each
-    /// axis takes the shift from the nearest box, from `id` outwards, that spans a whole number
-    /// of device pixels along it. The origins of `id` and its ancestors must already be known.
+    /// axis takes the shift from the nearest box, from `id` outwards, whose edges both land on
+    /// the grid under one shift along it. The origins of `id` and its ancestors must already be
+    /// known.
     fn grid_shift(&self, id: LayoutId) -> Point<f32> {
         let residual = |at: f32| round_half_toward_zero(at) - at;
         let (mut x, mut y) = (None, None);
@@ -807,10 +808,10 @@ impl TaffyLayoutEngine {
             && let Some(origin) = self.absolute_outer_origins.get(&at)
         {
             let size = self.taffy.layout(at.into()).expect(EXPECT_MESSAGE).size;
-            if x.is_none() && is_whole(size.width) {
+            if x.is_none() && spans_whole(origin.x, size.width) {
                 x = Some(residual(origin.x));
             }
-            if y.is_none() && is_whole(size.height) {
+            if y.is_none() && spans_whole(origin.y, size.height) {
                 y = Some(residual(origin.y));
             }
             node = self.taffy.parent(at.into()).map(LayoutId::from);
@@ -823,10 +824,12 @@ impl TaffyLayoutEngine {
     }
 }
 
-/// Whether a length in device pixels is a whole number of them, give or take the error the
-/// layout arithmetic leaves.
-fn is_whole(length: f32) -> bool {
-    (length - length.round()).abs() < WHOLE_SLACK
+/// Whether a box from `at` spanning `length` device pixels lands both edges on the grid under one
+/// shift, give or take the error layout arithmetic leaves. A length a hair short of whole, whose
+/// edges round to either side of a half pixel, does not.
+fn spans_whole(at: f32, length: f32) -> bool {
+    let residual = |at: f32| round_half_toward_zero(at) - at;
+    (residual(at) - residual(at + length)).abs() < WHOLE_SLACK
 }
 
 /// Whether `style` chose on or off the device pixel grid along each axis, `None` where it follows

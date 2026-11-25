@@ -5895,60 +5895,77 @@ mod tests {
 
     #[gpui::test]
     fn unsnapped_box_of_fractional_width_keeps_its_pinned_edge(cx: &mut TestAppContext) {
-        let window = cx.add_empty_window();
-        window.draw(
-            point(px(10.2), px(20.0)),
-            size(px(400.0), px(300.0)),
-            |window, _| {
-                // centred half a device pixel in, so the row's own place has a fraction to round
-                let room = px(200.0) + px(1.0) / window.scale_factor();
-                div().flex().justify_center().w(room).child(
+        /// Lays a box `width` device pixels wide off the grid at the end of a row centred half a
+        /// device pixel in, so the row's own place has a fraction to round, and returns the
+        /// bounds of the row, the box and the label in it, and the scale factor.
+        fn draw(
+            cx: &mut TestAppContext,
+            width: f32,
+        ) -> (Bounds<Pixels>, Bounds<Pixels>, Bounds<Pixels>, f32) {
+            let window = cx.add_empty_window();
+            window.draw(
+                point(px(10.2), px(20.0)),
+                size(px(400.0), px(300.0)),
+                |window, _| {
+                    let scale = window.scale_factor();
                     div()
-                        .debug_selector(|| "row".into())
                         .flex()
-                        .justify_end()
-                        .w(px(200.0))
+                        .justify_center()
+                        .w(px(200.0) + px(1.0 / scale))
                         .child(
                             div()
-                                .debug_selector(|| "grown".into())
-                                .pixel_snap(false)
+                                .debug_selector(|| "row".into())
                                 .flex()
-                                .items_center()
-                                .w(px(40.2))
-                                .h(px(11.25))
+                                .justify_end()
+                                .w(px(200.0))
                                 .child(
                                     div()
-                                        .debug_selector(|| "label".into())
-                                        .pixel_snap(true)
-                                        .pixel_snap_x(false)
-                                        .w(px(10.0))
-                                        .h(px(4.0)),
+                                        .debug_selector(|| "grown".into())
+                                        .pixel_snap(false)
+                                        .flex()
+                                        .items_center()
+                                        .w(px(width / scale))
+                                        .h(px(11.25))
+                                        .child(
+                                            div()
+                                                .debug_selector(|| "label".into())
+                                                .pixel_snap(true)
+                                                .pixel_snap_x(false)
+                                                .w(px(10.0))
+                                                .h(px(4.0)),
+                                        ),
                                 ),
-                        ),
+                        )
+                },
+            );
+            window.update(|window, _| {
+                let bounds = &window.rendered_frame.debug_bounds;
+                (
+                    bounds["row"],
+                    bounds["grown"],
+                    bounds["label"],
+                    window.scale_factor(),
                 )
-            },
-        );
-        let (row, grown, label, scale) = window.update(|window, _| {
-            let bounds = &window.rendered_frame.debug_bounds;
-            (
-                bounds["row"],
-                bounds["grown"],
-                bounds["label"],
-                window.scale_factor(),
-            )
-        });
+            })
+        }
+
+        let (row, grown, label, scale) = draw(cx, 80.4);
         let whole = |at: Pixels| {
             let device = at.0 * scale;
             (device - device.round()).abs() < 0.001
         };
-
         // the box pinned to the row's end ends where the row does, on a pixel, and its start glides
         assert!(whole(row.right()));
         assert!((grown.right() - row.right()).abs() < px(0.001));
-        assert!((grown.size.width - px(40.2)).abs() < px(0.001));
+        assert!((grown.size.width.0 * scale - 80.4).abs() < 0.001);
         assert!(!whole(grown.origin.x));
         // the label follows the box across by fractions but rounds its centred place up and down
         assert!((label.origin.x - grown.origin.x).abs() < px(0.001));
         assert!(whole(label.origin.y));
+
+        // a width a hair short of whole still ends with the row, where its own start would round
+        // the other way from the row's end
+        let (row, grown, _, _) = draw(cx, 79.9992);
+        assert!((grown.right() - row.right()).abs() < px(0.001));
     }
 }
