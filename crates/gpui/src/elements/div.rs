@@ -2912,6 +2912,16 @@ impl Interactivity {
                     .cloned();
                 let current_view = window.current_view();
 
+                // Layout reads the stored group state too, so a group covered under a resting
+                // pointer, as by a menu's shield, would keep its hover layout while painting
+                // without it. Only a stale hover clears here, for the same reason as above.
+                if let Some(hover_state) = &hover_state {
+                    if hover_state.borrow().group && !group_hitbox_id.is_hovered(window) {
+                        hover_state.borrow_mut().group = false;
+                        window.defer(cx, move |_, cx| cx.notify(current_view));
+                    }
+                }
+
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                     let group_hovered = group_hitbox_id.is_hovered(window);
                     let was_group_hovered = hover_state
