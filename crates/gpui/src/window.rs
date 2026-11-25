@@ -3420,6 +3420,10 @@ impl Window {
         exclusions: &[Range<ScaledPixels>],
     ) {
         self.invalidator.debug_assert_paint();
+        if !self.pixel_snapping && !style.wavy {
+            self.paint_gliding_underline(origin, width, style, exclusions);
+            return;
+        }
         let underline = self.underline(origin, width, style);
         if exclusions.is_empty() {
             self.next_frame.scene.insert_primitive(underline);
@@ -3465,6 +3469,46 @@ impl Window {
         }
         if start < bounds.right() {
             paint_span(start, bounds.right());
+        }
+    }
+
+    /// Paints a straight underline inside a subtree off the pixel grid as quads at its exact place,
+    /// leaving out the device-space `exclusions`. The underline primitive fills whole pixel rows,
+    /// so under text that glides between pixels it would step a row at a time, while a quad's
+    /// edges are antialiased and move with the text. It keeps its thickness in whole device
+    /// pixels.
+    fn paint_gliding_underline(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        style: &UnderlineStyle,
+        exclusions: &[Range<ScaledPixels>],
+    ) {
+        let scale_factor = self.scale_factor();
+        let thickness = px(self.snap_stroke(style.thickness).0 / scale_factor);
+        let color = style.color.unwrap_or_default();
+        let left = origin.x;
+        let right = origin.x + width;
+        let mut exclusions = exclusions
+            .iter()
+            .filter_map(|span| {
+                let start = px(span.start.0 / scale_factor).max(left);
+                let end = px(span.end.0 / scale_factor).min(right);
+                (start < end).then_some(start..end)
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        exclusions.sort_unstable_by(|a, b| a.start.0.total_cmp(&b.start.0));
+
+        let mut start = left;
+        for span in exclusions.into_iter().chain([right..right]) {
+            if start < span.start {
+                let bounds = Bounds::from_corners(
+                    point(start, origin.y),
+                    point(span.start, origin.y + thickness),
+                );
+                self.paint_quad(fill(bounds, color));
+            }
+            start = start.max(span.end);
         }
     }
 
@@ -5588,6 +5632,10 @@ impl Window {
         style: &UnderlineStyle,
     ) {
         self.invalidator.debug_assert_paint();
+        if !self.pixel_snapping && !style.wavy {
+            self.paint_gliding_underline(origin, width, style, &[]);
+            return;
+        }
         let underline = self.underline(origin, width, style);
         self.next_frame.scene.insert_primitive(underline);
     }
