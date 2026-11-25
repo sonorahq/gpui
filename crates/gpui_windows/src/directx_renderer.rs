@@ -29,8 +29,9 @@ pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSI
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
-/// How deeply filtered layers can nest before the innermost ones stop being filtered.
-const LAYER_DEPTH: usize = 4;
+/// How deeply filtered layers can nest before the innermost ones stop being filtered. Each depth
+/// keeps one offscreen target, made the first time a frame nests that deep.
+const LAYER_DEPTH: usize = 8;
 /// How long an offscreen target may go unused before its memory is given back. A frame with a
 /// blur, layer or path on screen touches its targets every time, so only targets that nothing
 /// on screen draws through are released.
