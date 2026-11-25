@@ -114,9 +114,11 @@ impl Scene {
 
     /// Starts a layer that is drawn offscreen, put through the given filter, and composited back.
     ///
-    /// The layer claims a range of orders nothing outside it can share: the barriers on either end
-    /// keep the rest of the frame out of it, while its contents order among themselves the way
-    /// they would anywhere else, so a quad still covers an image painted before it.
+    /// The layer claims a range of orders nothing outside it can share, above everything painted
+    /// before it, while its contents order among themselves the way they would anywhere else, so
+    /// a quad still covers an image painted before it. Only what is painted later over the area
+    /// the layer lands on goes above the range. The rest keeps the order it would have had
+    /// without the layer, so a backdrop beside a pressed button blurs what it always did.
     pub fn push_filter(
         &mut self,
         source_bounds: Bounds<ScaledPixels>,
@@ -124,7 +126,7 @@ impl Scene {
         content_mask: Bounds<ScaledPixels>,
         filter: Filter,
     ) {
-        let start = self.primitive_bounds.barrier();
+        let start = self.primitive_bounds.open();
         let mut destination_bounds =
             scale_bounds_around(source_bounds, transform_origin, filter.scale);
         destination_bounds.origin += filter.translate;
@@ -149,7 +151,8 @@ impl Scene {
 
     pub fn pop_filter(&mut self) {
         if let Some(index) = self.effect_stack.pop() {
-            self.effects[index].end = self.primitive_bounds.barrier();
+            let footprint = self.effects[index].destination_clip();
+            self.effects[index].end = self.primitive_bounds.close(footprint);
         }
         self.paint_operations.push(PaintOperation::EndFilter);
     }
@@ -922,6 +925,40 @@ mod layer_filter_tests {
         unscaled[0].filter.scale = 1.0;
         unscaled[1].filter.scale = 1.0;
         assert!(unscaled[0].can_merge_with(&unscaled[1]));
+    }
+
+    #[test]
+    fn a_closed_layer_lifts_only_what_is_painted_over_it() {
+        let content_mask = rect(0.0, 0.0, 500.0, 500.0);
+        let button = rect(100.0, 60.0, 20.0, 20.0);
+        let mut scene = Scene::default();
+        let row = scene.primitive_bounds.insert(rect(0.0, 50.0, 500.0, 40.0));
+        scene.push_filter(button, origin(110.0, 70.0), content_mask, filter(0.9));
+        scene.primitive_bounds.insert(button);
+        scene.pop_filter();
+        let layer = scene.effects[0];
+
+        // A table head painted after the pressed row, above it, keeps the order it has with the
+        // button at rest, so its backdrop still blurs before the row is drawn.
+        let head = scene.primitive_bounds.insert(rect(0.0, 10.0, 500.0, 30.0));
+        assert!(head <= row, "head at {head}, row at {row}");
+        assert!(scene.filtered(head).is_none());
+
+        // What stacks on the head climbs past the layer's orders rather than into them.
+        let label = scene.primitive_bounds.insert(rect(10.0, 15.0, 40.0, 20.0));
+        assert!(
+            label > layer.end,
+            "label at {label}, layer ends at {}",
+            layer.end
+        );
+
+        // What is painted over the button still lands above its layer.
+        let over = scene.primitive_bounds.insert(rect(105.0, 65.0, 5.0, 5.0));
+        assert!(
+            over > layer.end,
+            "over at {over}, layer ends at {}",
+            layer.end
+        );
     }
 }
 
