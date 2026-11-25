@@ -110,6 +110,7 @@ fn generate_fallback_array(fallbacks: &FontFallbacks, font: &mut FontKitFont) ->
     unsafe {
         let symbolic_traits = font.native_font().symbolic_traits();
         let all_traits = font.native_font().all_traits();
+        let weight = css_weight(font, all_traits.normalized_weight());
 
         let fallback_array = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
         for user_fallback in fallbacks.fallback_list() {
@@ -136,7 +137,7 @@ fn generate_fallback_array(fallbacks: &FontFallbacks, font: &mut FontKitFont) ->
 
             let variation = CFDictionary::from_CFType_pairs(&[(
                 CFNumber::from(WEIGHT_AXIS),
-                CFNumber::from(css_weight(all_traits.normalized_weight())),
+                CFNumber::from(weight),
             )]);
 
             let attr_keys = [
@@ -167,9 +168,10 @@ fn generate_fallback_array(fallbacks: &FontFallbacks, font: &mut FontKitFont) ->
     }
 }
 
-/// Maps CoreText's normalized weight trait back to the CSS weight a variable font's `wght` axis
-/// takes, by the table CoreText itself uses for the named weights.
-fn css_weight(normalized: f64) -> f64 {
+/// The CSS weight a variable fallback's `wght` axis should take to match `font`. It is the font's
+/// own OS/2 weight class, or its normalized weight trait read through CoreText's table of named
+/// weights when the font has no OS/2 table.
+fn css_weight(font: &FontKitFont, normalized: f64) -> f64 {
     const STEPS: [(f64, f64); 9] = [
         (-0.8, 100.),
         (-0.6, 200.),
@@ -181,6 +183,14 @@ fn css_weight(normalized: f64) -> f64 {
         (0.56, 800.),
         (0.62, 900.),
     ];
+    let class = font
+        .load_font_table(u32::from_be_bytes(*b"OS/2"))
+        .and_then(|table| Some(u16::from_be_bytes([*table.get(4)?, *table.get(5)?])))
+        .filter(|class| (1..=1000).contains(class));
+    if let Some(class) = class {
+        return f64::from(class);
+    }
+
     let (first, last) = (STEPS[0], STEPS[STEPS.len() - 1]);
     if normalized <= first.0 {
         return first.1;
