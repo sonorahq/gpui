@@ -67,6 +67,9 @@ struct CosmicTextSystemState {
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+    /// The same for families loaded as another font's fallback, which may hold faces that could
+    /// not serve as a primary font.
+    fallback_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
 }
@@ -75,6 +78,8 @@ struct LoadedFont {
     font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
     has_color_glyphs: bool,
+    /// Whether the face can be a primary font, which needs an `m` for layout measurements.
+    primary: bool,
     instantiated_weight: CosmicWeight,
     /// empty when not variable
     wght_coords: SmallVec<[NormalizedCoord; 4]>,
@@ -173,6 +178,7 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
+            fallback_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
         }))
@@ -192,6 +198,7 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
+            fallback_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
         }))
@@ -238,6 +245,7 @@ impl PlatformTextSystem for CosmicTextSystem {
                 &font.features,
                 font.fallbacks.as_ref(),
                 weight,
+                false,
             )?;
             state.font_ids_by_family_cache.insert(key.clone(), font_ids);
             state.font_ids_by_family_cache[&key].as_ref()
@@ -372,6 +380,7 @@ impl CosmicTextSystemState {
     #[profiling::function]
     fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.font_ids_by_family_cache.clear();
+        self.fallback_ids_by_family_cache.clear();
         let db = self.font_system.db_mut();
         for bytes in fonts {
             db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
@@ -386,6 +395,7 @@ impl CosmicTextSystemState {
         features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
         weight: CosmicWeight,
+        as_fallback: bool,
     ) -> Result<SmallVec<[FontId; 4]>> {
         let loaded_font_key = FontKey::new(
             SharedString::from(name.to_owned()),
@@ -407,14 +417,16 @@ impl CosmicTextSystemState {
                         None,
                         weight,
                     );
-                    let fb_ids = if let Some(cached) = self.font_ids_by_family_cache.get(&fb_key) {
-                        cached.clone()
-                    } else {
-                        let loaded = self.load_family(fallback_name, features, None, weight)?;
-                        self.font_ids_by_family_cache
-                            .insert(fb_key.clone(), loaded.clone());
-                        loaded
-                    };
+                    let fb_ids =
+                        if let Some(cached) = self.fallback_ids_by_family_cache.get(&fb_key) {
+                            cached.clone()
+                        } else {
+                            let loaded =
+                                self.load_family(fallback_name, features, None, weight, true)?;
+                            self.fallback_ids_by_family_cache
+                                .insert(fb_key.clone(), loaded.clone());
+                            loaded
+                        };
                     // a family can hold several static weights, so match the requested
                     // one rather than taking whichever face the database lists first.
                     let wanted = Font {
@@ -463,6 +475,9 @@ impl CosmicTextSystemState {
                 font: loaded_font_key.clone(),
             };
             if let Some(&font_id) = self.loaded_font_ids_by_key.get(&key) {
+                if !as_fallback && !self.loaded_fonts[font_id.0].primary {
+                    continue;
+                }
                 self.loaded_fonts[font_id.0].user_fallback_chain = Arc::clone(&user_fallback_chain);
                 loaded_font_ids.push(font_id);
                 continue;
@@ -484,16 +499,17 @@ impl CosmicTextSystemState {
 
             // This only decides whether a face can be a primary font. The
             // editor measures layout with the width of 'm' and would panic
-            // without it.
+            // without it. A face loaded as a listed fallback only draws the
+            // glyphs the primary font lacks, so it needs no 'm'.
             //
             // Don't remove the face from the font database. Arabic, Devanagari
             // and emoji fonts often have no Latin glyphs, and they are exactly
             // what cosmic-text falls back to when the primary font lacks a
             // glyph.
-            if default_instance.as_swash().charmap().map('m') == 0
-                && !has_color_glyphs
-                && !allowed_bad_font_names.contains(&postscript_name.as_str())
-            {
+            let primary = default_instance.as_swash().charmap().map('m') != 0
+                || has_color_glyphs
+                || allowed_bad_font_names.contains(&postscript_name.as_str());
+            if !primary && !as_fallback {
                 continue;
             };
 
@@ -521,6 +537,7 @@ impl CosmicTextSystemState {
             if let Some(&font_id) = static_key
                 .as_ref()
                 .and_then(|static_key| self.loaded_font_ids_by_key.get(static_key))
+                .filter(|font_id| as_fallback || self.loaded_fonts[font_id.0].primary)
             {
                 self.loaded_fonts[font_id.0].user_fallback_chain = Arc::clone(&user_fallback_chain);
                 loaded_font_ids.push(font_id);
@@ -534,6 +551,7 @@ impl CosmicTextSystemState {
                 font,
                 features: cosmic_features.clone(),
                 has_color_glyphs,
+                primary,
                 instantiated_weight,
                 wght_coords,
                 user_fallback_chain: Arc::clone(&user_fallback_chain),
@@ -716,6 +734,7 @@ impl CosmicTextSystemState {
             font,
             features: CosmicFontFeatures::new(),
             has_color_glyphs,
+            primary: false,
             instantiated_weight,
             wght_coords,
             user_fallback_chain: Arc::from(Vec::new()),
@@ -1260,8 +1279,11 @@ fn pick_covering_slot(
     if covers(primary, ch) {
         return None;
     }
+    // Punctuation and marks stay in the font of the text around them, but a letter takes the
+    // first listed fallback that has it, so a Japanese font that also has Hangul keeps no hold on
+    // the Korean that follows.
     let current_id = slot_font_id(current, primary, fallback_chain);
-    if covers(current_id, ch) {
+    if !ch.is_alphabetic() && covers(current_id, ch) {
         return current;
     }
 
