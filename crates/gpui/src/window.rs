@@ -5657,11 +5657,15 @@ impl Window {
             round_half_toward_zero(glyph_origin.x.0 * variants_x as f32) / variants_x as f32,
             round_half_toward_zero(glyph_origin.y.0 * variants_y as f32) / variants_y as f32,
         );
+        // the variant is the distance past the pixel below, so a glyph at a negative fraction keeps
+        // its place too
         let subpixel_variant = Point::new(
-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+            ((quantized_origin.x - quantized_origin.x.floor()) * SUBPIXEL_VARIANTS_X as f32).round()
+                as u8,
+            ((quantized_origin.y - quantized_origin.y.floor()) * SUBPIXEL_VARIANTS_Y as f32).round()
+                as u8,
         );
-        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.floor()));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
