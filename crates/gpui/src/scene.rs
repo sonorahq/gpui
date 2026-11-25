@@ -960,6 +960,42 @@ mod layer_filter_tests {
             layer.end
         );
     }
+
+    #[test]
+    fn backdrops_of_another_radius_blur_in_a_batch_of_their_own() {
+        let content_mask = rect(0.0, 0.0, 500.0, 500.0);
+        let mut scene = Scene::default();
+        // A faint haze of thin strips along the top and a frosted menu further down, apart, so
+        // nothing else orders between them.
+        for (bounds, blur) in [
+            (rect(0.0, 0.0, 500.0, 10.0), 1.0),
+            (rect(0.0, 10.0, 500.0, 10.0), 1.0),
+            (rect(300.0, 200.0, 150.0, 200.0), 8.0),
+        ] {
+            scene.insert_primitive(Backdrop {
+                blur,
+                opacity: 1.0,
+                bounds,
+                content_mask: ContentMask {
+                    bounds: content_mask,
+                },
+                ..Default::default()
+            });
+        }
+        scene.finish();
+
+        let batches: Vec<_> = scene
+            .batches()
+            .map(|batch| match batch {
+                PrimitiveBatch::Backdrops(range) => scene.backdrops[range]
+                    .iter()
+                    .map(|backdrop| backdrop.blur)
+                    .collect::<Vec<_>>(),
+                other => panic!("expected only backdrops, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(batches, vec![vec![1.0, 1.0], vec![8.0]]);
+    }
 }
 
 #[derive(Clone)]
@@ -1138,12 +1174,19 @@ impl<'a> Iterator for BatchIterator<'a> {
                 Some(PrimitiveBatch::Shadows(shadows_start..shadows_end))
             }
             PrimitiveKind::Backdrop => {
+                // The renderer blurs a batch once at a single radius, so a backdrop of another
+                // radius starts a batch of its own rather than taking on its neighbours' blur.
                 let backdrops_start = self.backdrops_start;
                 let mut backdrops_end = backdrops_start + 1;
-                self.backdrops_iter.next();
+                let blur = self
+                    .backdrops_iter
+                    .next()
+                    .map_or(0., |backdrop| backdrop.blur);
                 while self
                     .backdrops_iter
-                    .next_if(|backdrop| (backdrop.order, batch_kind) < max_order_and_kind)
+                    .next_if(|backdrop| {
+                        (backdrop.order, batch_kind) < max_order_and_kind && backdrop.blur == blur
+                    })
                     .is_some()
                 {
                     backdrops_end += 1;
