@@ -1,15 +1,17 @@
 name: shaders
 
 # Compiles the Metal and HLSL shaders with Apple's and Microsoft's own compilers, which only run
-# on their systems, and builds the squircle example on each so the shapes can be checked by eye.
-# The WGSL shaders are validated by the gpui_wgpu tests instead.
+# on their systems, builds the squircle example on each so the shapes can be checked by eye, and
+# runs the renderer tests there. The WGSL shaders are validated by the gpui_wgpu tests instead.
 on:
   pull_request:
     paths:
       - "crates/gpui/src/scene.rs"
       - "crates/gpui/examples/squircle.rs"
       - "crates/gpui_apple/**"
+      - "crates/gpui_macos/**"
       - "crates/gpui_windows/**"
+      - ".github/workflows/shaders.yml"
   workflow_dispatch:
 
 jobs:
@@ -24,6 +26,11 @@ jobs:
         with:
           name: squircle-macos
           path: target/release/examples/squircle
+      # The validation layer rejects wrong load actions, texture usage and scissors outside the
+      # target, which a compiler cannot catch.
+      - run: cargo test --package gpui_apple --package gpui_macos
+        env:
+          MTL_DEBUG_LAYER: "1"
 
   hlsl:
     runs-on: windows-latest
@@ -37,3 +44,4 @@ jobs:
         with:
           name: squircle-windows
           path: target/release/examples/squircle.exe
+      - run: cargo test --package gpui_windows
