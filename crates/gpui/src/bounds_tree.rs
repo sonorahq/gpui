@@ -28,8 +28,14 @@ where
     root: Option<usize>,
     /// Index of the leaf with the highest ordering (for fast-path lookups).
     max_leaf: Option<usize>,
-    /// An ordering every insert has to stay above, raised by [`BoundsTree::barrier`].
+    /// An ordering every insert has to stay above, raised while a layer is open.
     floor: u32,
+    /// The ordering each open layer starts at and the floor it raised, innermost last.
+    open: Vec<(u32, u32)>,
+    /// The orderings closed layers hold, inclusive, sorted, with nested ones folded into the
+    /// layer around them and back-to-back ones joined. An insert that lands in one is lifted
+    /// past it.
+    reserved: Vec<(u32, u32)>,
     /// Reusable stack for tree traversal during insertion.
     insert_path: Vec<usize>,
     /// Reusable stack for search operations.
@@ -112,19 +118,47 @@ where
         self.root = None;
         self.max_leaf = None;
         self.floor = 0;
+        self.open.clear();
+        self.reserved.clear();
         self.insert_path.clear();
         self.search_stack.clear();
     }
 
-    /// Reserves an ordering above everything inserted so far, and holds every later insert above
-    /// it.
-    ///
-    /// A layer that has to be drawn as a whole needs a slot nothing else can share. Inserting a
-    /// screen-sized rectangle would do it, but it would also make every later query intersect that
-    /// rectangle and walk the tree for nothing.
-    pub fn barrier(&mut self) -> u32 {
-        self.floor = self.highest() + 1;
-        self.floor
+    /// Opens a layer that has to be drawn as a whole: returns an ordering above everything
+    /// inserted so far, and holds every insert above it until [`BoundsTree::close`].
+    pub fn open(&mut self) -> u32 {
+        let start = self.highest() + 1;
+        self.open.push((start, self.floor));
+        self.floor = start;
+        start
+    }
+
+    /// Closes the innermost open layer and returns the ordering it ends at. `footprint` is
+    /// where the layer lands in the frame. A later insert that meets it goes above the layer,
+    /// and one that does not keeps the ordering it would have had without the layer, so a
+    /// layer opened for a press does not lift the rest of the frame over what it was drawn on.
+    pub fn close(&mut self, footprint: Bounds<U>) -> u32 {
+        let end = self.highest() + 1;
+        let Some((start, floor)) = self.open.pop() else {
+            return end;
+        };
+        self.floor = floor;
+        // A layer clipped away lands nowhere, and a flat footprint would still meet whatever
+        // straddles it.
+        if !footprint.is_empty() {
+            let leaf = self.insert_leaf(footprint, end);
+            self.max_leaf = Some(leaf);
+        }
+        // Ranges closed inside this one start after it, so they sit at the end, in order.
+        let inner = self.reserved.partition_point(|(from, _)| *from < start);
+        self.reserved.truncate(inner);
+        // Layers closed back to back hold one run of orderings, so an insert is lifted past all
+        // of them at once.
+        match self.reserved.last_mut() {
+            Some((_, last)) if *last + 1 == start => *last = end,
+            _ => self.reserved.push((start, end)),
+        }
+        end
     }
 
     fn highest(&self) -> u32 {
@@ -132,6 +166,21 @@ where
             .map(|index| self.nodes[index].max_order)
             .unwrap_or_default()
             .max(self.floor)
+            .max(self.reserved.last().map_or(0, |(_, end)| *end))
+    }
+
+    /// Moves an ordering that landed in a closed layer's range just past it, since nothing
+    /// outside a layer may be drawn among its contents.
+    fn lifted(&self, mut ordering: u32) -> u32 {
+        loop {
+            let after = self
+                .reserved
+                .partition_point(|(start, _)| *start <= ordering);
+            match after.checked_sub(1).map(|index| self.reserved[index]) {
+                Some((_, end)) if ordering <= end => ordering = end + 1,
+                _ => return ordering,
+            }
+        }
     }
 
     /// Inserts bounds into the tree and returns its assigned ordering.
@@ -141,7 +190,7 @@ where
     pub fn insert(&mut self, new_bounds: Bounds<U>) -> u32 {
         // Find maximum ordering among intersecting bounds
         let max_intersecting = self.find_max_ordering(&new_bounds).max(self.floor);
-        let ordering = max_intersecting + 1;
+        let ordering = self.lifted(max_intersecting + 1);
 
         // Insert the new leaf
         let new_leaf_idx = self.insert_leaf(new_bounds, ordering);
@@ -387,6 +436,8 @@ where
             root: None,
             max_leaf: None,
             floor: 0,
+            open: Vec::new(),
+            reserved: Vec::new(),
             insert_path: Vec::new(),
             search_stack: Vec::new(),
         }
