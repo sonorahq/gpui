@@ -32,8 +32,9 @@ where
     floor: u32,
     /// The ordering each open layer starts at and the floor it raised, innermost last.
     open: Vec<(u32, u32)>,
-    /// The orderings closed layers hold, inclusive, sorted and with nested ones folded into the
-    /// layer around them. An insert that lands in one is lifted past it.
+    /// The orderings closed layers hold, inclusive, sorted, with nested ones folded into the
+    /// layer around them and back-to-back ones joined. An insert that lands in one is lifted
+    /// past it.
     reserved: Vec<(u32, u32)>,
     /// Reusable stack for tree traversal during insertion.
     insert_path: Vec<usize>,
@@ -151,7 +152,12 @@ where
         // Ranges closed inside this one start after it, so they sit at the end, in order.
         let inner = self.reserved.partition_point(|(from, _)| *from < start);
         self.reserved.truncate(inner);
-        self.reserved.push((start, end));
+        // Layers closed back to back hold one run of orderings, so an insert is lifted past all
+        // of them at once.
+        match self.reserved.last_mut() {
+            Some((_, last)) if *last + 1 == start => *last = end,
+            _ => self.reserved.push((start, end)),
+        }
         end
     }
 
