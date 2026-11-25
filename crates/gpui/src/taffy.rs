@@ -115,14 +115,18 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
-    /// The nodes whose style chose on or off the device pixel grid, `false` for off.
-    pixel_snap: FxHashMap<LayoutId, bool>,
-    /// For each node laid out off the grid, how far its subtree was shifted as one so the
-    /// outermost such node's origin lands on a device pixel.
-    grid_shifts: FxHashMap<LayoutId, Point<f32>>,
+    /// The nodes whose style chose on or off the device pixel grid along an axis, `false` for
+    /// off and `None` where it follows the parent.
+    pixel_snap: FxHashMap<LayoutId, Point<Option<bool>>>,
+    /// For each node laid out off the grid along an axis, how far its subtree was shifted as one
+    /// along it to land on a device pixel, `None` along an axis it keeps on the grid.
+    grid_shifts: FxHashMap<LayoutId, Point<Option<f32>>>,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
+/// How far apart the distances of a box's two edges to the device pixel grid may sit and still
+/// count as one, which covers the error layout arithmetic leaves in them.
+const WHOLE_SLACK: f32 = 1e-3;
 
 impl TaffyLayoutEngine {
     pub fn new() -> Self {
@@ -374,8 +378,8 @@ impl TaffyLayoutEngine {
         snapping: bool,
         children: &[LayoutId],
     ) -> LayoutId {
-        let snap = style.pixel_snap;
-        let grid = Grid::new(scale_factor, Some(snap.unwrap_or(snapping)));
+        let snap = axis_snap(&style);
+        let grid = Grid::new(scale_factor, Some(grid_snap(snap, snapping)));
 
         if self.retain {
             let fingerprint = layout_fingerprint(&style, rem_size, grid);
@@ -406,9 +410,10 @@ impl TaffyLayoutEngine {
         id
     }
 
-    /// Remembers whether `id` chose on or off the device pixel grid, for `layout_bounds`.
-    fn note_pixel_snap(&mut self, id: LayoutId, snap: Option<bool>) {
-        if let Some(snap) = snap {
+    /// Remembers whether `id` chose on or off the device pixel grid along each axis, for
+    /// `layout_bounds`.
+    fn note_pixel_snap(&mut self, id: LayoutId, snap: Point<Option<bool>>) {
+        if snap.x.is_some() || snap.y.is_some() {
             self.pixel_snap.insert(id, snap);
         }
     }
@@ -424,8 +429,8 @@ impl TaffyLayoutEngine {
         snapping: bool,
         measured: Measured,
     ) -> LayoutId {
-        let snap = style.pixel_snap;
-        let grid = Grid::new(scale_factor, Some(snap.unwrap_or(snapping)));
+        let snap = axis_snap(&style);
+        let grid = Grid::new(scale_factor, Some(grid_snap(snap, snapping)));
 
         let id = if self.retain {
             let fingerprint = layout_fingerprint(&style, rem_size, grid);
@@ -707,6 +712,16 @@ impl TaffyLayoutEngine {
     // origin had to move to land on a device pixel. Whole-pixel metrics
     // inside such a subtree therefore still land on the grid.
     //
+    // A root whose own size is a fraction of a pixel, as one springing to a
+    // new width, takes that axis's shift from the nearest box around it that
+    // spans whole pixels instead. Whichever edge layout ties the root to,
+    // the start, the end or the middle of that box, then keeps one place on
+    // the grid while the other glides, rather than every edge trembling by
+    // the fraction of the root's width.
+    //
+    // Each axis is decided and shifted on its own, so a node can leave the
+    // grid across while it keeps it up and down (`Styled::pixel_snap_x`).
+    //
     // This gives both closure and translation stability in the case that
     // all local metrics are integer device-pixel lengths. Pre-layout
     // rounding covers that in most cases. The exception is metrics
@@ -741,30 +756,95 @@ impl TaffyLayoutEngine {
             .insert(id, absolute_outer_origin);
 
         let absolute_far = absolute_outer_origin + Point::from(Size::from(layout_size));
-        let parent_shift =
-            parent.and_then(|parent_id| self.grid_shifts.get(&LayoutId::from(parent_id)).copied());
-        let on_grid = match self.pixel_snap.get(&id) {
-            Some(snap) => *snap,
-            None => parent_shift.is_none(),
+        let parent_shift = parent
+            .and_then(|parent_id| self.grid_shifts.get(&LayoutId::from(parent_id)).copied())
+            .unwrap_or_default();
+        let chosen = self.pixel_snap.get(&id).copied().unwrap_or_default();
+        let on_grid = Point {
+            x: chosen.x.unwrap_or(parent_shift.x.is_none()),
+            y: chosen.y.unwrap_or(parent_shift.y.is_none()),
         };
-        let device_bounds = match on_grid {
-            true => Bounds::from_corners(
-                absolute_outer_origin.map(round_half_toward_zero),
-                absolute_far.map(round_half_toward_zero),
-            ),
-            false => {
-                let shift = parent_shift.unwrap_or_else(|| {
-                    absolute_outer_origin.map(round_half_toward_zero) - absolute_outer_origin
-                });
-                self.grid_shifts.insert(id, shift);
-                Bounds::from_corners(absolute_outer_origin + shift, absolute_far + shift)
-            }
+        // An axis that leaves the grid here, rather than inside its parent, finds its own shift.
+        let fresh =
+            (!on_grid.x && parent_shift.x.is_none()) || (!on_grid.y && parent_shift.y.is_none());
+        let own = fresh.then(|| self.grid_shift(id)).unwrap_or_default();
+        let shift = Point {
+            x: (!on_grid.x).then(|| parent_shift.x.unwrap_or(own.x)),
+            y: (!on_grid.y).then(|| parent_shift.y.unwrap_or(own.y)),
         };
+        if shift.x.is_some() || shift.y.is_some() {
+            self.grid_shifts.insert(id, shift);
+        }
+        let place = |at: f32, shift: Option<f32>| match shift {
+            Some(shift) => at + shift,
+            None => round_half_toward_zero(at),
+        };
+        let device_bounds = Bounds::from_corners(
+            Point {
+                x: place(absolute_outer_origin.x, shift.x),
+                y: place(absolute_outer_origin.y, shift.y),
+            },
+            Point {
+                x: place(absolute_far.x, shift.x),
+                y: place(absolute_far.y, shift.y),
+            },
+        );
 
         let bounds = (device_bounds / scale_factor).map(Pixels);
         self.absolute_layout_bounds.insert(id, bounds);
         bounds
     }
+
+    /// How far the subtree rooted at `id` shifts as one to land on the device pixel grid. Each
+    /// axis takes the shift from the nearest box, from `id` outwards, whose edges both land on
+    /// the grid under one shift along it. The origins of `id` and its ancestors must already be
+    /// known.
+    fn grid_shift(&self, id: LayoutId) -> Point<f32> {
+        let residual = |at: f32| round_half_toward_zero(at) - at;
+        let (mut x, mut y) = (None, None);
+        let mut node = Some(id);
+        while let Some(at) = node
+            && (x.is_none() || y.is_none())
+            && let Some(origin) = self.absolute_outer_origins.get(&at)
+        {
+            let size = self.taffy.layout(at.into()).expect(EXPECT_MESSAGE).size;
+            if x.is_none() && spans_whole(origin.x, size.width) {
+                x = Some(residual(origin.x));
+            }
+            if y.is_none() && spans_whole(origin.y, size.height) {
+                y = Some(residual(origin.y));
+            }
+            node = self.taffy.parent(at.into()).map(LayoutId::from);
+        }
+        let origin = self.absolute_outer_origins[&id];
+        Point {
+            x: x.unwrap_or_else(|| residual(origin.x)),
+            y: y.unwrap_or_else(|| residual(origin.y)),
+        }
+    }
+}
+
+/// Whether a box from `at` spanning `length` device pixels lands both edges on the grid under one
+/// shift, give or take the error layout arithmetic leaves. A length a hair short of whole, whose
+/// edges round to either side of a half pixel, does not.
+fn spans_whole(at: f32, length: f32) -> bool {
+    let residual = |at: f32| round_half_toward_zero(at) - at;
+    (residual(at) - residual(at + length)).abs() < WHOLE_SLACK
+}
+
+/// Whether `style` chose on or off the device pixel grid along each axis, `None` where it follows
+/// its parent.
+fn axis_snap(style: &Style) -> Point<Option<bool>> {
+    Point {
+        x: style.pixel_snap_x.or(style.pixel_snap),
+        y: style.pixel_snap,
+    }
+}
+
+/// Whether a node's authored lengths round to the grid before layout, which they do only while
+/// it keeps the grid both ways. `snapping` is what the subtree it sits in does.
+fn grid_snap(snap: Point<Option<bool>>, snapping: bool) -> bool {
+    snap.x.unwrap_or(snapping) && snap.y.unwrap_or(snapping)
 }
 
 /// A unique identifier for a layout node, generated when requesting a layout from Taffy

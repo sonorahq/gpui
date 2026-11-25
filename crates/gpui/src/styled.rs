@@ -863,6 +863,21 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Lays the horizontal edges of this element and its subtree out off the device pixel grid
+    /// with `false`, or back on it with `true`, whatever [`Styled::pixel_snap`] does for the
+    /// vertical ones and for painting. Only where edges land follows this: the lengths of its
+    /// children still round to whole pixels before layout wherever `pixel_snap` keeps the grid.
+    ///
+    /// Text that slides sideways inside an element that animates off the grid wants this
+    /// together with `pixel_snap(true)`: it then follows its parent by fractions of a pixel,
+    /// placed at a quarter pixel across, while it stays hinted on a whole-pixel baseline, as it
+    /// draws at rest. Off the grid both ways it would be drawn unhinted on a fractional baseline,
+    /// and would drop as the animation starts and jump back as it ends.
+    fn pixel_snap_x(mut self, snap: bool) -> Self {
+        self.style().pixel_snap_x = Some(snap);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
