@@ -316,6 +316,11 @@ pub struct Style {
     /// subtree, and `None` follows the parent.
     pub pixel_snap: Option<bool>,
 
+    /// Whether this element and its subtree lay their horizontal edges out on the device pixel
+    /// grid, where that differs from `pixel_snap`. `None` follows `pixel_snap`, and painting
+    /// follows `pixel_snap` alone.
+    pub pixel_snap_x: Option<bool>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -954,6 +959,7 @@ impl Default for Style {
             mouse_cursor: None,
             opacity: None,
             pixel_snap: None,
+            pixel_snap_x: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
