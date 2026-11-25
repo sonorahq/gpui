@@ -107,8 +107,8 @@ use gpui::{
     KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay,
     PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta,
-    ScrollWheelEvent, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams,
-    point, px, size,
+    ScrollEvent, ScrollSource, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind,
+    WindowParams, point, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -2805,27 +2805,30 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 }
                                 false => TouchPhase::Moved,
                             };
-                        inputs.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
                             position,
                             delta: ScrollDelta::Pixels(continuous),
                             modifiers,
                             touch_phase,
+                            source: ScrollSource::Pointer,
                         }));
                     } else if let Some(discrete) = discrete {
-                        inputs.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
                             position,
                             delta: ScrollDelta::Lines(discrete),
                             modifiers,
                             touch_phase: TouchPhase::Moved,
+                            source: ScrollSource::Pointer,
                         }));
                     }
                     if stopped && state.finger_scroll {
                         state.finger_scroll = false;
-                        inputs.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        inputs.push(PlatformInput::Scroll(ScrollEvent {
                             position,
                             delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
                             modifiers,
                             touch_phase: TouchPhase::Ended,
+                            source: ScrollSource::Pointer,
                         }));
                     }
                     drop(state);
