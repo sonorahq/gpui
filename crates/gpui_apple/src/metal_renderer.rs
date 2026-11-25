@@ -39,10 +39,7 @@ use std::{
     mem::MaybeUninit,
     ops::Range,
     ptr, slice,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -73,9 +70,6 @@ const LAYER_DEPTH: usize = 8;
 /// The widest and tallest the overscan may grow a frame drawn offscreen to, which every Metal GPU
 /// can allocate. A window already larger keeps its size and gets no overscan.
 const MAX_FRAME: i32 = 16384;
-/// How long a frame may stay on the GPU before the window draws again without waiting for it, so a
-/// completion that never arrives cannot freeze the window.
-const FRAME_STALL: Duration = Duration::from_millis(250);
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -176,12 +170,20 @@ impl InstanceBufferPool {
     }
 }
 
+enum DisplayLinkMode {
+    Detached,
+    Attached {
+        drawable: Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
+    },
+}
+
 pub struct MetalRenderer {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     layer: Option<Retained<CAMetalLayer>>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    display_link_mode: DisplayLinkMode,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -214,41 +216,12 @@ pub struct MetalRenderer {
     path_targets: Option<PathTargets>,
     path_sample_count: u32,
     filter_targets: FilterTargets,
-    /// Frames `draw` has committed that the GPU has not finished yet, and what wakes the window
-    /// once they are done.
-    frame_pacing: Arc<FramePacing>,
-    /// When `draw` last committed a frame.
-    committed_at: Instant,
     /// When the frame being encoded started, which stamps every offscreen target it touches.
     frame_time: Instant,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-}
-
-/// Frames on the GPU and the window's request for one more. The window skips a display tick
-/// while a frame is still running, and the frame that finishes asks for the one it held back.
-#[derive(Default)]
-struct FramePacing {
-    in_flight: AtomicUsize,
-    waiting: AtomicBool,
-    wake: Mutex<Option<FrameWaker>>,
-}
-
-/// Asks the window for a frame from a Metal completion thread.
-type FrameWaker = Box<dyn Fn() + Send + Sync>;
-
-impl FramePacing {
-    /// Counts a frame off the GPU and asks for the frame a skipped display tick held back.
-    fn frame_done(&self) {
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        if self.waiting.swap(false, Ordering::SeqCst)
-            && let Some(wake) = self.wake.lock().as_ref()
-        {
-            wake();
-        }
-    }
 }
 
 #[repr(C)]
@@ -598,6 +571,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            display_link_mode: DisplayLinkMode::Detached,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -627,8 +601,6 @@ impl MetalRenderer {
             path_targets: None,
             path_sample_count: PATH_SAMPLE_COUNT,
             filter_targets: FilterTargets::default(),
-            frame_pacing: Arc::default(),
-            committed_at: Instant::now(),
             frame_time: Instant::now(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
@@ -648,6 +620,54 @@ impl MetalRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
+    }
+
+    /// Draw the next frame into `drawable` instead of asking the layer for one.
+    ///
+    /// A `CAMetalDisplayLink` hands out each frame's drawable early enough for
+    /// the frame to reach the display on time; `nextDrawable` would instead
+    /// wait for the compositor to release one. Pass `None` once the frame is
+    /// done, so a drawable the frame did not use goes back to the layer.
+    ///
+    /// Returns the drawable this replaces: after a frame, `Some` means the
+    /// frame neither drew nor presented.
+    ///
+    /// This is a setter rather than a guard scoped to one frame because the
+    /// window releases its lock on the renderer while GPUI draws.
+    pub fn set_frame_drawable(
+        &mut self,
+        drawable: Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
+    ) -> Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> {
+        match &mut self.display_link_mode {
+            DisplayLinkMode::Attached { drawable: current } => mem::replace(current, drawable),
+            DisplayLinkMode::Detached => {
+                // Only a live link hands out drawables, and a link is detached
+                // only after it has been invalidated.
+                debug_assert!(
+                    drawable.is_none(),
+                    "received a display link drawable while detached"
+                );
+                None
+            }
+        }
+    }
+
+    /// Record whether a `CAMetalDisplayLink` drives the layer. While one
+    /// does, frames are drawn only into the drawables it hands out.
+    pub fn set_display_link_attached(&mut self, attached: bool) {
+        self.display_link_mode = if attached {
+            DisplayLinkMode::Attached { drawable: None }
+        } else {
+            DisplayLinkMode::Detached
+        };
+    }
+
+    pub fn is_display_link_attached(&self) -> bool {
+        matches!(self.display_link_mode, DisplayLinkMode::Attached { .. })
+    }
+
+    pub fn presents_with_transaction(&self) -> bool {
+        self.presents_with_transaction
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -843,20 +863,32 @@ impl MetalRenderer {
                 return;
             }
         };
-        let viewport_size = layer.drawableSize();
-        let viewport_size: Size<DevicePixels> = size(
-            (viewport_size.width.ceil() as i32).into(),
-            (viewport_size.height.ceil() as i32).into(),
-        );
-        let drawable = if let Some(drawable) = layer.nextDrawable() {
-            drawable
-        } else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            return;
+        let drawable = match &mut self.display_link_mode {
+            DisplayLinkMode::Attached { drawable } => {
+                let Some(drawable) = drawable.take() else {
+                    log::error!("skipped a frame drawn outside its display link's update");
+                    return;
+                };
+                drawable
+            }
+            DisplayLinkMode::Detached => {
+                let Some(drawable) = layer.nextDrawable() else {
+                    log::error!(
+                        "failed to retrieve next drawable, drawable size: {:?}",
+                        layer.drawableSize()
+                    );
+                    return;
+                };
+                drawable
+            }
         };
+        // A display link's drawable was sized when the link handed it out,
+        // which can be before a resize the layer has since taken.
+        let texture = drawable.texture();
+        let viewport_size: Size<DevicePixels> = size(
+            (texture.width() as i32).into(),
+            (texture.height() as i32).into(),
+        );
 
         let command_buffer = match self.render_frame(scene, &drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
@@ -866,18 +898,6 @@ impl MetalRenderer {
             }
         };
 
-        self.frame_pacing.in_flight.fetch_add(1, Ordering::SeqCst);
-        let pacing = self.frame_pacing.clone();
-        let block = RcBlock::new(
-            move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| pacing.frame_done(),
-        );
-        // SAFETY: Metal copies the live block and invokes it once after this frame completes.
-        // It only touches the atomics and the waker mutex of the shared pacing state.
-        unsafe {
-            command_buffer.addCompletedHandler(RcBlock::as_ptr(&block));
-        }
-        self.committed_at = Instant::now();
-
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.waitUntilScheduled();
@@ -886,30 +906,6 @@ impl MetalRenderer {
             command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
             command_buffer.commit();
         }
-    }
-
-    /// Whether the GPU is still running the last frame `draw` committed. Drawing another one now
-    /// would queue it behind that frame and block in `next_drawable` once the drawables run out,
-    /// which holds input back by every frame in the queue. A `true` arms the waker set with
-    /// `set_frame_waker`, so the window draws as soon as the GPU is done rather than a whole
-    /// display tick later.
-    pub fn gpu_behind(&self) -> bool {
-        if self.committed_at.elapsed() >= FRAME_STALL {
-            return false;
-        }
-        let pacing = &self.frame_pacing;
-        pacing.waiting.store(true, Ordering::SeqCst);
-        if pacing.in_flight.load(Ordering::SeqCst) == 0 {
-            pacing.waiting.store(false, Ordering::SeqCst);
-            return false;
-        }
-        true
-    }
-
-    /// Sets what asks the window for a frame once a frame `gpu_behind` held back has finished on
-    /// the GPU. It runs on a Metal completion thread.
-    pub fn set_frame_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
-        *self.frame_pacing.wake.lock() = Some(Box::new(wake));
     }
 
     fn render_frame(
@@ -982,17 +978,8 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = layer
-            .nextDrawable()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
-
-        let command_buffer = self.render_frame(scene, &drawable.texture(), viewport_size)?;
-
-        // Commit and wait for completion without presenting
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-
-        read_texture_to_image(&drawable.texture())
+        // CAMetalDisplayLink owns the drawable, so render into a texture we own.
+        self.render_offscreen(scene, viewport_size)
     }
 
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
@@ -1011,49 +998,55 @@ impl MetalRenderer {
 
         // Headless callers do not have a Cocoa event-loop pool to release
         // autoreleased command buffers and render-pass descriptors.
-        objc2::rc::autoreleasepool(|_| {
-            // Update path intermediate textures for this size
-            // Create an offscreen texture as render target
-            let texture_descriptor = MTLTextureDescriptor::new();
-            unsafe {
-                texture_descriptor.setWidth(size.width.0 as usize);
-                texture_descriptor.setHeight(size.height.0 as usize);
-            }
-            texture_descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-            texture_descriptor
-                .setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-            // Like the atlas, only Apple GPUs can create shared textures on macOS;
-            // Intel Macs cannot, even with unified memory. iOS has no managed storage.
-            let uses_shared_storage = cfg!(target_os = "ios") || self.is_apple_gpu;
-            texture_descriptor.setStorageMode(if uses_shared_storage {
-                MTLStorageMode::Shared
-            } else {
-                MTLStorageMode::Managed
-            });
-            let target_texture = self
-                .device
-                .newTextureWithDescriptor(&texture_descriptor)
-                .context("allocating headless render target")?;
+        objc2::rc::autoreleasepool(|_| self.render_offscreen(scene, size))
+    }
 
-            let command_buffer = self.render_frame(scene, &target_texture, size)?;
+    /// Renders a scene into a new offscreen texture of `size` and reads it
+    /// back, without presenting anything.
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    fn render_offscreen(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<RgbaImage> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            anyhow::bail!("Invalid size for render_offscreen: {:?}", size);
+        }
 
-            // Managed textures require an explicit blit synchronize before the CPU
-            // can read back the rendered data. Without this, get_bytes returns
-            // stale zeros.
-            if !uses_shared_storage {
-                let blit = command_buffer
-                    .blitCommandEncoder()
-                    .context("creating blit command encoder")?;
-                blit.synchronizeResource(ProtocolObject::from_ref(&*target_texture));
-                blit.endEncoding();
-            }
+        let texture_descriptor = MTLTextureDescriptor::new();
+        // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
+        unsafe {
+            texture_descriptor.setWidth(size.width.0 as usize);
+            texture_descriptor.setHeight(size.height.0 as usize);
+        }
+        texture_descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        // Like the atlas, only Apple GPUs can create shared textures on macOS;
+        // Intel Macs cannot, even with unified memory. iOS has no managed storage.
+        let uses_shared_storage = cfg!(target_os = "ios") || self.is_apple_gpu;
+        texture_descriptor.setStorageMode(if uses_shared_storage {
+            MTLStorageMode::Shared
+        } else {
+            MTLStorageMode::Managed
+        });
+        let target_texture = self
+            .device
+            .newTextureWithDescriptor(&texture_descriptor)
+            .context("allocating offscreen render target")?;
 
-            // Commit and wait for completion
-            command_buffer.commit();
-            command_buffer.waitUntilCompleted();
+        let command_buffer = self.render_frame(scene, &target_texture, size)?;
 
-            read_texture_to_image(&target_texture)
-        })
+        // Managed textures require an explicit blit synchronize before the CPU
+        // can read back the rendered data. Without this, get_bytes returns
+        // stale zeros.
+        if !uses_shared_storage {
+            let blit = command_buffer
+                .blitCommandEncoder()
+                .context("creating blit command encoder")?;
+            blit.synchronizeResource(ProtocolObject::from_ref(&*target_texture));
+            blit.endEncoding();
+        }
+
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        read_texture_to_image(&target_texture)
     }
 
     /// Renders a scene to a reused offscreen texture without reading pixels
@@ -3353,6 +3346,101 @@ mod tests {
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     };
     use objc2_metal::MTLCommandBufferStatus;
+
+    #[test]
+    fn path_intermediate_textures_are_reused_until_resize() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let initial_size = size(DevicePixels(64), DevicePixels(64));
+        let (initial_texture, initial_msaa_texture) = renderer
+            .path_targets(initial_size)?
+            .context("missing path intermediate texture")?;
+
+        let (reused_texture, reused_msaa_texture) = renderer
+            .path_targets(initial_size)?
+            .context("missing reused texture")?;
+        assert!(ptr::eq(&*initial_texture, &*reused_texture));
+        assert_eq!(
+            initial_msaa_texture.as_ref().map(Retained::as_ptr),
+            reused_msaa_texture.as_ref().map(Retained::as_ptr),
+        );
+
+        let (resized_texture, resized_msaa_texture) = renderer
+            .path_targets(size(DevicePixels(128), DevicePixels(64)))?
+            .context("missing resized texture")?;
+        assert_eq!(
+            (resized_texture.width(), resized_texture.height()),
+            (128, 64)
+        );
+        assert!(!ptr::eq(&*initial_texture, &*resized_texture));
+        if let Some(texture) = &resized_msaa_texture {
+            assert_eq!((texture.width(), texture.height()), (128, 64));
+        }
+
+        for (width, height) in [(0, 64), (64, 0), (-1, 64), (64, -1)] {
+            assert!(
+                renderer
+                    .path_targets(size(DevicePixels(width), DevicePixels(height)))?
+                    .is_none()
+            );
+            assert!(renderer.path_targets(initial_size)?.is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn render_to_image_rejects_zero_sized_layer() -> Result<()> {
+        let mut renderer = MetalRenderer::new(Default::default(), false, false)?;
+        for (width, height) in [(0, 0), (0, 64), (64, 0)] {
+            renderer.update_drawable_size(size(DevicePixels(width), DevicePixels(height)));
+            assert!(renderer.render_to_image(&Scene::default()).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn display_link_mode_consumes_and_clears_drawables() -> Result<()> {
+        let mut renderer = MetalRenderer::new(Default::default(), false, false)?;
+        renderer.update_drawable_size(size(DevicePixels(64), DevicePixels(64)));
+        let drawable = renderer
+            .layer()
+            .and_then(|layer| layer.nextDrawable())
+            .context("window renderer must supply a drawable")?;
+
+        renderer.set_display_link_attached(true);
+        assert!(matches!(
+            renderer.display_link_mode,
+            DisplayLinkMode::Attached { drawable: None }
+        ));
+        assert!(
+            renderer
+                .set_frame_drawable(Some(drawable.clone()))
+                .is_none()
+        );
+        assert!(matches!(
+            renderer.display_link_mode,
+            DisplayLinkMode::Attached { drawable: Some(_) }
+        ));
+        renderer.draw(&Scene::default());
+        assert!(matches!(
+            renderer.display_link_mode,
+            DisplayLinkMode::Attached { drawable: None }
+        ));
+        // A frame that drew consumed its drawable; one that didn't hands it back.
+        assert!(
+            renderer
+                .set_frame_drawable(Some(drawable.clone()))
+                .is_none()
+        );
+        assert!(renderer.set_frame_drawable(None).is_some());
+
+        renderer.set_frame_drawable(Some(drawable));
+        renderer.set_display_link_attached(false);
+        assert!(matches!(
+            renderer.display_link_mode,
+            DisplayLinkMode::Detached
+        ));
+        Ok(())
+    }
 
     #[test]
     fn render_core_video_surface() {

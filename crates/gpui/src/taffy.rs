@@ -1540,7 +1540,7 @@ mod tests {
                 let mut engine = TaffyLayoutEngine::new();
                 engine.retain = true;
                 let space = size(px(100.), px(100.)).into();
-                let mut request = |engine: &mut TaffyLayoutEngine, key, children: &[LayoutId]| {
+                let request = |engine: &mut TaffyLayoutEngine, key, children: &[LayoutId]| {
                     engine.request_layout(Some(key), Style::default(), px(16.), 1., true, children)
                 };
 

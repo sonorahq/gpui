@@ -166,14 +166,6 @@ macro_rules! text {
     }};
 }
 
-impl IntoElement for Text {
-    type Element = Self;
-    #[inline]
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for Text {
     type RequestLayoutState = TextLayout;
     type PrepaintState = ();
@@ -270,8 +262,8 @@ impl Element for &'static str {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let state = TextLayout::default();
+        let layout_id = state.layout(SharedString::new_static(self), None, window, cx);
         (layout_id, state)
     }
 
@@ -298,14 +290,6 @@ impl Element for &'static str {
         cx: &mut App,
     ) {
         text_layout.paint(self, window, cx)
-    }
-}
-
-impl IntoElement for &'static str {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 
@@ -344,7 +328,7 @@ impl Element for SharedString {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut state = TextLayout::default();
+        let state = TextLayout::default();
         let layout_id = state.layout(self.clone(), None, window, cx);
         (layout_id, state)
     }
@@ -372,14 +356,6 @@ impl Element for SharedString {
         cx: &mut App,
     ) {
         text_layout.paint(self.as_ref(), window, cx)
-    }
-}
-
-impl IntoElement for SharedString {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 
@@ -416,7 +392,7 @@ impl StyledText {
     /// Set the styling attributes for the given text, as well as
     /// as any ranges of text that have had their style customized.
     pub fn with_default_highlights(
-        mut self,
+        self,
         default_style: &TextStyle,
         highlights: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
     ) -> Self {
@@ -598,14 +574,6 @@ impl Element for StyledText {
         cx: &mut App,
     ) {
         self.layout.paint(&self.text, window, cx)
-    }
-}
-
-impl IntoElement for StyledText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 
@@ -1076,7 +1044,7 @@ impl TextLayout {
     }
 
     /// Get the byte index into the input of the pixel position.
-    pub fn index_for_position(&self, mut position: Point<Pixels>) -> Result<usize, usize> {
+    pub fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
         let element_state = self.0.borrow();
         let element_state = element_state
             .as_ref()
@@ -1385,7 +1353,7 @@ impl Element for InteractiveText {
         window.with_element_state::<InteractiveTextState, _>(
             global_id.unwrap(),
             |interactive_state, window| {
-                let mut interactive_state = interactive_state.unwrap_or_default();
+                let interactive_state = interactive_state.unwrap_or_default();
                 if let Some(click_listener) = self.click_listener.take() {
                     let mouse_position = window.mouse_position();
                     if let Ok(ix) = text_layout.index_for_position(mouse_position)
@@ -1440,7 +1408,7 @@ impl Element for InteractiveText {
                 }
 
                 window.on_mouse_event({
-                    let mut hover_listener = self.hover_listener.take();
+                    let hover_listener = self.hover_listener.take();
                     let hitbox = hitbox.clone();
                     let text_layout = text_layout.clone();
                     let hovered_index = interactive_state.hovered_index.clone();
@@ -1518,14 +1486,6 @@ impl Element for InteractiveText {
                 ((), interactive_state)
             },
         );
-    }
-}
-
-impl IntoElement for InteractiveText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 

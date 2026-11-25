@@ -152,9 +152,6 @@ actions!(image, [Quit]);
 fn run_example() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    #[cfg(not(target_family = "wasm"))]
-    let app = gpui_platform::application();
-    #[cfg(target_family = "wasm")]
     let app = gpui_platform::application();
     app.with_assets(Assets {
         base: manifest_dir.join("examples"),
@@ -163,7 +160,6 @@ fn run_example() {
         if !example_support::load_fonts(cx) {
             return;
         }
-
         cx.activate(true);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
