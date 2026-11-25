@@ -271,10 +271,20 @@ impl AppleTextSystemState {
                     };
                     let font = core_graphics::font::CGFont::from_data_provider(data_provider)
                         .map_err(|()| anyhow!("Could not load an embedded font."))?;
+                    register_for_cascade(&font);
                     let font = font_kit::loaders::core_text::Font::from_core_graphics_font(font);
                     Ok(Handle::from_native(&font))
                 }
-                Cow::Owned(bytes) => Ok(Handle::from_memory(Arc::new(bytes), 0)),
+                Cow::Owned(bytes) => {
+                    let bytes = Arc::new(bytes);
+                    let data_provider =
+                        core_graphics::data_provider::CGDataProvider::from_buffer(bytes.clone());
+                    if let Ok(font) = core_graphics::font::CGFont::from_data_provider(data_provider)
+                    {
+                        register_for_cascade(&font);
+                    }
+                    Ok(Handle::from_memory(bytes, 0))
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         self.memory_source.add_fonts(fonts.into_iter())?;
@@ -769,6 +779,34 @@ mod lenient_font_attributes {
             let reference = CFRetain(reference as *const ::std::os::raw::c_void) as CFStringRef;
             TCFType::wrap_under_create_rule(reference)
         }
+    }
+}
+
+/// Registers an app-supplied font with CoreText for this process. CoreText resolves a cascade list
+/// by family name among registered fonts only, so without this an embedded font could never serve
+/// as another font's fallback. A font whose name is already registered, such as one the user also
+/// installed, is logged and left to the installed copy.
+fn register_for_cascade(font: &core_graphics::font::CGFont) {
+    use core_foundation::error::{CFError, CFErrorRef};
+    use foreign_types::ForeignType as _;
+
+    #[link(name = "CoreText", kind = "framework")]
+    unsafe extern "C" {
+        fn CTFontManagerRegisterGraphicsFont(
+            font: core_graphics::sys::CGFontRef,
+            error: *mut CFErrorRef,
+        ) -> bool;
+    }
+
+    let mut error: CFErrorRef = std::ptr::null_mut();
+    let registered = unsafe { CTFontManagerRegisterGraphicsFont(font.as_ptr(), &mut error) };
+    if !registered && !error.is_null() {
+        let error = unsafe { CFError::wrap_under_create_rule(error) };
+        log::debug!(
+            "cannot register {:?} for font fallback: {}",
+            font.postscript_name(),
+            error.description()
+        );
     }
 }
 
