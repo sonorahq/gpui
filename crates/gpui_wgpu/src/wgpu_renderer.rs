@@ -264,8 +264,9 @@ struct BlurParams {
     level: u32,
 }
 
-/// How deeply filtered layers can nest before the innermost ones stop being filtered.
-const LAYER_DEPTH: usize = 4;
+/// How deeply filtered layers can nest before the innermost ones stop being filtered. Each depth
+/// keeps one offscreen target, made the first time a frame nests that deep.
+const LAYER_DEPTH: usize = 8;
 
 /// An offscreen render target that is created the first time a frame needs it and released
 /// once it has gone `IDLE_RELEASE` without use.
