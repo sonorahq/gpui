@@ -60,8 +60,9 @@ const INSTANCE_BUFFER_SETTLE: Duration = Duration::from_secs(5);
 /// blur, layer or path on screen touches its targets every time, so only targets that nothing
 /// on screen draws through are released.
 const IDLE_RELEASE: Duration = Duration::from_secs(2);
-/// How deeply filtered layers can nest before the innermost ones stop being filtered.
-const LAYER_DEPTH: usize = 4;
+/// How deeply filtered layers can nest before the innermost ones stop being filtered. Each depth
+/// keeps one offscreen target, made the first time a frame nests that deep.
+const LAYER_DEPTH: usize = 8;
 
 /// The widest and tallest the overscan may grow a frame drawn offscreen to, which every Metal GPU
 /// can allocate. A window already larger keeps its size and gets no overscan.

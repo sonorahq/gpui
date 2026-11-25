@@ -46,11 +46,14 @@ pub struct FontId(pub usize);
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct FontFamilyId(pub usize);
 
-/// Number of subpixel glyph variants along the X axis.
-pub const SUBPIXEL_VARIANTS_X: u8 = 4;
+/// Number of subpixel glyph variants along the X axis. Text on the pixel grid uses every other
+/// one, a quarter pixel apart, and text that moves or scales uses all of them.
+pub const SUBPIXEL_VARIANTS_X: u8 = 8;
 
-/// Number of subpixel glyph variants along the Y axis.
-pub const SUBPIXEL_VARIANTS_Y: u8 = 1;
+/// Number of subpixel glyph variants along the Y axis. Text that moves up or down between device
+/// pixels, such as a rising letter, is drawn at an eighth of a pixel rather than jumping a whole
+/// one.
+pub const SUBPIXEL_VARIANTS_Y: u8 = 8;
 
 // Leave enough room below the underline for its stroke while keeping it below the baseline.
 const UNDERLINE_DESCENT_OFFSET_FACTOR: f32 = 0.618;
@@ -1296,6 +1299,9 @@ pub struct RenderGlyphParams {
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
     pub dilation: u8,
+    /// Whether the rasterizer may fit the glyph's outline to the pixel grid. Text that moves or
+    /// scales is drawn unhinted, so its shape follows its size and place smoothly.
+    pub hinted: bool,
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1310,6 +1316,7 @@ impl Hash for RenderGlyphParams {
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
+        self.hinted.hash(state);
     }
 }
 

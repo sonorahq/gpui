@@ -363,16 +363,19 @@ impl TaffyLayoutEngine {
     }
 
     /// `key` names the place the request comes from, see [`crate::window::LayoutKeys`].
+    /// `snapping` is whether the subtree the node sits in keeps to the device pixel grid, which
+    /// decides how its authored lengths are rounded when its own style does not say.
     pub fn request_layout(
         &mut self,
         key: Option<u64>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
+        snapping: bool,
         children: &[LayoutId],
     ) -> LayoutId {
         let snap = style.pixel_snap;
-        let grid = Grid::new(scale_factor, snap);
+        let grid = Grid::new(scale_factor, Some(snap.unwrap_or(snapping)));
 
         if self.retain {
             let fingerprint = layout_fingerprint(&style, rem_size, grid);
@@ -411,16 +414,18 @@ impl TaffyLayoutEngine {
     }
 
     /// `key` names the place the request comes from, see [`crate::window::LayoutKeys`].
+    /// `snapping` is as for [`Self::request_layout`].
     pub(crate) fn request_measured_layout(
         &mut self,
         key: Option<u64>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
+        snapping: bool,
         measured: Measured,
     ) -> LayoutId {
         let snap = style.pixel_snap;
-        let grid = Grid::new(scale_factor, snap);
+        let grid = Grid::new(scale_factor, Some(snap.unwrap_or(snapping)));
 
         let id = if self.retain {
             let fingerprint = layout_fingerprint(&style, rem_size, grid);
@@ -697,10 +702,10 @@ impl TaffyLayoutEngine {
     // rounded value so that they remain stable under translation.
     //
     // A subtree may opt out (`Styled::pixel_snap(false)`), for layout that
-    // animates. Its root keeps its own authored lengths unrounded, and every
-    // node inside keeps its unrounded edges, shifted as one by however far
-    // the root's origin had to move to land on a device pixel. Whole-pixel
-    // metrics inside such a subtree therefore still land on the grid.
+    // animates. Its root and every node inside keep their authored lengths
+    // and their edges unrounded, shifted as one by however far the root's
+    // origin had to move to land on a device pixel. Whole-pixel metrics
+    // inside such a subtree therefore still land on the grid.
     //
     // This gives both closure and translation stability in the case that
     // all local metrics are integer device-pixel lengths. Pre-layout
@@ -1525,7 +1530,7 @@ mod tests {
                 engine.retain = true;
                 let space = size(px(100.), px(100.)).into();
                 let mut request = |engine: &mut TaffyLayoutEngine, key, children: &[LayoutId]| {
-                    engine.request_layout(Some(key), Style::default(), px(16.), 1., children)
+                    engine.request_layout(Some(key), Style::default(), px(16.), 1., true, children)
                 };
 
                 let child = request(&mut engine, 1, &[]);
@@ -1558,16 +1563,18 @@ mod tests {
                 engine.retain = true;
                 let space = size(px(100.), px(100.)).into();
 
-                let root = engine.request_layout(Some(1), Style::default(), px(16.), 1., &[]);
+                let root = engine.request_layout(Some(1), Style::default(), px(16.), 1., true, &[]);
                 engine.stretch_auto_size_to_fill(root, size(px(100.), px(100.)), 1.);
                 engine.compute_layout(root, space, window, cx);
                 engine.clear();
 
-                let child = engine.request_layout(Some(1), Style::default(), px(16.), 1., &[]);
+                let child =
+                    engine.request_layout(Some(1), Style::default(), px(16.), 1., true, &[]);
                 assert_eq!(child, root, "the node is kept");
                 let mut parent_style = Style::default();
                 parent_style.size = size(px(50.).into(), px(50.).into());
-                let parent = engine.request_layout(Some(2), parent_style, px(16.), 1., &[child]);
+                let parent =
+                    engine.request_layout(Some(2), parent_style, px(16.), 1., true, &[child]);
                 engine.compute_layout(parent, space, window, cx);
                 let fresh = Style::default().to_taffy(px(16.), Grid::new(1., None));
                 assert_eq!(
