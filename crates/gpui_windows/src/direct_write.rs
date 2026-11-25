@@ -324,7 +324,7 @@ impl DirectWriteState {
                         font,
                         font_collection,
                         &components.factory,
-                        &this.system_font_collection,
+                        [&this.custom_font_collection, &this.system_font_collection],
                         &components.system_ui_font_name,
                     )
                 })?;
@@ -395,10 +395,13 @@ impl DirectWriteState {
         Ok(())
     }
 
+    /// Builds the fallback chain for `fallbacks`, looking each family up in `collections` in
+    /// order, so a font the app embedded can stand in for text its main font lacks. Families
+    /// found nowhere are skipped, and the system's own fallback follows the listed ones.
     fn generate_font_fallbacks(
         fallbacks: &FontFallbacks,
         factory: &IDWriteFactory5,
-        system_font_collection: &IDWriteFontCollection1,
+        collections: [&IDWriteFontCollection1; 2],
     ) -> Result<Option<IDWriteFontFallback>> {
         let fallback_list = fallbacks.fallback_list();
         if fallback_list.is_empty() {
@@ -406,25 +409,25 @@ impl DirectWriteState {
         }
         unsafe {
             let builder = factory.CreateFontFallbackBuilder()?;
-            let font_set = &system_font_collection.GetFontSet()?;
             let mut unicode_ranges = Vec::new();
             for family_name in fallback_list {
                 let family_name = HSTRING::from(family_name);
-                let Some(fonts) = font_set
-                    .GetMatchingFonts(
-                        &family_name,
-                        DWRITE_FONT_WEIGHT_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        DWRITE_FONT_STYLE_NORMAL,
-                    )
-                    .log_err()
-                else {
+                let Some((collection, font)) = collections.into_iter().find_map(|collection| {
+                    let fonts = collection
+                        .GetFontSet()
+                        .log_err()?
+                        .GetMatchingFonts(
+                            &family_name,
+                            DWRITE_FONT_WEIGHT_NORMAL,
+                            DWRITE_FONT_STRETCH_NORMAL,
+                            DWRITE_FONT_STYLE_NORMAL,
+                        )
+                        .log_err()?;
+                    let font = fonts.GetFontFaceReference(0).ok()?.CreateFontFace().ok()?;
+                    Some((collection, font))
+                }) else {
                     continue;
                 };
-                let Ok(font_face) = fonts.GetFontFaceReference(0) else {
-                    continue;
-                };
-                let font = font_face.CreateFontFace()?;
                 let mut count = 0;
                 font.GetUnicodeRanges(None, &mut count).ok();
                 if count == 0 {
@@ -441,7 +444,7 @@ impl DirectWriteState {
                 builder.AddMapping(
                     &unicode_ranges,
                     &[family_name.as_ptr()],
-                    None,
+                    collection,
                     None,
                     None,
                     1.0,
@@ -473,7 +476,7 @@ impl DirectWriteState {
         }: &Font,
         collection: &IDWriteFontCollection1,
         factory: &IDWriteFactory5,
-        system_font_collection: &IDWriteFontCollection1,
+        fallback_collections: [&IDWriteFontCollection1; 2],
         system_ui_font_name: &SharedString,
     ) -> Option<FontInfo> {
         const SYSTEM_UI_FONT_NAME: &str = ".SystemUIFont";
@@ -502,7 +505,7 @@ impl DirectWriteState {
                 let direct_write_features =
                     unsafe { Self::generate_font_features(factory, features).log_err()? };
                 let fallbacks = fallbacks.as_ref().and_then(|fallbacks| {
-                    Self::generate_font_fallbacks(fallbacks, factory, system_font_collection)
+                    Self::generate_font_fallbacks(fallbacks, factory, fallback_collections)
                         .log_err()
                         .flatten()
                 });

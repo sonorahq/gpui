@@ -4,7 +4,8 @@ use core_foundation::{
     },
     base::{CFRelease, TCFType, kCFAllocatorDefault},
     dictionary::{
-        CFDictionaryCreate, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+        CFDictionary, CFDictionaryCreate, kCFTypeDictionaryKeyCallBacks,
+        kCFTypeDictionaryValueCallBacks,
     },
     number::CFNumber,
     string::CFString,
@@ -12,7 +13,7 @@ use core_foundation::{
 use core_foundation_sys::locale::CFLocaleCopyPreferredLanguages;
 use core_text::font_descriptor::{
     TraitAccessors, kCTFontFamilyNameAttribute, kCTFontItalicTrait, kCTFontSlantTrait,
-    kCTFontTraitsAttribute, kCTFontWeightTrait,
+    kCTFontTraitsAttribute, kCTFontVariationAttribute, kCTFontWeightTrait,
 };
 use core_text::{
     font::{CTFont, cascade_list_for_languages},
@@ -24,6 +25,9 @@ use core_text::{
 use font_kit::font::Font as FontKitFont;
 use gpui::{FontFallbacks, FontFeatures};
 use objc2_core_text::{kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue};
+
+/// The `wght` axis tag, which CoreText takes as the key of a variation dictionary.
+const WEIGHT_AXIS: i32 = i32::from_be_bytes(*b"wght");
 
 pub fn apply_features_and_fallbacks(
     font: &mut FontKitFont,
@@ -130,8 +134,17 @@ fn generate_fallback_array(fallbacks: &FontFallbacks, font: &mut FontKitFont) ->
             drop(weight_value);
             drop(slant_value);
 
-            let attr_keys = [kCTFontFamilyNameAttribute, kCTFontTraitsAttribute];
-            let attr_values = [name.as_CFTypeRef(), traits as _];
+            let variation = CFDictionary::from_CFType_pairs(&[(
+                CFNumber::from(WEIGHT_AXIS),
+                CFNumber::from(css_weight(all_traits.normalized_weight())),
+            )]);
+
+            let attr_keys = [
+                kCTFontFamilyNameAttribute,
+                kCTFontTraitsAttribute,
+                kCTFontVariationAttribute,
+            ];
+            let attr_values = [name.as_CFTypeRef(), traits as _, variation.as_CFTypeRef()];
             let attrs = CFDictionaryCreate(
                 kCFAllocatorDefault,
                 &attr_keys as *const _ as _,
@@ -152,6 +165,34 @@ fn generate_fallback_array(fallbacks: &FontFallbacks, font: &mut FontKitFont) ->
         append_system_fallbacks(fallback_array, &font.native_font());
         fallback_array
     }
+}
+
+/// Maps CoreText's normalized weight trait back to the CSS weight a variable font's `wght` axis
+/// takes, by the table CoreText itself uses for the named weights.
+fn css_weight(normalized: f64) -> f64 {
+    const STEPS: [(f64, f64); 9] = [
+        (-0.8, 100.),
+        (-0.6, 200.),
+        (-0.4, 300.),
+        (0.0, 400.),
+        (0.23, 500.),
+        (0.3, 600.),
+        (0.4, 700.),
+        (0.56, 800.),
+        (0.62, 900.),
+    ];
+    let (first, last) = (STEPS[0], STEPS[STEPS.len() - 1]);
+    if normalized <= first.0 {
+        return first.1;
+    }
+    STEPS
+        .windows(2)
+        .find(|pair| normalized <= pair[1].0)
+        .map(|pair| {
+            let ((from, low), (to, high)) = (pair[0], pair[1]);
+            low + (normalized - from) / (to - from) * (high - low)
+        })
+        .unwrap_or(last.1)
 }
 
 fn append_system_fallbacks(fallback_array: CFMutableArrayRef, font: &CTFont) {
