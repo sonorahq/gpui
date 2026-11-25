@@ -4569,10 +4569,10 @@ impl Window {
     /// a pixel at a time under a quad that glides. An element that animates its own position
     /// wants this: rounding turns a smooth path into whole-pixel steps, so a decelerating one
     /// either sits on its last pixel for several frames or stops while it is still visibly
-    /// moving. Text is placed at subpixel positions either way; only an edge that falls between
-    /// pixels softens. Elements styled with [`Styled::pixel_snap`](crate::Styled::pixel_snap)
-    /// set this for themselves. This method should only be called during the prepaint or paint
-    /// phase of element drawing.
+    /// moving. Text in such a subtree is drawn unhinted at an eighth of a pixel both ways, so it
+    /// moves and scales smoothly too. Only an edge that falls between pixels softens. Elements
+    /// styled with [`Styled::pixel_snap`](crate::Styled::pixel_snap) set this for themselves.
+    /// This method should only be called during the prepaint or paint phase of element drawing.
     pub fn with_pixel_snapping<R>(&mut self, snap: bool, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
 
@@ -5629,6 +5629,11 @@ impl Window {
     /// [`WrappedLine::paint`](crate::WrappedLine::paint) methods in the [`TextSystem`](crate::TextSystem).
     /// This method is only useful if you need to paint a single glyph that has already been shaped.
     ///
+    /// A glyph sits on a whole device pixel vertically and a quarter pixel across, hinted to the
+    /// grid, which keeps its strokes sharp, unless it is painted inside a subtree that opts out of
+    /// pixel snapping. There it is placed at an eighth of a pixel both ways and left unhinted, so
+    /// text that moves or scales glides rather than stepping.
+    ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_glyph(
         &mut self,
@@ -5644,11 +5649,13 @@ impl Window {
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
 
+        let (variants_x, variants_y) = match self.pixel_snapping {
+            true => (SUBPIXEL_VARIANTS_X / 2, 1),
+            false => (SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y),
+        };
         let quantized_origin = Point::new(
-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
-                / SUBPIXEL_VARIANTS_X as f32,
-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
-                / SUBPIXEL_VARIANTS_Y as f32,
+            round_half_toward_zero(glyph_origin.x.0 * variants_x as f32) / variants_x as f32,
+            round_half_toward_zero(glyph_origin.y.0 * variants_y as f32) / variants_y as f32,
         );
         let subpixel_variant = Point::new(
             (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
@@ -5666,6 +5673,7 @@ impl Window {
             is_emoji: false,
             subpixel_rendering,
             dilation,
+            hinted: self.pixel_snapping,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -5756,6 +5764,7 @@ impl Window {
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
+            hinted: true,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -6035,11 +6044,13 @@ impl Window {
         let scale_factor = self.scale_factor();
         let key = self.layout_keys.take(self.element_id_stack.hash());
 
+        let snapping = self.pixel_snapping;
         self.layout_engine.as_mut().unwrap().request_layout(
             Some(key),
             style,
             rem_size,
             scale_factor,
+            snapping,
             &cx.layout_id_buffer,
         )
     }
@@ -6088,10 +6099,11 @@ impl Window {
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
         let key = self.layout_keys.take(self.element_id_stack.hash());
+        let snapping = self.pixel_snapping;
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(Some(key), style, rem_size, scale_factor, measured)
+            .request_measured_layout(Some(key), style, rem_size, scale_factor, snapping, measured)
     }
 
     /// Compute the layout for the given id within the given available space.

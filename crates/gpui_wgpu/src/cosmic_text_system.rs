@@ -641,9 +641,12 @@ impl CosmicTextSystemState {
         let font_ref = loaded_font.font.as_swash();
         let pixel_size = f32::from(params.font_size);
 
+        // The glyph is scaled to device pixels, so its offset is measured in them too. Swash
+        // renders from the bottom left with y pointing up, so a glyph that sits lower on screen
+        // takes a negative offset.
         let subpixel_offset = Vector::new(
-            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor,
-            params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
+            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32,
+            -(params.subpixel_variant.y as f32) / SUBPIXEL_VARIANTS_Y as f32,
         );
 
         // clears stale coords
@@ -651,7 +654,7 @@ impl CosmicTextSystemState {
             .swash_scale_context
             .builder(font_ref)
             .size(pixel_size * params.scale_factor)
-            .hint(true)
+            .hint(params.hinted)
             .normalized_coords(&loaded_font.wght_coords)
             .build();
 

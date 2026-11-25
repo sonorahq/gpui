@@ -35,8 +35,8 @@ use font_kit::{
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
     FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams,
-    Result, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode,
-    point, px, size, swap_rgba_pa_to_bgra,
+    Result, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size,
+    TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
@@ -506,9 +506,10 @@ impl AppleTextSystemState {
                 params.scale_factor as CGFloat,
             );
 
-            let subpixel_shift = params
-                .subpixel_variant
-                .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
+            let subpixel_shift = point(
+                params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32,
+                params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32,
+            );
             cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
             cx.set_allows_antialiasing(true);
             cx.set_should_antialias(true);

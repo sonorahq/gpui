@@ -1945,13 +1945,18 @@ impl Element for Div {
                 window,
                 cx,
                 |style, window, cx| {
-                    window.with_text_style(style.text_style().cloned(), |window| {
-                        child_layout_ids = self
-                            .children
-                            .iter_mut()
-                            .map(|child| child.request_layout(window, cx))
-                            .collect::<SmallVec<_>>();
-                        window.request_layout(style, child_layout_ids.iter().copied(), cx)
+                    // children inside a subtree that leaves the pixel grid keep the fractions of
+                    // their own lengths too
+                    let snap = style.pixel_snap.unwrap_or(window.pixel_snapping);
+                    window.with_pixel_snapping(snap, |window| {
+                        window.with_text_style(style.text_style().cloned(), |window| {
+                            child_layout_ids = self
+                                .children
+                                .iter_mut()
+                                .map(|child| child.request_layout(window, cx))
+                                .collect::<SmallVec<_>>();
+                            window.request_layout(style, child_layout_ids.iter().copied(), cx)
+                        })
                     })
                 },
             )
