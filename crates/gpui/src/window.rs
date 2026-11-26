@@ -5631,6 +5631,13 @@ impl Window {
                 continue;
             }
             let hole = (bounds + shadow.offset).dilate(-shadow.spread_radius);
+            // Keep an empty hole empty rather than letting cover_bounds expand a fractional
+            // collapsed rect into a 1px hole.
+            let shape_bounds = if hole.is_empty() {
+                Bounds::default()
+            } else {
+                self.cover_bounds(hole)
+            };
             // Clamp at zero so a large spread can't produce negative radii, which would
             // break the SDF in the shader.
             let zero = Pixels::ZERO;
@@ -5647,7 +5654,7 @@ impl Window {
                 content_mask,
                 corner_radii: element_corner_radii,
                 color: shadow.color.opacity(opacity),
-                shape_bounds: self.cover_bounds(hole),
+                shape_bounds,
                 shape_corner_radii: hole_corner_radii.scale(scale_factor),
                 inset: true.into(),
                 element_corner_smoothing: corner_smoothing,
@@ -5671,11 +5678,24 @@ impl Window {
 
         // A corner's inner border edge is a quarter ellipse around the
         // corner's center, with the border widths taken off its radius.
+        // Smoothed corners offset their outer curve by the wider border on
+        // both axes in the shader, so use that width for both coordinates
+        // inside a rounded corner.
+        let smoothed = quad.corner_smoothing > 0.0;
         let corner_inset = |radius: ScaledPixels, width_x: ScaledPixels, width_y: ScaledPixels| {
-            point(
-                width_x.max(radius - (radius - width_x) * cos),
-                width_y.max(radius - (radius - width_y) * sin),
-            )
+            if smoothed && radius > ScaledPixels(0.0) {
+                let w = width_x.max(width_y);
+                let inner = (radius - w).max(ScaledPixels(0.0));
+                point(
+                    width_x.max(radius - inner * cos),
+                    width_y.max(radius - inner * sin),
+                )
+            } else {
+                point(
+                    width_x.max(radius - (radius - width_x) * cos),
+                    width_y.max(radius - (radius - width_y) * sin),
+                )
+            }
         };
 
         // A smoothed corner starts further along each edge than its radius and bulges past the
@@ -12408,5 +12428,85 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+
+    #[test]
+    fn largest_border_interior_clears_unequal_smoothed_borders() {
+        let mut quad = Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds::new(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size(ScaledPixels(200.0), ScaledPixels(200.0)),
+            ),
+            content_mask: ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                    size(ScaledPixels(200.0), ScaledPixels(200.0)),
+                ),
+            },
+            background: crate::Background::default(),
+            border_color: crate::black(),
+            corner_radii: Corners::all(ScaledPixels(60.0)),
+            border_widths: Edges {
+                top: ScaledPixels(1.0),
+                right: ScaledPixels(50.0),
+                bottom: ScaledPixels(1.0),
+                left: ScaledPixels(50.0),
+            },
+            corner_smoothing: 1.0,
+            pad: 0,
+        };
+        let interior = Window::largest_border_interior(&quad);
+        assert!(
+            !interior.contains(&point(ScaledPixels(64.5), ScaledPixels(29.5))),
+            "interior cutout {interior:?} must not clip a smoothed corner offset by the wider border"
+        );
+        assert!(interior.origin.y > ScaledPixels(63.0));
+
+        quad.corner_radii = Corners::all(ScaledPixels(0.0));
+        let square_interior = Window::largest_border_interior(&quad);
+        assert_eq!(square_interior.origin.y, ScaledPixels(2.0));
+        assert_eq!(square_interior.origin.x, ScaledPixels(51.0));
+    }
+
+    #[gpui::test]
+    fn test_collapsed_inset_shadow_hole_stays_empty_at_fractional_origin(cx: &mut TestAppContext) {
+        struct BlankView;
+        impl Render for BlankView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let window = cx.add_window(|_, _| BlankView);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.invalidator.set_phase(DrawPhase::Paint);
+            let bounds = Bounds::new(point(px(10.5), px(10.5)), size(px(20.0), px(20.0)));
+            window.paint_inset_shadows(
+                bounds,
+                Corners::default(),
+                0.0,
+                &[BoxShadow {
+                    color: crate::black(),
+                    offset: point(px(0.0), px(0.0)),
+                    blur_radius: px(4.0),
+                    spread_radius: px(10.0),
+                    inset: true,
+                }],
+            );
+            let shadow = window
+                .next_frame
+                .scene
+                .shadows
+                .last()
+                .expect("collapsed inset shadow inserted");
+            assert!(
+                shadow.shape_bounds.is_empty(),
+                "collapsed inset hole at fractional origin must stay empty, got {:?}",
+                shadow.shape_bounds
+            );
+        })
+        .unwrap();
     }
 }

@@ -992,9 +992,17 @@ float erf7(float x) {
 // Raph Levien's blurred rounded rectangle approximation, whose blur s is sigma * sqrt(2):
 // https://raphlinus.github.io/graphics/2020/04/21/blurred-rounded-rects.html
 PreparedBlurredRoundedRect prepare_blurred_rounded_rect(float2 size, Corners corner_radii, float sigma) {
+    float min_edge = min(size.x, size.y);
+    if (min_edge <= 0.) {
+        PreparedBlurredRoundedRect empty;
+        empty.shape = float4(0., 0., 0., 0.);
+        empty.r1 = float4(0., 0., 0., 0.);
+        empty.exponent = float4(2., 2., 2., 2.);
+        empty.scale = float4(0., 0., 0., 0.);
+        return empty;
+    }
     float s = max(sigma * sqrt(2.), 1e-6);
     float s_inv = 1. / s;
-    float min_edge = min(size.x, size.y);
     float r_max = 0.5 * min_edge;
     float4 radii = float4(corner_radii.top_left, corner_radii.top_right,
                           corner_radii.bottom_right, corner_radii.bottom_left);
@@ -1062,7 +1070,9 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
     Shadow shadow = shadows[input.shadow_id];
 
     float alpha;
-    if (shadow.blur_radius == 0.) {
+    if (shadow.shape_bounds.size.x <= 0. || shadow.shape_bounds.size.y <= 0.) {
+        alpha = 0.;
+    } else if (shadow.blur_radius == 0.) {
         float distance = quad_sdf(input.position.xy, shadow.shape_bounds, shadow.shape_corner_radii, 0.0);
         alpha = saturate(0.5 - distance);
     } else {
