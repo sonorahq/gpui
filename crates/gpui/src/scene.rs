@@ -700,8 +700,11 @@ impl PrimitiveKind {
     /// topmost primitive it overlaps if that primitive's kind is at most the
     /// one returned here. Otherwise, it needs a new draw order. A backdrop shares only
     /// with shadows and other backdrops, so every quad it overlaps is drawn before it blurs.
+    /// A custom shader shares at most with a quad, since shaders sharing an order are sorted by
+    /// their id rather than in paint order.
     fn max_shared_kind(self) -> Self {
         match self {
+            Self::Shader => Self::Quad,
             Self::MonochromeSprite => Self::Underline,
             Self::SubpixelSprite => Self::MonochromeSprite,
             Self::PolychromeSprite => Self::SubpixelSprite,
@@ -1662,16 +1665,37 @@ mod layer_filter_tests {
             params: [0.0; crate::SHADER_PARAM_COUNT],
             colors: [[0.0; 4]; crate::SHADER_COLOR_COUNT],
         });
+        // Another shader over that one takes a new order, so it draws on top despite its lower id.
+        scene.insert_primitive(ShaderQuad {
+            order: 0,
+            shader: ShaderId(3),
+            opacity: 1.0,
+            time: 0.0,
+            bounds: rect(65.0, 65.0, 20.0, 20.0),
+            content_mask,
+            corner_radii: Corners::default(),
+            scale_factor: 1.0,
+            pad: [0; 3],
+            params: [0.0; crate::SHADER_PARAM_COUNT],
+            colors: [[0.0; 4]; crate::SHADER_COLOR_COUNT],
+        });
         scene.finish();
 
         let labels: Vec<_> = scene.batches().map(|batch| batch.label()).collect();
         assert_eq!(
             labels,
-            ["quads (1)", "backdrops (1)", "quads (1)", "shader 7 (1)"]
+            [
+                "quads (1)",
+                "backdrops (1)",
+                "quads (1)",
+                "shader 7 (1)",
+                "shader 3 (1)"
+            ]
         );
         assert!(scene.quads[0].order < scene.backdrops[0].order);
         assert_eq!(scene.quads[1].order, scene.backdrops[0].order);
         assert_eq!(scene.shaders[0].order, scene.backdrops[0].order);
+        assert!(scene.shaders[1].order > scene.shaders[0].order);
     }
 
     #[test]
