@@ -346,7 +346,8 @@ impl Scene {
         self.push_span(id, span.bounds);
         // A span pushed by hand can open a layer or a filter it does not close, or close one
         // it did not open. The replay keeps count, so it never closes the caller's and never
-        // leaves one of its own open.
+        // leaves one of its own open. A paint layer opens only inside a filter, so the layers
+        // left open close first.
         let (mut layers, mut filters) = (0usize, 0usize);
         for operation in &prev_scene.paint_operations[span.operations.clone()] {
             match operation {
@@ -375,11 +376,11 @@ impl Scene {
                 | PaintOperation::EndSpan => {}
             }
         }
-        for _ in 0..filters {
-            self.pop_filter();
-        }
         for _ in 0..layers {
             self.pop_layer();
+        }
+        for _ in 0..filters {
+            self.pop_filter();
         }
         self.pop_span();
         true
@@ -1675,6 +1676,31 @@ mod layer_filter_tests {
             replayed.quads[0].order,
             replayed.underlines[0].order
         );
+    }
+
+    #[test]
+    fn a_replayed_span_closes_its_paint_layers_inside_its_filters() {
+        let mut painted = Scene::default();
+        painted.push_span(1, Bounds::default());
+        painted.push_filter(
+            rect(0.0, 0.0, 100.0, 100.0),
+            origin(50.0, 50.0),
+            rect(0.0, 0.0, 500.0, 500.0),
+            Filter {
+                blur: 4.0,
+                ..Default::default()
+            },
+        );
+        painted.push_layer();
+        painted.insert_primitive(quad(rect(10.0, 10.0, 20.0, 20.0)));
+        // The span ends with the filter and the layer inside it still open.
+        painted.pop_span();
+        painted.pop_layer();
+        painted.pop_filter();
+
+        let mut replayed = Scene::default();
+        assert!(replayed.replay_span(1, &painted, 1.0));
+        assert_eq!(replayed.filtered(replayed.quads[0].order), Some(0));
     }
 
     #[test]
