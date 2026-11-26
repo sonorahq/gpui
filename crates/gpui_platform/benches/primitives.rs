@@ -225,6 +225,7 @@ fn paint(rectangle: &Rectangle, window: &mut Window, cx: &mut App) {
         Kind::Shadow => window.paint_drop_shadows(
             rectangle.bounds,
             Corners::all(px(4.)),
+            0.,
             &[BoxShadow {
                 color: rectangle.color,
                 offset: point(px(0.), px(2.)),
@@ -310,6 +311,8 @@ fn build_scene(scene: &mut Scene, rectangles: &[Rectangle]) {
                 border_color: Default::default(),
                 corner_radii: Default::default(),
                 border_widths: Default::default(),
+                corner_smoothing: 0.,
+                pad: 0,
             }),
             Kind::Shadow => scene.insert_primitive(gpui::Shadow {
                 order: 0,
@@ -321,7 +324,9 @@ fn build_scene(scene: &mut Scene, rectangles: &[Rectangle]) {
                 shape_bounds: bounds,
                 shape_corner_radii: Corners::all(gpui::ScaledPixels(4.)),
                 inset: false.into(),
-                pad: 0,
+                element_corner_smoothing: 0.,
+                element_bounds: bounds,
+                element_corner_radii: Corners::all(gpui::ScaledPixels(4.)),
             }),
             Kind::Underline => scene.insert_primitive(gpui::Underline {
                 order: 0,
