@@ -2,7 +2,6 @@
 name = "gpui"
 version = "0.2.2"
 edition.workspace = true
-authors = ["Nathan Sobo <nathan@zed.dev>"]
 description = "Zed's GPU-accelerated UI framework"
 repository = "https://github.com/zed-industries/zed"
 publish = true
@@ -123,7 +122,7 @@ lyon_path = "1.0.19"
 naga = { workspace = true, features = ["wgsl-in"] }
 pin-project = "1.1.10"
 spin.workspace = true
-tiny-skia-path = "0.11"
+tiny-skia-path = "0.12"
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 web-time = { workspace = true, optional = true }
