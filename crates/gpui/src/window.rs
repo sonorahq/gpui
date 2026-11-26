@@ -15,7 +15,7 @@ use crate::{
     GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent,
     KeyEvent, Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex, Modifiers,
     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
-    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PaintedPath, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shader,
@@ -5434,28 +5434,20 @@ impl Window {
         });
     }
 
-    /// Creates a new painting layer for the specified bounds. A "layer" is a batch
-    /// of geometry that are non-overlapping and have the same draw order. This is typically used
+    /// Creates a new painting layer. A "layer" is a batch of geometry that are
+    /// non-overlapping and have the same draw order. This is typically used
     /// for performance reasons.
     ///
+    /// Layers painted inside `f` are drawn above this layer, including above
+    /// what `f` paints after them.
+    ///
     /// This method should only be called as part of the paint phase of element drawing.
-    pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
+    pub fn paint_layer<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint();
 
-        let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
-        if !clipped_bounds.is_empty() {
-            self.next_frame
-                .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
-        }
-
+        self.next_frame.scene.push_layer();
         let result = f(self);
-
-        if !clipped_bounds.is_empty() {
-            self.next_frame.scene.pop_layer();
-        }
-
+        self.next_frame.scene.pop_layer();
         result
     }
 
@@ -5484,7 +5476,6 @@ impl Window {
             if shadow.inset {
                 continue;
             }
-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             // The spread grows the rounded corners with the box, as CSS does, so a ring drawn
             // with a spread keeps one width around the corners. A square corner stays square,
             // and a corner rounded less than the spread grows by less, so it does not jump to
@@ -5510,17 +5501,26 @@ impl Window {
                 bottom_right: spread(corner_radii.bottom_right),
                 bottom_left: spread(corner_radii.bottom_left),
             };
+            let shape_bounds =
+                self.cover_bounds((bounds + shadow.offset).dilate(shadow.spread_radius));
+            if shape_bounds.is_empty() {
+                continue;
+            }
+            let blur_radius = shadow.blur_radius.scale(scale_factor);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
-                blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(shadow_bounds),
+                blur_radius,
+                // Leave room for the tail of the blur.
+                bounds: shape_bounds.dilate(blur_radius * 3.),
                 content_mask,
-                corner_radii: shadow_corner_radii.scale(scale_factor),
+                corner_radii: Corners::default(),
                 color: shadow.color.opacity(opacity),
+                shape_bounds,
+                shape_corner_radii: shadow_corner_radii.scale(scale_factor),
+                inset: false.into(),
+                element_corner_smoothing: corner_smoothing,
                 element_bounds,
                 element_corner_radii,
-                inset: 0,
-                element_corner_smoothing: corner_smoothing,
             });
         }
     }
@@ -5560,14 +5560,16 @@ impl Window {
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(hole),
+                bounds: element_bounds,
                 content_mask,
-                corner_radii: hole_corner_radii.scale(scale_factor),
+                corner_radii: element_corner_radii,
                 color: shadow.color.opacity(opacity),
+                shape_bounds: self.cover_bounds(hole),
+                shape_corner_radii: hole_corner_radii.scale(scale_factor),
+                inset: true.into(),
+                element_corner_smoothing: corner_smoothing,
                 element_bounds,
                 element_corner_radii,
-                inset: 1,
-                element_corner_smoothing: corner_smoothing,
             });
         }
     }
@@ -5927,18 +5929,19 @@ impl Window {
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Background>) {
+    pub fn paint_path(&mut self, path: Path, color: impl Into<Background>) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
-        path.content_mask = content_mask;
         let color: Background = color.into();
-        path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        self.next_frame.scene.insert_primitive(PaintedPath::new(
+            path,
+            scale_factor,
+            content_mask,
+            color.opacity(opacity),
+        ));
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.

@@ -6,19 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
-    Pixels, Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point,
+    Path, PathTiles, Pixels, Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree,
+    point,
 };
 use collections::FxHashMap;
-use std::{
-    fmt::Debug,
-    iter::Peekable,
-    ops::{Add, Range, Sub},
-    slice,
-};
-
-#[allow(non_camel_case_types, unused)]
-#[expect(missing_docs)]
-pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
+use smallvec::SmallVec;
+use std::{collections::VecDeque, fmt::Debug, iter::Peekable, ops::Range, rc::Rc, slice};
 
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
@@ -62,18 +55,39 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+impl PaddedBool32 {
+    /// The wrapped boolean.
+    pub fn as_bool(self) -> bool {
+        self.0 != 0
+    }
+}
+
+/// A paint layer, whose primitives get one order between them once the outermost open layer
+/// closes.
+struct Layer {
+    primitives: SmallVec<[Range<usize>; 1]>,
+    bounds: Bounds<ScaledPixels>,
+    max_kind: PrimitiveKind,
+    max_shared_kind: PrimitiveKind,
+    /// The order an earlier frame gave this layer, when a replay that keeps its orders pushed
+    /// it and also closes the layers around it.
+    known: Option<DrawOrder>,
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    /// A running hash of everything the bounds tree was told this frame, in order, along with
-    /// every layer pop. Two scenes with the same history hand out the same orders from there on.
+    /// A running hash of every primitive this frame inserted, in or out of a paint layer, and
+    /// of every layer and filter it opened and closed, in order. Two scenes with the same history
+    /// hand out the same orders from there on.
     history: u64,
     /// The history at chosen paint operation indices, in rising index order, so a later frame
     /// that replays from one of them can tell whether its orders still hold.
     marks: Vec<(usize, u64)>,
-    layer_stack: Vec<DrawOrder>,
+    layer_stack: Vec<usize>,
+    layers: VecDeque<Layer>,
     spans: FxHashMap<SpanId, PaintSpan>,
     span_stack: Vec<(SpanId, usize, Bounds<Pixels>)>,
     pub shadows: Vec<Shadow>,
@@ -82,7 +96,7 @@ pub struct Scene {
     effect_stack: Vec<usize>,
     pub quads: Vec<Quad>,
     pub shaders: Vec<ShaderQuad>,
-    pub paths: Vec<Path<ScaledPixels>>,
+    pub paths: Vec<PaintedPath>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
@@ -102,6 +116,7 @@ impl Scene {
         self.history = 0;
         self.marks.clear();
         self.layer_stack.clear();
+        self.layers.clear();
         self.spans.clear();
         self.span_stack.clear();
         self.paths.clear();
@@ -132,18 +147,62 @@ impl Scene {
         }
     }
 
-    pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        self.record(TreeEvent::PushLayer, bounds);
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
-        self.paint_operations
-            .push(PaintOperation::StartLayer(bounds, order));
+    pub fn push_layer(&mut self) {
+        self.record(
+            TreeEvent::PushLayer,
+            PrimitiveKind::default(),
+            Bounds::default(),
+        );
+        self.layer_stack.push(self.layers.len());
+        self.layers.push_back(Layer {
+            primitives: SmallVec::new(),
+            bounds: Bounds::default(),
+            max_kind: PrimitiveKind::Shadow,
+            max_shared_kind: PrimitiveKind::Surface,
+            known: None,
+        });
+        self.paint_operations.push(PaintOperation::StartLayer);
     }
 
     pub fn pop_layer(&mut self) {
-        self.record(TreeEvent::PopLayer, Bounds::default());
+        self.record(
+            TreeEvent::PopLayer,
+            PrimitiveKind::default(),
+            Bounds::default(),
+        );
         self.layer_stack.pop();
+        if self.layer_stack.is_empty() {
+            while let Some(layer) = self.layers.pop_front() {
+                self.insert_layer(layer);
+            }
+        }
         self.paint_operations.push(PaintOperation::EndLayer);
+    }
+
+    /// Gives a closed layer its order and its primitives that order, in the scene and in the
+    /// paint operations a later frame may replay with their orders kept.
+    fn insert_layer(&mut self, layer: Layer) {
+        if layer.primitives.is_empty() {
+            return;
+        }
+        let order = match layer.known {
+            Some(order) => {
+                self.primitive_bounds
+                    .insert_known(layer.bounds, order, layer.max_kind);
+                order
+            }
+            None => {
+                self.primitive_bounds
+                    .insert(layer.bounds, layer.max_kind, layer.max_shared_kind)
+            }
+        };
+        for index in layer.primitives.into_iter().flatten() {
+            if let PaintOperation::Primitive(primitive) = &mut self.paint_operations[index] {
+                primitive.set_order(order);
+                let primitive = primitive.clone();
+                self.push_primitive(primitive, order);
+            }
+        }
     }
 
     /// Starts a layer that is drawn offscreen, put through the given filter, and composited back.
@@ -153,6 +212,9 @@ impl Scene {
     /// a quad still covers an image painted before it. Only what is painted later over the area
     /// the layer lands on goes above the range. The rest keeps the order it would have had
     /// without the layer, so a backdrop beside a pressed button blurs what it always did.
+    ///
+    /// No paint layer may be open, since its primitives get their orders only once it closes,
+    /// after this layer. gpui opens paint layers only around a line of text.
     pub fn push_filter(
         &mut self,
         source_bounds: Bounds<ScaledPixels>,
@@ -160,7 +222,11 @@ impl Scene {
         content_mask: Bounds<ScaledPixels>,
         filter: Filter,
     ) {
-        self.record(TreeEvent::Open, Bounds::default());
+        debug_assert!(
+            self.layer_stack.is_empty(),
+            "a filtered layer opened inside a paint layer"
+        );
+        self.record(TreeEvent::Open, PrimitiveKind::default(), Bounds::default());
         let start = self.primitive_bounds.open();
         let mut destination_bounds =
             scale_bounds_around(source_bounds, transform_origin, filter.scale);
@@ -187,7 +253,7 @@ impl Scene {
     pub fn pop_filter(&mut self) {
         if let Some(index) = self.effect_stack.pop() {
             let footprint = self.effects[index].destination_clip();
-            self.record(TreeEvent::Close, footprint);
+            self.record(TreeEvent::Close, PrimitiveKind::default(), footprint);
             self.effects[index].end = self.primitive_bounds.close(footprint);
         }
         self.paint_operations.push(PaintOperation::EndFilter);
@@ -232,9 +298,9 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => {
                     self.insert_primitive(primitive.clone().faded(fade))
                 }
-                PaintOperation::StartLayer(bounds, _) => {
+                PaintOperation::StartLayer => {
                     layers += 1;
-                    self.push_layer(*bounds);
+                    self.push_layer();
                 }
                 PaintOperation::EndLayer if layers > 0 => {
                     layers -= 1;
@@ -310,82 +376,99 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let primitive = primitive.into();
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
-
+        let mut primitive = primitive.into();
+        let clipped_bounds = primitive.clipped_bounds();
         if clipped_bounds.is_empty() {
             return;
         }
 
-        let order = match self.layer_stack.last() {
-            Some(order) => *order,
-            None => self.order(clipped_bounds),
-        };
-        self.push_primitive(primitive, order);
-    }
-
-    /// Inserts a primitive replayed from a scene whose history matched this one's where the
-    /// replay began, with the order it was drawn at there.
-    fn keep_primitive(&mut self, primitive: Primitive) {
-        let order = primitive.order();
-        if self.layer_stack.is_empty() {
-            let clipped_bounds = primitive
-                .bounds()
-                .intersect(&primitive.content_mask().bounds);
-            self.record(TreeEvent::Insert, clipped_bounds);
-            self.primitive_bounds.insert_known(clipped_bounds, order);
-        }
-        self.push_primitive(primitive, order);
-    }
-
-    fn push_primitive(&mut self, mut primitive: Primitive, order: DrawOrder) {
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
-                shadow.order = order;
-                self.shadows.push(*shadow);
-            }
-            Primitive::Backdrop(backdrop) => {
-                backdrop.order = order;
-                self.backdrops.push(*backdrop);
-            }
-            Primitive::Quad(quad) => {
-                quad.order = order;
-                self.quads.push(*quad);
-            }
-            Primitive::Shader(shader) => {
-                shader.order = order;
-                self.shaders.push(*shader);
-            }
-            Primitive::Path(path) => {
-                path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
-            }
-            Primitive::Underline(underline) => {
-                underline.order = order;
-                self.underlines.push(*underline);
-            }
-            Primitive::MonochromeSprite(sprite) => {
-                sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
-            }
-            Primitive::SubpixelSprite(sprite) => {
-                sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
-            }
-            Primitive::PolychromeSprite(sprite) => {
-                sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
-            }
-            Primitive::Surface(surface) => {
-                surface.order = order;
-                self.surfaces.push(surface.clone());
-            }
+        let kind = primitive.kind();
+        self.record(TreeEvent::Insert, kind, clipped_bounds);
+        if !self.add_to_layer(clipped_bounds, kind, None) {
+            let order = self
+                .primitive_bounds
+                .insert(clipped_bounds, kind, kind.max_shared_kind());
+            primitive.set_order(order);
+            self.push_primitive(primitive.clone(), order);
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+    }
+
+    /// Inserts a primitive replayed from a scene whose history matched this one's where the
+    /// replay began, with the order it was drawn at there. With `layers_kept`, a paint layer it
+    /// goes into takes that order too, since the replay opened that layer and closes it.
+    fn keep_primitive(&mut self, primitive: Primitive, layers_kept: bool) {
+        let clipped_bounds = primitive.clipped_bounds();
+        let kind = primitive.kind();
+        let order = primitive.order();
+        self.record(TreeEvent::Insert, kind, clipped_bounds);
+        if !self.add_to_layer(clipped_bounds, kind, layers_kept.then_some(order)) {
+            self.primitive_bounds
+                .insert_known(clipped_bounds, order, kind);
+            self.push_primitive(primitive.clone(), order);
+        }
+        self.paint_operations
+            .push(PaintOperation::Primitive(primitive));
+    }
+
+    /// Adds the primitive that becomes the next paint operation to the innermost open paint
+    /// layer, or returns false when none is open. `known` is the layer's order in an earlier
+    /// frame, when it still holds.
+    fn add_to_layer(
+        &mut self,
+        clipped_bounds: Bounds<ScaledPixels>,
+        kind: PrimitiveKind,
+        known: Option<DrawOrder>,
+    ) -> bool {
+        let Some(layer) = self
+            .layer_stack
+            .last()
+            .and_then(|index| self.layers.get_mut(*index))
+        else {
+            return false;
+        };
+        layer.bounds = layer.bounds.join(&clipped_bounds);
+        layer.max_kind = layer.max_kind.max(kind);
+        layer.max_shared_kind = layer.max_shared_kind.min(kind.max_shared_kind());
+        if known.is_some() {
+            layer.known = known;
+        }
+        let index = self.paint_operations.len();
+        match layer.primitives.last_mut() {
+            Some(range) if range.end == index => range.end += 1,
+            _ => layer.primitives.push(index..index + 1),
+        }
+        true
+    }
+
+    fn push_primitive(&mut self, primitive: Primitive, order: DrawOrder) {
+        match primitive {
+            Primitive::Shadow(shadow) => self.shadows.push(Shadow { order, ..shadow }),
+            Primitive::Backdrop(backdrop) => self.backdrops.push(Backdrop { order, ..backdrop }),
+            Primitive::Quad(quad) => self.quads.push(Quad { order, ..quad }),
+            Primitive::Shader(shader) => self.shaders.push(ShaderQuad { order, ..shader }),
+            Primitive::Path(mut path) => {
+                path.order = order;
+                self.paths.push(path);
+            }
+            Primitive::Underline(underline) => {
+                self.underlines.push(Underline { order, ..underline })
+            }
+            Primitive::MonochromeSprite(sprite) => self
+                .monochrome_sprites
+                .push(MonochromeSprite { order, ..sprite }),
+            Primitive::SubpixelSprite(sprite) => self
+                .subpixel_sprites
+                .push(SubpixelSprite { order, ..sprite }),
+            Primitive::PolychromeSprite(sprite) => self
+                .polychrome_sprites
+                .push(PolychromeSprite { order, ..sprite }),
+            Primitive::Surface(mut surface) => {
+                surface.order = order;
+                self.surfaces.push(surface);
+            }
+        }
     }
 
     /// Paints the operations `range` of `prev_scene` again. When this scene's history matches
@@ -397,6 +480,9 @@ impl Scene {
             .marks
             .partition_point(|(index, _)| *index < range.start);
         let keep = prev_scene.marks.get(first_mark) == Some(&(range.start, self.history));
+        // A paint layer gets its order when the outermost one closes, so a layer keeps its
+        // order only when the replay opens every layer around it.
+        let layers_kept = keep && self.layer_stack.is_empty();
         let mut marks = prev_scene.marks[first_mark..]
             .iter()
             .map(|(index, _)| *index)
@@ -409,19 +495,10 @@ impl Scene {
             }
             match operation {
                 PaintOperation::Primitive(primitive) => match keep {
-                    true => self.keep_primitive(primitive.clone()),
+                    true => self.keep_primitive(primitive.clone(), layers_kept),
                     false => self.insert_primitive(primitive.clone()),
                 },
-                PaintOperation::StartLayer(bounds, order) => match keep {
-                    true => {
-                        self.record(TreeEvent::PushLayer, *bounds);
-                        self.primitive_bounds.insert_known(*bounds, *order);
-                        self.layer_stack.push(*order);
-                        self.paint_operations
-                            .push(PaintOperation::StartLayer(*bounds, *order));
-                    }
-                    false => self.push_layer(*bounds),
-                },
+                PaintOperation::StartLayer => self.push_layer(),
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartFilter(bounds, transform_origin, content_mask, filter) => {
                     self.push_filter(*bounds, *transform_origin, *content_mask, *filter)
@@ -431,21 +508,22 @@ impl Scene {
                 PaintOperation::EndSpan => self.pop_span(),
             }
         }
+        // A layer left open takes more primitives after the range, which can change its order.
+        if layers_kept {
+            for layer in &mut self.layers {
+                layer.known = None;
+            }
+        }
     }
 
-    /// Asks the bounds tree for the order of `bounds` and folds the request into the history.
-    fn order(&mut self, bounds: Bounds<ScaledPixels>) -> DrawOrder {
-        self.record(TreeEvent::Insert, bounds);
-        self.primitive_bounds.insert(bounds)
-    }
-
-    /// Folds one event into the history.
-    fn record(&mut self, event: TreeEvent, bounds: Bounds<ScaledPixels>) {
+    /// Folds one event into the history. An insert names its kind, which the tree keeps with
+    /// the order and which decides whether that order can be shared.
+    fn record(&mut self, event: TreeEvent, kind: PrimitiveKind, bounds: Bounds<ScaledPixels>) {
         let pair = |a: ScaledPixels, b: ScaledPixels| {
             (u64::from(a.0.to_bits()) << 32) | u64::from(b.0.to_bits())
         };
         for word in [
-            event as u64,
+            event as u64 | (kind as u64) << 8,
             pair(bounds.origin.x, bounds.origin.y),
             pair(bounds.size.width, bounds.size.height),
         ] {
@@ -454,6 +532,7 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
+        debug_assert!(self.layer_stack.is_empty(), "unbalanced scene layers");
         self.span_stack.clear();
         // A layer that never closed would otherwise swallow everything painted after it.
         for index in self.effect_stack.drain(..) {
@@ -543,10 +622,27 @@ pub(crate) enum PrimitiveKind {
     Surface,
 }
 
+impl PrimitiveKind {
+    /// We guarantee that overlapping primitives are drawn in paint order.
+    /// But, to improve GPU draw batching, the renderer sorts primitives that
+    /// share a draw order by kind, then by atlas texture, and only then in
+    /// paint order. So, a primitive can only share the draw order of the
+    /// topmost primitive it overlaps if that primitive's kind is at most the
+    /// one returned here. Otherwise, it needs a new draw order. A backdrop shares only
+    /// with shadows and other backdrops, so every quad it overlaps is drawn before it blurs.
+    fn max_shared_kind(self) -> Self {
+        match self {
+            Self::MonochromeSprite => Self::Underline,
+            Self::SubpixelSprite => Self::MonochromeSprite,
+            Self::PolychromeSprite => Self::SubpixelSprite,
+            kind => kind,
+        }
+    }
+}
+
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
-    /// A layer's bounds and the order everything in it is drawn at.
-    StartLayer(Bounds<ScaledPixels>, DrawOrder),
+    StartLayer,
     EndLayer,
     StartFilter(
         Bounds<ScaledPixels>,
@@ -1035,20 +1131,25 @@ mod layer_filter_tests {
         let content_mask = rect(0.0, 0.0, 500.0, 500.0);
         let button = rect(100.0, 60.0, 20.0, 20.0);
         let mut scene = Scene::default();
-        let row = scene.primitive_bounds.insert(rect(0.0, 50.0, 500.0, 40.0));
+        let row = quad_order(&mut scene, rect(0.0, 50.0, 500.0, 40.0));
         scene.push_filter(button, origin(110.0, 70.0), content_mask, filter(0.9));
-        scene.primitive_bounds.insert(button);
+        quad_order(&mut scene, button);
         scene.pop_filter();
         let layer = scene.effects[0];
 
         // A table head painted after the pressed row, above it, keeps the order it has with the
         // button at rest, so its backdrop still blurs before the row is drawn.
-        let head = scene.primitive_bounds.insert(rect(0.0, 10.0, 500.0, 30.0));
+        let head = quad_order(&mut scene, rect(0.0, 10.0, 500.0, 30.0));
         assert!(head <= row, "head at {head}, row at {row}");
         assert!(scene.filtered(head).is_none());
 
-        // What stacks on the head climbs past the layer's orders rather than into them.
-        let label = scene.primitive_bounds.insert(rect(10.0, 15.0, 40.0, 20.0));
+        // What stacks on the head without sharing its order climbs past the layer's orders
+        // rather than into them.
+        let label = scene.primitive_bounds.insert(
+            rect(10.0, 15.0, 40.0, 20.0),
+            PrimitiveKind::Shadow,
+            PrimitiveKind::Shadow,
+        );
         assert!(
             label > layer.end,
             "label at {label}, layer ends at {}",
@@ -1056,12 +1157,19 @@ mod layer_filter_tests {
         );
 
         // What is painted over the button still lands above its layer.
-        let over = scene.primitive_bounds.insert(rect(105.0, 65.0, 5.0, 5.0));
+        let over = quad_order(&mut scene, rect(105.0, 65.0, 5.0, 5.0));
         assert!(
             over > layer.end,
             "over at {over}, layer ends at {}",
             layer.end
         );
+    }
+
+    /// Asks the scene's bounds tree for the order of a quad at `bounds`.
+    fn quad_order(scene: &mut Scene, bounds: Bounds<ScaledPixels>) -> DrawOrder {
+        scene
+            .primitive_bounds
+            .insert(bounds, PrimitiveKind::Quad, PrimitiveKind::Quad)
     }
 
     fn quad(bounds: Bounds<ScaledPixels>) -> Quad {
@@ -1081,10 +1189,24 @@ mod layer_filter_tests {
         }
     }
 
+    fn underline(bounds: Bounds<ScaledPixels>) -> Underline {
+        Underline {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask {
+                bounds: rect(0.0, 0.0, 500.0, 500.0),
+            },
+            color: Hsla::default(),
+            thickness: ScaledPixels(1.0),
+            wavy: false.into(),
+        }
+    }
+
     /// Paints three views the way a window does, marking the scene around each one, and
     /// returns their paint operation ranges. A view is painted live when `prev` is `None`,
     /// and otherwise replayed from the matching range of `prev`. The first view's middle
-    /// quad is drawn at `moved`.
+    /// primitive is an underline drawn at `moved`, so a quad over it takes a new order.
     fn paint_views(
         scene: &mut Scene,
         prev: Option<(&Scene, &[Range<usize>])>,
@@ -1095,11 +1217,11 @@ mod layer_filter_tests {
         let views: [&dyn Fn(&mut Scene); 3] = [
             &|scene| {
                 scene.insert_primitive(quad(rect(0.0, 0.0, 200.0, 100.0)));
-                scene.insert_primitive(quad(moved));
+                scene.insert_primitive(underline(moved));
                 scene.insert_primitive(quad(rect(150.0, 50.0, 100.0, 100.0)));
             },
             &|scene| {
-                scene.push_layer(rect(100.0, 80.0, 120.0, 60.0));
+                scene.push_layer();
                 scene.insert_primitive(quad(rect(100.0, 80.0, 120.0, 60.0)));
                 scene.insert_primitive(quad(rect(110.0, 90.0, 20.0, 20.0)));
                 scene.pop_layer();
@@ -1137,14 +1259,13 @@ mod layer_filter_tests {
         ranges
     }
 
-    /// The order of every primitive and layer, in paint order.
+    /// The order of every primitive, in paint order.
     fn orders(scene: &Scene) -> Vec<DrawOrder> {
         scene
             .paint_operations
             .iter()
             .filter_map(|operation| match operation {
                 PaintOperation::Primitive(primitive) => Some(primitive.order()),
-                PaintOperation::StartLayer(_, order) => Some(*order),
                 _ => None,
             })
             .collect()
@@ -1192,7 +1313,7 @@ mod layer_filter_tests {
         let bounds = rect(40.0, 40.0, 100.0, 100.0);
         let paint = |scene: &mut Scene, prev: Option<(&Scene, Range<usize>)>, layer: bool| {
             match layer {
-                true => scene.push_layer(bounds),
+                true => scene.push_layer(),
                 false => scene.insert_primitive(quad(bounds)),
             }
             scene.mark();
@@ -1241,7 +1362,7 @@ mod layer_filter_tests {
             match prev {
                 Some((prev, range)) => scene.replay(range, prev),
                 None => {
-                    scene.push_layer(rect(40.0, 40.0, 100.0, 100.0));
+                    scene.push_layer();
                     scene.insert_primitive(quad(rect(40.0, 40.0, 50.0, 50.0)));
                     scene.pop_layer();
                     scene.insert_primitive(quad(rect(60.0, 60.0, 100.0, 100.0)));
@@ -1292,18 +1413,22 @@ mod layer_filter_tests {
         let row = scene.quads[0].order;
         let layer = scene.effects[0];
 
-        let head = scene.primitive_bounds.insert(rect(0.0, 10.0, 500.0, 30.0));
+        let head = quad_order(&mut scene, rect(0.0, 10.0, 500.0, 30.0));
         assert!(head <= row, "head at {head}, row at {row}");
         assert!(scene.filtered(head).is_none());
 
-        let label = scene.primitive_bounds.insert(rect(10.0, 15.0, 40.0, 20.0));
+        let label = scene.primitive_bounds.insert(
+            rect(10.0, 15.0, 40.0, 20.0),
+            PrimitiveKind::Shadow,
+            PrimitiveKind::Shadow,
+        );
         assert!(
             label > layer.end,
             "label at {label}, layer ends at {}",
             layer.end
         );
 
-        let over = scene.primitive_bounds.insert(rect(105.0, 65.0, 5.0, 5.0));
+        let over = quad_order(&mut scene, rect(105.0, 65.0, 5.0, 5.0));
         assert!(
             over > layer.end,
             "over at {over}, layer ends at {}",
@@ -1346,6 +1471,100 @@ mod layer_filter_tests {
             .collect();
         assert_eq!(batches, vec![vec![1.0, 1.0], vec![8.0]]);
     }
+
+    #[test]
+    fn an_order_shared_inside_a_filter_stays_inside_its_range() {
+        let content_mask = rect(0.0, 0.0, 500.0, 500.0);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0.0, 0.0, 300.0, 300.0)));
+        scene.push_filter(
+            rect(20.0, 20.0, 200.0, 200.0),
+            origin(120.0, 120.0),
+            content_mask,
+            Filter {
+                blur: 4.0,
+                ..Default::default()
+            },
+        );
+        // Outside a filter this quad would share the order of the one under it.
+        scene.insert_primitive(quad(rect(40.0, 40.0, 50.0, 50.0)));
+        scene.pop_filter();
+        // Nothing shares the order the layer ends at, so a quad over it goes above the layer.
+        scene.insert_primitive(quad(rect(60.0, 60.0, 10.0, 10.0)));
+
+        let layer = scene.effects[0];
+        let [under, inside, over] = [0, 1, 2].map(|index| scene.quads[index].order);
+        assert_eq!(scene.filtered(under), None);
+        assert!(
+            inside > layer.start,
+            "inside at {inside}, layer at {layer:?}"
+        );
+        assert_eq!(scene.filtered(inside), Some(0));
+        assert!(
+            over > layer.end,
+            "over at {over}, layer ends at {}",
+            layer.end
+        );
+    }
+
+    #[test]
+    fn backdrops_and_shaders_take_their_place_among_the_kinds() {
+        let content_mask = ContentMask {
+            bounds: rect(0.0, 0.0, 500.0, 500.0),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0.0, 0.0, 200.0, 200.0)));
+        // A backdrop blurs the quad under it, so it takes a new order.
+        scene.insert_primitive(Backdrop {
+            blur: 4.0,
+            opacity: 1.0,
+            bounds: rect(50.0, 50.0, 100.0, 100.0),
+            content_mask,
+            ..Default::default()
+        });
+        // A tint over the backdrop and a shader over the tint share its order and draw after it.
+        scene.insert_primitive(quad(rect(50.0, 50.0, 100.0, 100.0)));
+        scene.insert_primitive(ShaderQuad {
+            order: 0,
+            shader: ShaderId(7),
+            opacity: 1.0,
+            time: 0.0,
+            bounds: rect(60.0, 60.0, 20.0, 20.0),
+            content_mask,
+            corner_radii: Corners::default(),
+            scale_factor: 1.0,
+            pad: [0; 3],
+            params: [0.0; crate::SHADER_PARAM_COUNT],
+            colors: [[0.0; 4]; crate::SHADER_COLOR_COUNT],
+        });
+        scene.finish();
+
+        let labels: Vec<_> = scene.batches().map(|batch| batch.label()).collect();
+        assert_eq!(
+            labels,
+            ["quads (1)", "backdrops (1)", "quads (1)", "shader 7 (1)"]
+        );
+        assert!(scene.quads[0].order < scene.backdrops[0].order);
+        assert_eq!(scene.quads[1].order, scene.backdrops[0].order);
+        assert_eq!(scene.shaders[0].order, scene.backdrops[0].order);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a filtered layer opened inside a paint layer")]
+    fn a_filter_cannot_open_inside_a_paint_layer() {
+        let mut scene = Scene::default();
+        scene.push_layer();
+        scene.push_filter(
+            rect(0.0, 0.0, 100.0, 100.0),
+            origin(50.0, 50.0),
+            rect(0.0, 0.0, 500.0, 500.0),
+            Filter {
+                blur: 4.0,
+                ..Default::default()
+            },
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -1355,7 +1574,7 @@ pub enum Primitive {
     Backdrop(Backdrop),
     Quad(Quad),
     Shader(ShaderQuad),
-    Path(Path<ScaledPixels>),
+    Path(PaintedPath),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
@@ -1365,6 +1584,21 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    pub(crate) fn kind(&self) -> PrimitiveKind {
+        match self {
+            Primitive::Shadow(_) => PrimitiveKind::Shadow,
+            Primitive::Backdrop(_) => PrimitiveKind::Backdrop,
+            Primitive::Quad(_) => PrimitiveKind::Quad,
+            Primitive::Shader(_) => PrimitiveKind::Shader,
+            Primitive::Path(_) => PrimitiveKind::Path,
+            Primitive::Underline(_) => PrimitiveKind::Underline,
+            Primitive::MonochromeSprite(_) => PrimitiveKind::MonochromeSprite,
+            Primitive::SubpixelSprite(_) => PrimitiveKind::SubpixelSprite,
+            Primitive::PolychromeSprite(_) => PrimitiveKind::PolychromeSprite,
+            Primitive::Surface(_) => PrimitiveKind::Surface,
+        }
+    }
+
     /// The primitive with the alpha of its colours scaled by `fade`. A surface has no colour
     /// of its own and comes back as it was.
     pub fn faded(mut self, fade: f32) -> Self {
@@ -1377,7 +1611,7 @@ impl Primitive {
                 quad.border_color = quad.border_color.opacity(fade);
             }
             Primitive::Shader(shader) => shader.opacity *= fade,
-            Primitive::Path(path) => path.color = path.color.opacity(fade),
+            Primitive::Path(path) => path.paint.color = path.paint.color.opacity(fade),
             Primitive::Underline(underline) => underline.color = underline.color.opacity(fade),
             Primitive::MonochromeSprite(sprite) => sprite.color = sprite.color.opacity(fade),
             Primitive::SubpixelSprite(sprite) => sprite.color = sprite.color.opacity(fade),
@@ -1402,13 +1636,27 @@ impl Primitive {
         }
     }
 
+    fn transformation(&self) -> TransformationMatrix {
+        match self {
+            Primitive::MonochromeSprite(sprite) => sprite.transformation,
+            Primitive::SubpixelSprite(sprite) => sprite.transformation,
+            _ => TransformationMatrix::unit(),
+        }
+    }
+
+    fn clipped_bounds(&self) -> Bounds<ScaledPixels> {
+        self.transformation()
+            .transform_bounds(*self.bounds())
+            .intersect(&self.content_mask().bounds)
+    }
+
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Backdrop(backdrop) => &backdrop.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Shader(shader) => &shader.content_mask,
-            Primitive::Path(path) => &path.content_mask,
+            Primitive::Path(path) => &path.paint.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
@@ -1432,6 +1680,22 @@ impl Primitive {
             Primitive::Surface(surface) => surface.order,
         }
     }
+
+    /// Stores the order the scene draws the primitive at.
+    fn set_order(&mut self, order: DrawOrder) {
+        match self {
+            Primitive::Shadow(shadow) => shadow.order = order,
+            Primitive::Backdrop(backdrop) => backdrop.order = order,
+            Primitive::Quad(quad) => quad.order = order,
+            Primitive::Shader(shader) => shader.order = order,
+            Primitive::Path(path) => path.order = order,
+            Primitive::Underline(underline) => underline.order = order,
+            Primitive::MonochromeSprite(sprite) => sprite.order = order,
+            Primitive::SubpixelSprite(sprite) => sprite.order = order,
+            Primitive::PolychromeSprite(sprite) => sprite.order = order,
+            Primitive::Surface(surface) => surface.order = order,
+        }
+    }
 }
 
 #[cfg_attr(
@@ -1453,7 +1717,7 @@ struct BatchIterator<'a> {
     shaders_start: usize,
     shaders_iter: Peekable<slice::Iter<'a, ShaderQuad>>,
     paths_start: usize,
-    paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
+    paths_iter: Peekable<slice::Iter<'a, PaintedPath>>,
     underlines_start: usize,
     underlines_iter: Peekable<slice::Iter<'a, Underline>>,
     monochrome_sprites_start: usize,
@@ -1484,7 +1748,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.shaders_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shader,
             ),
-            (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
+            (
+                self.paths_iter.peek().map(|path| path.order),
+                PrimitiveKind::Path,
+            ),
             (
                 self.underlines_iter.peek().map(|u| u.order),
                 PrimitiveKind::Underline,
@@ -1800,7 +2067,7 @@ impl From<Backdrop> for Primitive {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Quad {
@@ -1887,12 +2154,15 @@ pub struct Shadow {
     pub corner_radii: Corners<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
-    pub element_bounds: Bounds<ScaledPixels>,
-    pub element_corner_radii: Corners<ScaledPixels>,
-    /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
-    pub inset: u32,
+    pub shape_bounds: Bounds<ScaledPixels>,
+    pub shape_corner_radii: Corners<ScaledPixels>,
+    pub inset: PaddedBool32,
     /// The corner smoothing of the element's own outline, which clips the shadow.
     pub element_corner_smoothing: f32,
+    /// The element that clips the shadow: a drop shadow is drawn only outside it, an inset one
+    /// only inside it.
+    pub element_bounds: Bounds<ScaledPixels>,
+    pub element_corner_radii: Corners<ScaledPixels>,
 }
 
 impl From<Shadow> for Primitive {
@@ -1996,6 +2266,31 @@ impl TransformationMatrix {
         }
     }
 
+    /// The smallest bounds that contain `bounds` once it is transformed.
+    pub(crate) fn transform_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        if *self == Self::unit() {
+            return bounds;
+        }
+        let [[xx, xy], [yx, yy]] = self.rotation_scale;
+        let [translate_x, translate_y] = self.translation;
+        let corners = [
+            bounds.origin,
+            bounds.top_right(),
+            bounds.bottom_left(),
+            bounds.bottom_right(),
+        ]
+        .map(|corner| {
+            Point::new(
+                ScaledPixels(xx * corner.x.0 + xy * corner.y.0 + translate_x),
+                ScaledPixels(yx * corner.x.0 + yy * corner.y.0 + translate_y),
+            )
+        });
+        let [first, rest @ ..] = corners;
+        let top_left = rest.iter().fold(first, |min, corner| min.min(corner));
+        let bottom_right = rest.iter().fold(first, |max, corner| max.max(corner));
+        Bounds::from_corners(top_left, bottom_right)
+    }
+
     /// Apply transformation to a point, mainly useful for debugging
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
         let input = [point.x.0, point.y.0];
@@ -2089,171 +2384,215 @@ impl From<PaintSurface> for Primitive {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
 #[expect(missing_docs)]
-pub struct PathId(pub usize);
+pub struct PathCurve {
+    pub p0: Point<f32>,
+    pub p1: Point<f32>,
+    pub a: Point<f32>,
+    pub b: Point<f32>,
+    pub sign: f32,
+    pub pad: u32, // align to 8 bytes
+}
 
-/// A line made up of a series of vertices and control points.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct PathPaint {
+    /// The path's bounds, in device pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub color: Background,
+    pub even_odd: PaddedBool32,
+    pub pad: u32, // align to 8 bytes
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct PathTile {
+    pub paint: u32,
+    pub curve_start: u32,
+    pub curve_count: u32,
+    pub backdrop: i32,
+    pub top_left: Point<f32>,
+    pub bottom_right: Point<f32>,
+    pub reference: Point<f32>,
+    pub curves_top_left: Point<f32>,
+    pub curves_bottom_right: Point<f32>,
+}
+
 #[derive(Clone, Debug)]
 #[expect(missing_docs)]
-pub struct Path<P: Clone + Debug + Default + PartialEq> {
-    pub id: PathId,
-    pub order: DrawOrder,
-    pub bounds: Bounds<P>,
-    pub content_mask: ContentMask<P>,
-    pub vertices: Vec<PathVertex<P>>,
-    pub color: Background,
-    start: Point<P>,
-    current: Point<P>,
-    contour_count: usize,
+pub struct PaintedPath {
+    order: DrawOrder,
+    bounds: Bounds<ScaledPixels>,
+    tiles: Rc<PathTiles>,
+    paint: PathPaint,
 }
 
-impl Path<Pixels> {
-    /// Create a new path with the given starting point.
-    pub fn new(start: Point<Pixels>) -> Self {
+#[expect(missing_docs)]
+impl PaintedPath {
+    /// Bins `path` into tiles, to be filled with `color` within `content_mask`.
+    pub fn new(
+        path: Path,
+        scale_factor: f32,
+        content_mask: ContentMask<Pixels>,
+        color: Background,
+    ) -> Self {
+        let content_mask = content_mask.scale(scale_factor);
+        let mut tiles = path.bin(scale_factor);
+        tiles.retain_visible(content_mask.bounds);
+        let paint = PathPaint {
+            bounds: tiles.bounds(),
+            content_mask,
+            color,
+            even_odd: path.even_odd().into(),
+            pad: 0,
+        };
         Self {
-            id: PathId(0),
-            order: DrawOrder::default(),
-            vertices: Vec::new(),
-            start,
-            current: start,
-            bounds: Bounds {
-                origin: start,
-                size: Default::default(),
-            },
-            content_mask: Default::default(),
-            color: Default::default(),
-            contour_count: 0,
+            order: 0,
+            bounds: tiles.painted_bounds(),
+            tiles: Rc::new(tiles),
+            paint,
         }
     }
 
-    /// Scale this path by the given factor.
-    pub fn scale(&self, factor: f32) -> Path<ScaledPixels> {
-        Path {
-            id: self.id,
-            order: self.order,
-            bounds: self.bounds.scale(factor),
-            content_mask: self.content_mask.scale(factor),
-            vertices: self
-                .vertices
-                .iter()
-                .map(|vertex| vertex.scale(factor))
-                .collect(),
-            start: self.start.map(|start| start.scale(factor)),
-            current: self.current.scale(factor),
-            contour_count: self.contour_count,
-            color: self.color,
-        }
+    pub fn tile_count(&self) -> usize {
+        self.tiles.tiles().len()
     }
 
-    /// Move the start, current point to the given point.
-    pub fn move_to(&mut self, to: Point<Pixels>) {
-        self.contour_count += 1;
-        self.start = to;
-        self.current = to;
-    }
-
-    /// Draw a straight line from the current point to the given point.
-    pub fn line_to(&mut self, to: Point<Pixels>) {
-        self.contour_count += 1;
-        if self.contour_count > 1 {
-            self.push_triangle(
-                (self.start, self.current, to),
-                (point(0., 1.), point(0., 1.), point(0., 1.)),
-            );
-        }
-        self.current = to;
-    }
-
-    /// Draw a curve from the current point to the given point, using the given control point.
-    pub fn curve_to(&mut self, to: Point<Pixels>, ctrl: Point<Pixels>) {
-        self.contour_count += 1;
-        if self.contour_count > 1 {
-            self.push_triangle(
-                (self.start, self.current, to),
-                (point(0., 1.), point(0., 1.), point(0., 1.)),
-            );
-        }
-
-        self.push_triangle(
-            (self.current, ctrl, to),
-            (point(0., 0.), point(0.5, 0.), point(1., 1.)),
-        );
-        self.current = to;
-    }
-
-    /// Push a triangle to the Path.
-    pub fn push_triangle(
-        &mut self,
-        xy: (Point<Pixels>, Point<Pixels>, Point<Pixels>),
-        st: (Point<f32>, Point<f32>, Point<f32>),
+    pub fn append_to(
+        &self,
+        paints: &mut Vec<PathPaint>,
+        curves: &mut Vec<PathCurve>,
+        tiles: &mut Vec<PathTile>,
     ) {
-        self.bounds = self
-            .bounds
-            .union(&Bounds {
-                origin: xy.0,
-                size: Default::default(),
-            })
-            .union(&Bounds {
-                origin: xy.1,
-                size: Default::default(),
-            })
-            .union(&Bounds {
-                origin: xy.2,
-                size: Default::default(),
-            });
-
-        self.vertices.push(PathVertex {
-            xy_position: xy.0,
-            st_position: st.0,
-            content_mask: Default::default(),
-        });
-        self.vertices.push(PathVertex {
-            xy_position: xy.1,
-            st_position: st.1,
-            content_mask: Default::default(),
-        });
-        self.vertices.push(PathVertex {
-            xy_position: xy.2,
-            st_position: st.2,
-            content_mask: Default::default(),
-        });
+        let paint_index = paints.len() as u32;
+        let curve_start = curves.len() as u32;
+        paints.push(self.paint);
+        curves.extend_from_slice(self.tiles.curves());
+        tiles.extend(self.tiles.tiles().iter().map(|tile| PathTile {
+            paint: paint_index,
+            curve_start: curve_start + tile.curve_start,
+            ..*tile
+        }));
     }
 }
 
-impl<T> Path<T>
-where
-    T: Clone + Debug + Default + PartialEq + PartialOrd + Add<T, Output = T> + Sub<Output = T>,
-{
-    #[allow(unused)]
-    #[expect(missing_docs)]
-    pub fn clipped_bounds(&self) -> Bounds<T> {
-        self.bounds.intersect(&self.content_mask.bounds)
-    }
-}
-
-impl From<Path<ScaledPixels>> for Primitive {
-    fn from(path: Path<ScaledPixels>) -> Self {
+impl From<PaintedPath> for Primitive {
+    fn from(path: PaintedPath) -> Self {
         Primitive::Path(path)
     }
 }
 
-#[derive(Clone, Debug)]
-#[repr(C)]
-#[expect(missing_docs)]
-pub struct PathVertex<P: Clone + Debug + Default + PartialEq> {
-    pub xy_position: Point<P>,
-    pub st_position: Point<f32>,
-    pub content_mask: ContentMask<P>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{point, size};
 
-#[expect(missing_docs)]
-impl PathVertex<Pixels> {
-    pub fn scale(&self, factor: f32) -> PathVertex<ScaledPixels> {
-        PathVertex {
-            xy_position: self.xy_position.scale(factor),
-            st_position: self.st_position,
-            content_mask: self.content_mask.scale(factor),
+    fn square(x: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: size(ScaledPixels(10.), ScaledPixels(10.)),
         }
+    }
+
+    fn quad(x: f32) -> Quad {
+        Quad {
+            bounds: square(x),
+            content_mask: ContentMask { bounds: square(x) },
+            ..Default::default()
+        }
+    }
+
+    fn underline(x: f32) -> Underline {
+        Underline {
+            order: 0,
+            pad: 0,
+            bounds: square(x),
+            content_mask: ContentMask { bounds: square(x) },
+            color: Hsla::default(),
+            thickness: ScaledPixels(1.),
+            wavy: false.into(),
+        }
+    }
+
+    fn batch_labels(scene: &mut Scene) -> Vec<String> {
+        scene.finish();
+        scene.batches().map(|batch| batch.label()).collect()
+    }
+
+    #[test]
+    fn layers_are_drawn_in_paint_order() {
+        // A quad painted after a layer goes above it.
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0.));
+        scene.push_layer();
+        scene.insert_primitive(underline(0.));
+        scene.insert_primitive(underline(5.));
+        scene.pop_layer();
+        scene.insert_primitive(quad(5.));
+        assert_eq!(
+            batch_labels(&mut scene),
+            ["quads (1)", "underlines (2)", "quads (1)"]
+        );
+
+        // A layer goes above the layer painted before it.
+        let mut scene = Scene::default();
+        scene.push_layer();
+        scene.insert_primitive(underline(0.));
+        scene.pop_layer();
+        scene.push_layer();
+        scene.insert_primitive(quad(5.));
+        scene.pop_layer();
+        assert_eq!(batch_labels(&mut scene), ["underlines (1)", "quads (1)"]);
+    }
+
+    #[test]
+    fn nested_layers_are_drawn_above_their_parents() {
+        // A layer has one draw order, so what it paints after a nested layer
+        // still goes below that layer.
+        let mut scene = Scene::default();
+        scene.push_layer();
+        scene.insert_primitive(underline(0.));
+        scene.push_layer();
+        scene.insert_primitive(quad(5.));
+        scene.pop_layer();
+        scene.insert_primitive(underline(5.));
+        scene.pop_layer();
+        assert_eq!(batch_labels(&mut scene), ["underlines (2)", "quads (1)"]);
+
+        // The same holds when the nested layer shares its parent's order.
+        let mut scene = Scene::default();
+        scene.push_layer();
+        scene.insert_primitive(quad(0.));
+        scene.push_layer();
+        scene.insert_primitive(quad(5.));
+        scene.pop_layer();
+        scene.insert_primitive(quad(8.));
+        scene.pop_layer();
+        assert_eq!(batch_labels(&mut scene), ["quads (3)"]);
+        assert_eq!(
+            scene
+                .quads
+                .iter()
+                .map(|quad| quad.bounds)
+                .collect::<Vec<_>>(),
+            [square(0.), square(8.), square(5.)]
+        );
+
+        // A layer goes above the layers nested in the layer before it.
+        let mut scene = Scene::default();
+        scene.push_layer();
+        scene.push_layer();
+        scene.insert_primitive(underline(0.));
+        scene.pop_layer();
+        scene.pop_layer();
+        scene.push_layer();
+        scene.insert_primitive(quad(5.));
+        scene.pop_layer();
+        assert_eq!(batch_labels(&mut scene), ["underlines (1)", "quads (1)"]);
     }
 }

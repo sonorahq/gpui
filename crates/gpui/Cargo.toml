@@ -119,10 +119,11 @@ unicode-segmentation.workspace = true
 gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
-lyon = "1.0"
+lyon_path = "1.0.19"
 naga = { workspace = true, features = ["wgsl-in"] }
 pin-project = "1.1.10"
 spin.workspace = true
+tiny-skia-path = "0.11"
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 web-time = { workspace = true, optional = true }
@@ -184,7 +185,7 @@ postage = { workspace = true, features = ["blocking"] }
 web-time.workspace = true
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 gpui_util.workspace = true
-lyon = { version = "1.0", features = ["extra"] }
+lyon_extra = "1.1.0"
 naga = { workspace = true, features = ["wgsl-in", "msl-out", "hlsl-out"] }
 rand = { workspace = true, default-features = true }
 scheduler = { workspace = true, features = ["test-support"] }
