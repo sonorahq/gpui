@@ -78,13 +78,29 @@ impl PaddedBool32 {
 /// A paint layer, whose primitives get one order between them once the outermost open layer
 /// closes.
 struct Layer {
+    /// The paint operation that opened the layer, which keeps the layer's key once it closes.
+    start: usize,
     primitives: SmallVec<[Range<usize>; 1]>,
     bounds: Bounds<ScaledPixels>,
     max_kind: PrimitiveKind,
     max_shared_kind: PrimitiveKind,
-    /// The order an earlier frame gave this layer, when a replay that keeps its orders pushed
-    /// it and also closes the layers around it.
+    /// The order an earlier frame gave this layer, when a replay that keeps its orders opened it
+    /// along with every layer around it. Its bounds and kinds are then that frame's too, so its
+    /// primitives go in without adding to them.
     known: Option<DrawOrder>,
+    /// Whether its primitives go straight into the scene at the known order. Only an outermost
+    /// layer can, since a nested layer's primitives follow all of its parent's.
+    direct: bool,
+}
+
+/// How a closed paint layer went into the bounds tree, kept with the paint operation that opened
+/// it so that a replay can open it again settled.
+#[derive(Clone, Copy)]
+pub(crate) struct LayerKey {
+    bounds: Bounds<ScaledPixels>,
+    order: DrawOrder,
+    max_kind: PrimitiveKind,
+    max_shared_kind: PrimitiveKind,
 }
 
 #[derive(Default)]
@@ -161,16 +177,37 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self) {
+        self.open_layer(None);
+    }
+
+    /// Opens a paint layer, settled on `key` when a replay that keeps its orders knows how the
+    /// layer went into the tree in an earlier frame.
+    fn open_layer(&mut self, key: Option<LayerKey>) {
         self.record(TreeEvent::PushLayer, Bounds::default());
+        let direct = key.is_some() && self.layer_stack.is_empty();
         self.layer_stack.push(self.layers.len());
-        self.layers.push_back(Layer {
-            primitives: SmallVec::new(),
-            bounds: Bounds::default(),
-            max_kind: PrimitiveKind::Shadow,
-            max_shared_kind: PrimitiveKind::Surface,
-            known: None,
+        let start = self.paint_operations.len();
+        self.layers.push_back(match key {
+            Some(key) => Layer {
+                start,
+                primitives: SmallVec::new(),
+                bounds: key.bounds,
+                max_kind: key.max_kind,
+                max_shared_kind: key.max_shared_kind,
+                known: Some(key.order),
+                direct,
+            },
+            None => Layer {
+                start,
+                primitives: SmallVec::new(),
+                bounds: Bounds::default(),
+                max_kind: PrimitiveKind::Shadow,
+                max_shared_kind: PrimitiveKind::Surface,
+                known: None,
+                direct,
+            },
         });
-        self.paint_operations.push(PaintOperation::StartLayer);
+        self.paint_operations.push(PaintOperation::StartLayer(None));
     }
 
     pub fn pop_layer(&mut self) {
@@ -205,6 +242,15 @@ impl Scene {
                     .insert(layer.bounds, layer.max_kind, layer.max_shared_kind)
             }
         };
+        self.paint_operations[layer.start] = PaintOperation::StartLayer(Some(LayerKey {
+            bounds: layer.bounds,
+            order,
+            max_kind: layer.max_kind,
+            max_shared_kind: layer.max_shared_kind,
+        }));
+        if layer.direct {
+            return;
+        }
         for index in layer.primitives.into_iter().flatten() {
             if let PaintOperation::Primitive(primitive) = &mut self.paint_operations[index] {
                 primitive.set_order(order);
@@ -307,7 +353,7 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => {
                     self.insert_primitive(primitive.clone().faded(fade))
                 }
-                PaintOperation::StartLayer => {
+                PaintOperation::StartLayer(_) => {
                     layers += 1;
                     self.push_layer();
                 }
@@ -392,7 +438,7 @@ impl Scene {
         }
 
         let kind = primitive.kind();
-        if !self.add_to_layer(clipped_bounds, kind, None) {
+        if !self.add_to_layer(clipped_bounds, kind) {
             self.record(
                 TreeEvent::Insert(kind, kind.max_shared_kind()),
                 clipped_bounds,
@@ -408,13 +454,28 @@ impl Scene {
     }
 
     /// Inserts a primitive replayed from a scene whose history matched this one's where the
-    /// replay began, with the order it was drawn at there. With `layers_kept`, a paint layer it
-    /// goes into takes that order too, since the replay opened that layer and closes it.
-    fn keep_primitive(&mut self, primitive: Primitive, layers_kept: bool) {
+    /// replay began, with the order it was drawn at there.
+    fn keep_primitive(&mut self, primitive: Primitive) {
+        let index = self.paint_operations.len();
+        if let Some(layer) = self
+            .layer_stack
+            .last()
+            .and_then(|index| self.layers.get_mut(*index))
+            && let Some(order) = layer.known
+        {
+            let direct = layer.direct;
+            Self::extend_layer(layer, index);
+            if direct {
+                self.push_primitive(primitive.clone(), order);
+            }
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+            return;
+        }
         let clipped_bounds = primitive.clipped_bounds();
         let kind = primitive.kind();
         let order = primitive.order();
-        if !self.add_to_layer(clipped_bounds, kind, layers_kept.then_some(order)) {
+        if !self.add_to_layer(clipped_bounds, kind) {
             self.record(
                 TreeEvent::Insert(kind, kind.max_shared_kind()),
                 clipped_bounds,
@@ -428,14 +489,9 @@ impl Scene {
     }
 
     /// Adds the primitive that becomes the next paint operation to the innermost open paint
-    /// layer, or returns false when none is open. `known` is the layer's order in an earlier
-    /// frame, when it still holds.
-    fn add_to_layer(
-        &mut self,
-        clipped_bounds: Bounds<ScaledPixels>,
-        kind: PrimitiveKind,
-        known: Option<DrawOrder>,
-    ) -> bool {
+    /// layer, or returns false when none is open.
+    fn add_to_layer(&mut self, clipped_bounds: Bounds<ScaledPixels>, kind: PrimitiveKind) -> bool {
+        let index = self.paint_operations.len();
         let Some(layer) = self
             .layer_stack
             .last()
@@ -446,15 +502,16 @@ impl Scene {
         layer.bounds = layer.bounds.join(&clipped_bounds);
         layer.max_kind = layer.max_kind.max(kind);
         layer.max_shared_kind = layer.max_shared_kind.min(kind.max_shared_kind());
-        if known.is_some() {
-            layer.known = known;
-        }
-        let index = self.paint_operations.len();
+        Self::extend_layer(layer, index);
+        true
+    }
+
+    /// Counts the paint operation at `index` among the layer's primitives.
+    fn extend_layer(layer: &mut Layer, index: usize) {
         match layer.primitives.last_mut() {
             Some(range) if range.end == index => range.end += 1,
             _ => layer.primitives.push(index..index + 1),
         }
-        true
     }
 
     fn push_primitive(&mut self, primitive: Primitive, order: DrawOrder) {
@@ -496,8 +553,10 @@ impl Scene {
             .partition_point(|(index, _)| *index < range.start);
         let keep = prev_scene.marks.get(first_mark) == Some(&(range.start, self.history));
         // A paint layer gets its order when the outermost one closes, so a layer keeps its
-        // order only when the replay opens every layer around it.
-        let layers_kept = keep && self.layer_stack.is_empty();
+        // order only when the replay opens every layer around it and closes it again.
+        let layers_kept = keep
+            && self.layer_stack.is_empty()
+            && closes_its_layers(&prev_scene.paint_operations[range.clone()]);
         let mut marks = prev_scene.marks[first_mark..]
             .iter()
             .map(|(index, _)| *index)
@@ -510,10 +569,13 @@ impl Scene {
             }
             match operation {
                 PaintOperation::Primitive(primitive) => match keep {
-                    true => self.keep_primitive(primitive.clone(), layers_kept),
+                    true => self.keep_primitive(primitive.clone()),
                     false => self.insert_primitive(primitive.clone()),
                 },
-                PaintOperation::StartLayer => self.push_layer(),
+                PaintOperation::StartLayer(key) => match layers_kept {
+                    true => self.open_layer(*key),
+                    false => self.push_layer(),
+                },
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartFilter(bounds, transform_origin, content_mask, filter) => {
                     self.push_filter(*bounds, *transform_origin, *content_mask, *filter)
@@ -521,12 +583,6 @@ impl Scene {
                 PaintOperation::EndFilter => self.pop_filter(),
                 PaintOperation::StartSpan(id, bounds) => self.push_span(*id, *bounds),
                 PaintOperation::EndSpan => self.pop_span(),
-            }
-        }
-        // A layer left open takes more primitives after the range, which can change its order.
-        if layers_kept {
-            for layer in &mut self.layers {
-                layer.known = None;
             }
         }
     }
@@ -656,7 +712,8 @@ impl PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
-    StartLayer,
+    /// A paint layer opens, with how it went into the tree once it closed.
+    StartLayer(Option<LayerKey>),
     EndLayer,
     StartFilter(
         Bounds<ScaledPixels>,
@@ -954,6 +1011,22 @@ pub(crate) fn scale_bounds_around(
             scaled_y(bounds.bottom_right().y),
         ),
     )
+}
+
+/// Whether `operations` close every paint layer they open and no other.
+fn closes_its_layers(operations: &[PaintOperation]) -> bool {
+    let mut depth = 0usize;
+    for operation in operations {
+        match operation {
+            PaintOperation::StartLayer(_) => depth += 1,
+            PaintOperation::EndLayer => match depth.checked_sub(1) {
+                Some(outer) => depth = outer,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 #[cfg(test)]
@@ -1354,6 +1427,44 @@ mod layer_filter_tests {
 
         assert_eq!(orders(&replayed), orders(&fresh));
         assert_eq!(replayed.primitive_bounds.known_inserts, 0);
+    }
+
+    #[test]
+    fn a_kept_replay_of_nested_layers_draws_them_as_painted() {
+        let view = |scene: &mut Scene| {
+            scene.push_layer();
+            scene.insert_primitive(quad(rect(0.0, 0.0, 10.0, 10.0)));
+            scene.push_layer();
+            scene.insert_primitive(quad(rect(5.0, 0.0, 10.0, 10.0)));
+            scene.pop_layer();
+            scene.insert_primitive(quad(rect(8.0, 0.0, 10.0, 10.0)));
+            scene.pop_layer();
+        };
+        let mut painted = Scene::default();
+        painted.mark();
+        view(&mut painted);
+        let range = 0..painted.len();
+        painted.mark();
+
+        let mut replayed = Scene::default();
+        replayed.mark();
+        replayed.replay(range, &painted);
+        replayed.mark();
+
+        // The nested layer shares its parent's order, so the quads draw in the order they went
+        // into the scene, the parent's before the nested layer's.
+        let quads = |scene: &Scene| {
+            scene
+                .quads
+                .iter()
+                .map(|quad| (quad.bounds, quad.order))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(quads(&replayed), quads(&painted));
+        assert_eq!(painted.quads[2].bounds, rect(5.0, 0.0, 10.0, 10.0));
+        assert_eq!(replayed.history, painted.history);
+        assert_eq!(replayed.primitive_bounds.searches, 0);
+        assert_eq!(replayed.primitive_bounds.known_inserts, 2);
     }
 
     #[test]
