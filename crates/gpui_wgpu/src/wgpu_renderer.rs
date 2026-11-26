@@ -3,9 +3,9 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, BLUR_LEVELS, BlurPasses, Bounds, DevicePixels, GAUSSIAN_REACH, GpuSpecs,
-    LayerEffect, PaintedPath, PrimitiveBatch, Pyramid, ScaledPixels, Scene, ShaderId, Size,
-    get_gamma_correction_ratios, point, size,
+    AtlasTextureId, BLUR_LEVELS, BlurPasses, Bounds, DEPTH_PREPASS, DevicePixels, GAUSSIAN_REACH,
+    GpuSpecs, LayerEffect, PaintedPath, PrimitiveBatch, Pyramid, ScaledPixels, Scene, ShaderId,
+    Size, get_gamma_correction_ratios, point, quad_depth, quad_depth_scale, size,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -77,6 +77,17 @@ struct GlobalParams {
     viewport_size: [f32; 2],
     path_paint_base: u32,
     path_curve_base: u32,
+    depth_scale: f32,
+    quad_count: u32,
+    premultiplied_alpha: u32,
+    pad: u32,
+}
+
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+struct DepthTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
 }
 
 /// The globals a custom shader's prelude reads, as its `GpuiShaderGlobals` declares them. They
@@ -147,6 +158,7 @@ struct WgpuPipelines {
     /// Composites a layer blurred across only, running the gaussian down on the way.
     blurred: wgpu::RenderPipeline,
     quads: wgpu::RenderPipeline,
+    opaque_quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_tiles: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
@@ -163,6 +175,7 @@ struct WgpuPipelines {
     /// A pipeline per custom shader, created the first time a frame draws it. A shader that
     /// failed to compile is kept as `None`, so it is not compiled again every frame.
     custom: FxHashMap<ShaderId, Option<wgpu::RenderPipeline>>,
+    premultiplied_alpha: bool,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -424,9 +437,6 @@ struct WgpuRendererCore {
     atlas: Arc<WgpuAtlas>,
     shader_globals_offset: u64,
     gamma_offset: u64,
-    /// Whether the pipelines were built for a premultiplied surface, which custom shaders read
-    /// from their globals.
-    premultiplied_alpha: bool,
     instance_data_capacity: u64,
     max_instance_data_size: u64,
     instance_data_alignment: u64,
@@ -442,7 +452,9 @@ struct WgpuRendererCore {
     rendering_params: RenderingParameters,
     is_bgr: bool,
     dual_source_blending: bool,
+    transient_attachments: bool,
     adapter_info: wgpu::AdapterInfo,
+    depth_texture: Option<DepthTexture>,
     /// The format of the frame, which the offscreen filter targets share.
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
@@ -1011,10 +1023,6 @@ impl WgpuRendererCore {
         } else {
             wgpu::BlendState::ALPHA_BLENDING
         };
-        let compilation_options = wgpu::PipelineCompilationOptions {
-            constants: &[("PREMULTIPLIED_ALPHA", f64::from(premultiplied_alpha as u8))],
-            ..Default::default()
-        };
 
         let color_target = wgpu::ColorTargetState {
             format: surface_format,
@@ -1038,7 +1046,7 @@ impl WgpuRendererCore {
                                texture_layout: Option<&wgpu::BindGroupLayout>,
                                topology: wgpu::PrimitiveTopology,
                                color_targets: &[Option<wgpu::ColorTargetState>],
-                               sample_count: u32,
+                               depth_write_enabled: bool,
                                module: &wgpu::ShaderModule| {
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
             bind_group_layouts.extend(texture_layout.map(Some));
@@ -1055,13 +1063,13 @@ impl WgpuRendererCore {
                     module,
                     entry_point: Some(vs_entry),
                     buffers: &[],
-                    compilation_options: compilation_options.clone(),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module,
                     entry_point: Some(fs_entry),
                     targets: color_targets,
-                    compilation_options: compilation_options.clone(),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology,
@@ -1072,12 +1080,14 @@ impl WgpuRendererCore {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
+                depth_stencil: DEPTH_PREPASS.then(|| wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write_enabled),
+                    depth_compare: Some(wgpu::CompareFunction::Greater),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
                 cache: None,
             })
@@ -1130,7 +1140,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(backdrop_punch_target)],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1143,7 +1153,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(backdrop_target)],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1162,7 +1172,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(opaque_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1175,7 +1185,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(opaque_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1188,7 +1198,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(opaque_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1201,7 +1211,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(opaque_target)],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1214,7 +1224,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(premultiplied_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1227,7 +1237,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(premultiplied_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1240,7 +1250,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(premultiplied_target)],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1253,7 +1263,24 @@ impl WgpuRendererCore {
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
+            false,
+            &shader_module,
+        );
+
+        let opaque_quads = create_pipeline(
+            "opaque_quads",
+            "vs_opaque_quad",
+            "fs_opaque_quad",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            true,
             &shader_module,
         );
 
@@ -1266,7 +1293,7 @@ impl WgpuRendererCore {
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1279,7 +1306,7 @@ impl WgpuRendererCore {
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1292,7 +1319,7 @@ impl WgpuRendererCore {
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1305,7 +1332,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1336,7 +1363,7 @@ impl WgpuRendererCore {
                     blend: Some(subpixel_blend),
                     write_mask: wgpu::ColorWrites::COLOR,
                 })],
-                1,
+                false,
                 subpixel_module,
             ))
         } else {
@@ -1353,7 +1380,7 @@ impl WgpuRendererCore {
                 Some(&layouts.texture),
                 wgpu::PrimitiveTopology::TriangleStrip,
                 &[Some(color_target.clone())],
-                1,
+                false,
                 subpixel_module,
             )
         });
@@ -1367,7 +1394,7 @@ impl WgpuRendererCore {
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1380,7 +1407,7 @@ impl WgpuRendererCore {
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
-            1,
+            false,
             &shader_module,
         );
 
@@ -1395,6 +1422,7 @@ impl WgpuRendererCore {
             masked,
             blurred,
             quads,
+            opaque_quads,
             shadows,
             path_tiles,
             underlines,
@@ -1405,6 +1433,7 @@ impl WgpuRendererCore {
             surfaces,
             custom_target: color_target,
             custom: FxHashMap::default(),
+            premultiplied_alpha,
         }
     }
 
@@ -2214,7 +2243,6 @@ impl WgpuRendererCore {
             atlas,
             shader_globals_offset,
             gamma_offset,
-            premultiplied_alpha: alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied,
             instance_data_capacity,
             max_instance_data_size,
             instance_data_alignment,
@@ -2226,7 +2254,9 @@ impl WgpuRendererCore {
             rendering_params,
             is_bgr: false,
             dual_source_blending,
+            transient_attachments: context.supports_transient_attachments(),
             adapter_info: context.adapter.get_info(),
+            depth_texture: None,
             target_format,
             max_texture_size,
         }
@@ -2241,7 +2271,6 @@ impl WgpuRendererCore {
         surface_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
     ) {
-        self.premultiplied_alpha = alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
         self.resources.pipelines = Self::create_pipelines(
             &self.resources.device,
             &self.resources.bind_group_layouts,
@@ -2305,7 +2334,7 @@ impl WgpuRendererCore {
         };
         let shader_globals = ShaderGlobals {
             viewport_size: [frame_size.0 as f32, frame_size.1 as f32],
-            premultiplied_alpha: self.premultiplied_alpha as u32,
+            premultiplied_alpha: self.resources.pipelines.premultiplied_alpha as u32,
             pad: 0,
         };
         self.resources.queue.write_buffer(
@@ -2351,10 +2380,15 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
+        let depth_scale = quad_depth_scale(scene.quads.len());
         let globals = GlobalParams {
             viewport_size: [self.frame_size.0 as f32, self.frame_size.1 as f32],
             path_paint_base: instance_bindings.path_tiles.paint_base,
             path_curve_base: instance_bindings.path_tiles.curve_base,
+            depth_scale,
+            quad_count: scene.quads.len() as u32,
+            premultiplied_alpha: self.resources().pipelines.premultiplied_alpha as u32,
+            pad: 0,
         };
         self.resources().queue.write_buffer(
             &self.resources().globals_buffer,
@@ -2362,6 +2396,21 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&globals),
         );
         self.prepare_texture_bind_groups(scene);
+        // Without the depth pre-pass the frame takes no depth attachment, as no fork pass does.
+        let depth_view = match DEPTH_PREPASS {
+            true => {
+                let (width, height) = self.frame_size;
+                self.ensure_depth_texture(size(
+                    DevicePixels(width as i32),
+                    DevicePixels(height as i32),
+                ));
+                let depth_texture = self.depth_texture.as_ref();
+                Some(depth_texture.context("depth texture missing")?.view.clone())
+            }
+            false => None,
+        };
+        // Quad depths rely on a quad's instance index being its index in `scene.quads`.
+        debug_assert!(!DEPTH_PREPASS || instance_bindings.quads.first_instance == 0);
 
         let mut encoder =
             self.resources()
@@ -2391,10 +2440,28 @@ impl WgpuRendererCore {
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: depth_view.as_ref().map(|view| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }
+                }),
                 ..Default::default()
             });
             pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+
+            if DEPTH_PREPASS {
+                self.draw_instances(
+                    &instance_bindings.quads,
+                    &self.resources().pipelines.opaque_quads,
+                    instance_range(0..scene.quads.len()),
+                    &mut pass,
+                );
+            }
 
             // Where the pass in hand is drawing: the frame, or the layer being filled when one
             // is open. Anything that has to break the pass and resume it has to resume it here,
@@ -2406,6 +2473,9 @@ impl WgpuRendererCore {
             // filter share one target, so a list of separately blurred rows costs one pass, not one
             // per row.
             let mut spans: Vec<Bounds<ScaledPixels>> = Vec::new();
+            let viewport_width = self.frame_size.0 as f32;
+            let viewport_height = self.frame_size.1 as f32;
+            let mut quad_cursor: u32 = 0;
             let mut path_tile_cursor = 0;
             for batch in scene.batches() {
                 let wanted = filtered
@@ -2488,13 +2558,36 @@ impl WgpuRendererCore {
                     spans.push(layer.destination_clip());
                 }
 
+                // Quad shaders assign each quad its own depth.
+                // In every other batch type, the depth is fixed to the position of the quad cursor.
+                if DEPTH_PREPASS {
+                    let (minimum_depth, maximum_depth) =
+                        if matches!(&batch, PrimitiveBatch::Quads(_)) {
+                            (0.0, 1.0)
+                        } else {
+                            let depth = quad_depth(quad_cursor, depth_scale);
+                            (depth, depth)
+                        };
+                    pass.set_viewport(
+                        0.0,
+                        0.0,
+                        viewport_width,
+                        viewport_height,
+                        minimum_depth,
+                        maximum_depth,
+                    );
+                }
+
                 match batch {
-                    PrimitiveBatch::Quads(range) => self.draw_instances(
-                        &instance_bindings.quads,
-                        &self.resources().pipelines.quads,
-                        instance_range(range),
-                        &mut pass,
-                    ),
+                    PrimitiveBatch::Quads(range) => {
+                        quad_cursor += range.len() as u32;
+                        self.draw_instances(
+                            &instance_bindings.quads,
+                            &self.resources().pipelines.quads,
+                            instance_range(range),
+                            &mut pass,
+                        )
+                    }
                     PrimitiveBatch::Shaders { shader, range } => {
                         if let Some(pipeline) = self.custom_pipeline(shader) {
                             // A custom shader reads globals of its own, so the renderer's go
@@ -2741,6 +2834,41 @@ impl WgpuRendererCore {
         let params =
             self.write_instance_binding("layer_composite_bind_group", instance_offset, &[mask])?;
         Ok((onto, blurred, params, composite))
+    }
+
+    fn ensure_depth_texture(&mut self, size: Size<DevicePixels>) {
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
+        if let Some(depth_texture) = &self.depth_texture
+            && depth_texture.texture.width() == width
+            && depth_texture.texture.height() == height
+        {
+            return;
+        }
+        let usage = if self.transient_attachments {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT_ATTACHMENT
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
+        let texture = self
+            .resources()
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("depth_texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage,
+                view_formats: &[],
+            });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.depth_texture = Some(DepthTexture { texture, view });
     }
 
     fn write_instances(

@@ -1,11 +1,9 @@
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
-use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, BLUR_LEVELS, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
-    LayerEffect, PaintSurface, PaintedPath, PrimitiveBatch, Pyramid, ScaledPixels, Scene, ShaderId,
-    Size, point, size,
+    AtlasTextureId, Bounds, ContentMask, DevicePixels, PaintSurface, PaintedPath, PrimitiveBatch,
+    ScaledPixels, Scene, Size, quad_depth, quad_depth_scale, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -22,26 +20,19 @@ use objc2_foundation::{NSRange, NSString};
 use objc2_metal::MTLCopyAllDevices;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLBuffer, MTLClearColor, MTLCommandBuffer,
-    MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDrawable, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState, MTLResourceOptions, MTLScissorRect, MTLStorageMode, MTLStoreAction,
-    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
+    MTLCommandEncoder, MTLCommandQueue, MTLCompareFunction, MTLCreateSystemDefaultDevice,
+    MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLDrawable, MTLGPUFamily,
+    MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
+    MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
+    MTLTextureUsage, MTLViewport,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
 
-use std::{
-    cell::Cell,
-    mem,
-    mem::MaybeUninit,
-    ops::Range,
-    ptr, slice,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 
 #[cfg(not(feature = "runtime_shaders"))]
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
@@ -50,20 +41,6 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-const INITIAL_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-/// How long the instance buffer pool watches its peak use before deciding whether to shrink.
-const INSTANCE_BUFFER_SETTLE: Duration = Duration::from_secs(5);
-/// How long an offscreen target may go unused before its memory is given back. A frame with a
-/// blur, layer or path on screen touches its targets every time, so only targets that nothing
-/// on screen draws through are released.
-const IDLE_RELEASE: Duration = Duration::from_secs(2);
-/// How deeply filtered layers can nest before the innermost ones stop being filtered. Each depth
-/// keeps one offscreen target, made the first time a frame nests that deep.
-const LAYER_DEPTH: usize = 8;
-
-/// The widest and tallest the overscan may grow a frame drawn offscreen to, which every Metal GPU
-/// can allocate. A window already larger keeps its size and gets no overscan.
-const MAX_FRAME: i32 = 16384;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -79,18 +56,13 @@ pub fn new_renderer(
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<InstanceBuffer>,
-    /// The most any frame has written since `window` began.
-    peak: usize,
-    window: Instant,
 }
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: INITIAL_INSTANCE_BUFFER_SIZE,
+            buffer_size: 2 * 1024 * 1024,
             buffers: Vec::new(),
-            peak: 0,
-            window: Instant::now(),
         }
     }
 }
@@ -139,29 +111,6 @@ impl InstanceBufferPool {
             self.buffers.push(buffer)
         }
     }
-
-    /// Shrinks the buffers once every frame over the last `INSTANCE_BUFFER_SETTLE` has needed
-    /// under a quarter of one. `used` is what the frame just encoded wrote, and the new size keeps
-    /// twice the peak so the next busy frame does not grow it straight back. Buffers still in
-    /// flight are dropped when they come back, since their size no longer matches.
-    pub(crate) fn settle(&mut self, used: usize) {
-        self.peak = self.peak.max(used);
-        let now = Instant::now();
-        if now.duration_since(self.window) < INSTANCE_BUFFER_SETTLE {
-            return;
-        }
-        let peak = mem::take(&mut self.peak);
-        self.window = now;
-
-        let buffer_size = (peak * 2)
-            .next_power_of_two()
-            .clamp(INITIAL_INSTANCE_BUFFER_SIZE, MAX_INSTANCE_BUFFER_SIZE);
-        if peak * 4 > self.buffer_size || buffer_size >= self.buffer_size {
-            return;
-        }
-        log::info!("decreased instance buffer size to {buffer_size}");
-        self.reset(buffer_size);
-    }
 }
 
 enum DisplayLinkMode {
@@ -174,7 +123,6 @@ enum DisplayLinkMode {
 pub struct MetalRenderer {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     layer: Option<Retained<CAMetalLayer>>,
-    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -185,30 +133,17 @@ pub struct MetalRenderer {
     path_tiles_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     shadows_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     quads_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    opaque_quads_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     underlines_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    backdrops_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    backdrop_punch_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    gaussian_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    pyramid_down_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    pyramid_up_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    blit_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    /// Writes transparent black under a scissor, for wiping the part of a layer target in use.
-    clear_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    composite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    masked_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    /// A pipeline per custom shader, built from its MSL translation the first time a frame draws
-    /// it. A shader that failed to build is kept as `None`, so it is not built again every frame.
-    custom_pipeline_states:
-        FxHashMap<ShaderId, Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
+    depth_write_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
+    depth_test_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
+    depth_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: CFRetained<CVMetalTextureCache>,
-    filter_targets: FilterTargets,
-    /// When the frame being encoded started, which stamps every offscreen target it touches.
-    frame_time: Instant,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -354,6 +289,7 @@ impl MetalRenderer {
             "path_tile_vertex",
             "path_tile_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let shadows_pipeline_state = build_pipeline_state(
             &device,
@@ -362,6 +298,7 @@ impl MetalRenderer {
             "shadow_vertex",
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let quads_pipeline_state = build_pipeline_state(
             &device,
@@ -370,6 +307,16 @@ impl MetalRenderer {
             "quad_vertex",
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
+        )?;
+        let opaque_quads_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "opaque_quads",
+            "opaque_quad_vertex",
+            "opaque_quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            false,
         )?;
         let underlines_pipeline_state = build_pipeline_state(
             &device,
@@ -378,6 +325,7 @@ impl MetalRenderer {
             "underline_vertex",
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -386,6 +334,7 @@ impl MetalRenderer {
             "monochrome_sprite_vertex",
             "monochrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let polychrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -394,6 +343,7 @@ impl MetalRenderer {
             "polychrome_sprite_vertex",
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
@@ -402,92 +352,11 @@ impl MetalRenderer {
             "surface_vertex",
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
 
-        // A backdrop mixes the blurred copy into what it covers rather than laying it over:
-        // the punch scales the destination by `1 - k`, the draw after it adds `blurred * k`.
-        // Laying it over cost a see-through window its transparency.
-        let backdrops_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "backdrops",
-            "backdrop_vertex",
-            "backdrop_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Add,
-        )?;
-        let backdrop_punch_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "backdrop_punch",
-            "backdrop_vertex",
-            "backdrop_punch_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Punch,
-        )?;
-        let gaussian_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "gaussian",
-            "filter_vertex",
-            "gaussian_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Replace,
-        )?;
-        let pyramid_down_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "pyramid_down",
-            "filter_vertex",
-            "pyramid_down_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Replace,
-        )?;
-        let pyramid_up_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "pyramid_up",
-            "filter_vertex",
-            "pyramid_up_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Replace,
-        )?;
-        let blit_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "blit",
-            "filter_vertex",
-            "blit_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Replace,
-        )?;
-        let clear_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "clear",
-            "filter_vertex",
-            "clear_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Replace,
-        )?;
-        let composite_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "composite",
-            "filter_vertex",
-            "mask_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Over,
-        )?;
-        let masked_pipeline_state = build_filter_pipeline_state(
-            &device,
-            &library,
-            "masked",
-            "filter_vertex",
-            "mask_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            FilterBlend::Over,
-        )?;
+        let depth_write_state = build_depth_stencil_state(&device, true)?;
+        let depth_test_state = build_depth_stencil_state(&device, false)?;
 
         let command_queue = device.newCommandQueue().context("creating command queue")?;
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -514,7 +383,6 @@ impl MetalRenderer {
             layer,
             presents_with_transaction: false,
             display_link_mode: DisplayLinkMode::Detached,
-            #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -522,25 +390,17 @@ impl MetalRenderer {
             path_tiles_pipeline_state,
             shadows_pipeline_state,
             quads_pipeline_state,
+            opaque_quads_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
-            backdrops_pipeline_state,
-            backdrop_punch_pipeline_state,
-            gaussian_pipeline_state,
-            pyramid_down_pipeline_state,
-            pyramid_up_pipeline_state,
-            blit_pipeline_state,
-            clear_pipeline_state,
-            composite_pipeline_state,
-            masked_pipeline_state,
-            custom_pipeline_states: FxHashMap::default(),
+            depth_write_state,
+            depth_test_state,
+            depth_texture: None,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
-            filter_targets: FilterTargets::default(),
-            frame_time: Instant::now(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         })
@@ -619,72 +479,6 @@ impl MetalRenderer {
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
             layer.setDrawableSize(CGSize::new(size.width.0 as f64, size.height.0 as f64));
-        }
-        // Targets made for the old size are freed now rather than held until the next frame
-        // that draws a filter rebuilds them.
-        if self.filter_targets.size != size {
-            self.filter_targets = FilterTargets::default();
-        }
-    }
-
-    /// One filter target for a drawable of `viewport_size`, created if no frame has drawn
-    /// through it at that size since it was last released.
-    fn filter_texture(
-        &mut self,
-        target: FilterTarget,
-        viewport_size: Size<DevicePixels>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        if self.filter_targets.size != viewport_size {
-            self.filter_targets = FilterTargets {
-                size: viewport_size,
-                ..FilterTargets::default()
-            };
-        }
-        let shrink = target.shrink() as usize;
-        // A level rounds up, so it covers the whole frame and its last texel can hang past it.
-        let width = (i32::from(viewport_size.width).max(1) as usize).div_ceil(shrink);
-        let height = (i32::from(viewport_size.height).max(1) as usize).div_ceil(shrink);
-        let now = self.frame_time;
-        let device = &self.device;
-        let slot = self.filter_targets.slot(target);
-        let scratch = match slot {
-            Some(scratch) => scratch,
-            None => {
-                let descriptor = MTLTextureDescriptor::new();
-                descriptor.setTextureType(MTLTextureType::Type2D);
-                descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-                // SAFETY: Both dimensions are at least one and this descriptor creates a 2D texture.
-                unsafe {
-                    descriptor.setWidth(width);
-                    descriptor.setHeight(height);
-                }
-                descriptor.setStorageMode(MTLStorageMode::Private);
-                descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-                let texture = device
-                    .newTextureWithDescriptor(&descriptor)
-                    .context("allocating filter target")?;
-                slot.insert(Scratch { texture, used: now })
-            }
-        };
-        scratch.used = now;
-        Ok(scratch.texture.clone())
-    }
-
-    /// Frees offscreen targets that no frame has drawn through for `IDLE_RELEASE`. Every frame
-    /// checks this itself, so a caller only needs it for a window that has stopped drawing.
-    pub fn release_idle_targets(&mut self) {
-        self.release_targets_idle_at(Instant::now());
-    }
-
-    /// Drops every offscreen target that no frame has drawn through within `IDLE_RELEASE` of
-    /// `now`. A command buffer retains what it encodes, so a target an earlier frame still uses
-    /// on the GPU stays alive until that frame completes.
-    fn release_targets_idle_at(&mut self, now: Instant) {
-        let idle = |used: Instant| now.duration_since(used) >= IDLE_RELEASE;
-        for slot in self.filter_targets.slots() {
-            if slot.as_ref().is_some_and(|scratch| idle(scratch.used)) {
-                *slot = None;
-            }
         }
     }
 
@@ -787,9 +581,7 @@ impl MetalRenderer {
         )?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
-        let used = writer.offset;
         let frame_resources = Cell::new(Some((writer.finish(), surface_textures)));
-        instance_buffer_pool.lock().settle(used);
         let block = RcBlock::new(
             move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 if let Some((instance_buffer, _surface_textures)) = frame_resources.take() {
@@ -950,156 +742,71 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        self.frame_time = Instant::now();
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue
             .commandBuffer()
             .context("creating command buffer")?;
         let alpha = if self.opaque { 1. } else { 0. };
-        let filtered =
-            filters_enabled() && (!scene.effects.is_empty() || !scene.backdrops.is_empty());
-        // Backdrops read what the frame has drawn so far, which a drawable cannot be sampled from,
-        // so a frame carrying them is drawn offscreen and blitted back at the end. A backdrop near
-        // the right or bottom edge reads what the scene drew past it too, so that frame is drawn
-        // larger by the overscan, and the blit leaves the overscan behind.
-        let overscan = match filters_enabled() {
-            true => scene.overscan,
-            false => Size::default(),
-        };
-        let overscanned = overscan.width.0 > 0 || overscan.height.0 > 0;
-        let mirrored = (filtered && !scene.backdrops.is_empty()) || overscanned;
-        let grow = |side: DevicePixels, past: DevicePixels| {
-            DevicePixels(side.0 + past.0.clamp(0, (MAX_FRAME - side.0).max(0)))
-        };
-        let viewport_size = match mirrored {
-            true => size(
-                grow(viewport_size.width, overscan.width),
-                grow(viewport_size.height, overscan.height),
-            ),
-            false => viewport_size,
-        };
-        let main_texture = match mirrored {
-            true => self.filter_texture(FilterTarget::Frame, viewport_size)?,
-            false => texture.retain(),
-        };
+        let depth_texture = self.depth_texture_matching(texture)?;
 
-        let mut command_encoder = new_command_encoder_for_texture(
+        let command_encoder = new_command_encoder_for_texture(
             &command_buffer,
-            &main_texture,
+            texture,
+            &depth_texture,
             viewport_size,
-            Some(MTLClearColor {
+            MTLClearColor {
                 red: 0.,
                 green: 0.,
                 blue: 0.,
                 alpha,
-            }),
+            },
         )?;
-        // SAFETY: Metal copies the viewport bytes, which match every vertex
-        // shader's `GlobalInputIndex_ViewportSize` argument.
+        let depth_scale = quad_depth_scale(scene.quads.len());
+        // SAFETY: Metal copies both values, which match every vertex shader's
+        // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
         unsafe {
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&viewport_size).cast(),
                 mem::size_of_val(&viewport_size),
                 GlobalInputIndex::ViewportSize as usize,
             );
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&depth_scale).cast(),
+                mem::size_of_val(&depth_scale),
+                GlobalInputIndex::DepthScale as usize,
+            );
         }
 
-        let mut stack: Vec<usize> = Vec::new();
-        // What each open layer will be composited through: neighbours that ask for the same filter
-        // share one target, so a list of separately blurred rows costs one pass, not one per row.
-        let mut spans: Vec<Bounds<ScaledPixels>> = Vec::new();
-        // The part of each open layer's target that was wiped when it opened. A neighbour may only
-        // share the target when everything it draws lands inside it.
-        let mut wiped: Vec<Bounds<ScaledPixels>> = Vec::new();
+        self.draw_opaque_quads(scene.quads.len(), instance_bindings, &command_encoder);
+        command_encoder.setDepthStencilState(Some(&self.depth_test_state));
 
+        let mut quad_cursor: u32 = 0;
         let mut path_tile_cursor = 0;
         for batch in scene.batches() {
-            let wanted = filtered
-                .then(|| scene.filtered(scene.batch_order(&batch)))
-                .flatten()
-                .map(|index| scene.filter_chain(index))
-                .unwrap_or_default();
-            let shared = stack
-                .iter()
-                .zip(wanted.iter())
-                .take_while(|(open, next)| open == next)
-                .count();
-
-            let mut merged = false;
-            while stack.len() > shared {
-                if stack.len() == shared + 1
-                    && wanted.len() == stack.len()
-                    && let Some(open) = stack.last_mut()
-                    && let Some(span) = spans.last_mut()
-                {
-                    let next = scene.effects[wanted[shared]];
-                    let layer = scene.effects[*open];
-                    if layer.can_merge_with(&next)
-                        && wiped
-                            .last()
-                            .is_some_and(|wiped| covers(*wiped, layer_wipe(next)))
-                    {
-                        *open = wanted[shared];
-                        *span = span.union(&next.destination_clip());
-                        merged = true;
-                        break;
-                    }
-                }
-
-                let index = stack.pop().expect("the stack is not empty");
-                let layer = scene.effects[index];
-                let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
-                wiped.pop();
-
-                command_encoder.endEncoding();
-                command_encoder = self.close_layer(
-                    &command_buffer,
-                    layer,
-                    clip,
-                    stack.len(),
-                    &main_texture,
-                    viewport_size,
-                )?;
-            }
-
-            for index in wanted.iter().skip(shared + usize::from(merged)) {
-                if stack.len() >= LAYER_DEPTH {
-                    break;
-                }
-                let layer = scene.effects[*index];
-                let depth = stack.len();
-
-                command_encoder.endEncoding();
-                let target = self.filter_texture(FilterTarget::Layer(depth), viewport_size)?;
-                // Clearing the whole target writes every tile of a window-sized texture, which
-                // on a tiled GPU costs more than most layers draw. Only the source area, and the
-                // margin a blur reads past it, is ever read back, so only that is wiped.
-                command_encoder =
-                    new_discarding_command_encoder(&command_buffer, &target, viewport_size)?;
-                bind_viewport(&command_encoder, viewport_size);
-                self.clear_within(&command_encoder, layer_wipe(layer), viewport_size);
-                stack.push(*index);
-                spans.push(layer.destination_clip());
-                wiped.push(layer_wipe(layer));
-            }
+            // Quad shaders assign each quad its own depth.
+            // In every other batch type, the depth is fixed to the position of the quad cursor.
+            let (znear, zfar) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
+                (0.0, 1.0)
+            } else {
+                let depth = quad_depth(quad_cursor, depth_scale) as f64;
+                (depth, depth)
+            };
+            command_encoder.setViewport(MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: i32::from(viewport_size.width) as f64,
+                height: i32::from(viewport_size.height) as f64,
+                znear,
+                zfar,
+            });
 
             match batch {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::Quads(range) => {
+                    quad_cursor += range.len() as u32;
                     self.draw_quads(range, instance_bindings, &command_encoder)
-                }
-                PrimitiveBatch::Shaders { shader, range } => {
-                    if let Some(pipeline) = self.custom_pipeline_state(shader) {
-                        self.draw_custom_shaders(
-                            &pipeline,
-                            range,
-                            instance_bindings,
-                            viewport_size,
-                            &command_encoder,
-                        );
-                    }
                 }
                 PrimitiveBatch::Paths(range) => {
                     let tiles_start = path_tile_cursor;
@@ -1130,59 +837,6 @@ impl MetalRenderer {
                         instance_bindings,
                         &command_encoder,
                     ),
-                PrimitiveBatch::Backdrops(range) => {
-                    if !filtered {
-                        continue;
-                    }
-                    let backdrops = &scene.backdrops[range.clone()];
-                    let sigma = backdrops
-                        .iter()
-                        .fold(0., |widest: f32, backdrop| widest.max(backdrop.blur));
-                    // A backdrop samples the blur only within its own bounds, so the passes
-                    // are scissored to the union of the batch's, grown by the kernel inside
-                    // `blur_source`, rather than run over the whole frame.
-                    let clip = backdrops
-                        .iter()
-                        .map(|backdrop| backdrop.bounds)
-                        .reduce(|union, bounds| union.union(&bounds));
-
-                    command_encoder.endEncoding();
-                    let source = self.backdrop_source(
-                        &command_buffer,
-                        &main_texture,
-                        &wiped,
-                        viewport_size,
-                        clip.map(|clip| clip.dilate(BlurPasses::for_sigma(sigma).source_margin())),
-                    )?;
-                    let blurred = self.blur_source(
-                        &command_buffer,
-                        &source,
-                        false,
-                        sigma,
-                        clip,
-                        viewport_size,
-                    )?;
-                    let target = match stack.len().checked_sub(1) {
-                        Some(depth) => {
-                            self.filter_texture(FilterTarget::Layer(depth), viewport_size)?
-                        }
-                        None => main_texture.clone(),
-                    };
-                    command_encoder = new_command_encoder_for_texture(
-                        &command_buffer,
-                        &target,
-                        viewport_size,
-                        None,
-                    )?;
-                    bind_viewport(&command_encoder, viewport_size);
-                    self.draw_backdrops(
-                        range,
-                        instance_bindings,
-                        &blurred,
-                        viewport_size,
-                        &command_encoder,
-                    );
-                }
                 PrimitiveBatch::Surfaces(range) => {
                     if let Err(error) = self.draw_surfaces(
                         &scene.surfaces[range.clone()],
@@ -1199,550 +853,76 @@ impl MetalRenderer {
             }
         }
 
-        while let Some(index) = stack.pop() {
-            let layer = scene.effects[index];
-            let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
-            wiped.pop();
-
-            command_encoder.endEncoding();
-            command_encoder = self.close_layer(
-                &command_buffer,
-                layer,
-                clip,
-                stack.len(),
-                &main_texture,
-                viewport_size,
-            )?;
-        }
-
         command_encoder.endEncoding();
-
-        if mirrored {
-            self.filter_pass(
-                &command_buffer,
-                &self.blit_pipeline_state,
-                &main_texture,
-                texture,
-                None,
-                None,
-            )?;
-        }
-
-        self.release_targets_idle_at(self.frame_time);
 
         Ok(command_buffer)
     }
 
-    /// Blurs a filtered layer that has just closed, when its filter asks for a blur, and
-    /// composites it as the first draw of a pass that resumes its parent. The caller carries on
-    /// drawing through the encoder it returns. `depth` is the closed layer's own nesting depth.
-    fn close_layer(
+    fn depth_texture_matching(
         &mut self,
-        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-        layer: LayerEffect,
-        clip: Bounds<ScaledPixels>,
-        depth: usize,
-        main_texture: &ProtocolObject<dyn MTLTexture>,
-        viewport_size: Size<DevicePixels>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
-        let source = self.filter_texture(
-            FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)),
-            viewport_size,
-        )?;
-        let onto = match depth.checked_sub(1) {
-            Some(parent) => self.filter_texture(
-                FilterTarget::Layer(parent.min(LAYER_DEPTH - 1)),
-                viewport_size,
-            )?,
-            None => main_texture.retain(),
-        };
-        let blurred = match layer.filter.blurs() {
-            true => self.blur_source(
-                command_buffer,
-                &source,
-                true,
-                layer.filter.blur,
-                Some(layer.blur_bounds(clip)),
-                viewport_size,
-            )?,
-            false => source,
-        };
-        let encoder = new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None)?;
-        bind_viewport(&encoder, viewport_size);
-        self.composite_layer(&encoder, &blurred, layer, clip, viewport_size);
-        Ok(encoder)
-    }
-
-    /// Writes transparent black over `bounds` of the encoder's target and lifts the scissor
-    /// again, so the draws after it see the whole target.
-    fn clear_within(
-        &self,
-        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-        bounds: Bounds<ScaledPixels>,
-        viewport_size: Size<DevicePixels>,
-    ) {
-        let Some(within) = Self::scissor(bounds, viewport_size, 1) else {
-            return;
-        };
-        encoder.setRenderPipelineState(&self.clear_pipeline_state);
-        encoder.setScissorRect(within);
-        // SAFETY: `filter_vertex` builds the four strip vertices from their ids and reads no buffer.
-        unsafe {
-            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
-        }
-        encoder.setScissorRect(whole_scissor(viewport_size));
-    }
-
-    /// Clamps a region to the target it is drawn into, shrunk to the blur step it runs at.
-    fn scissor(
-        bounds: Bounds<ScaledPixels>,
-        viewport_size: Size<DevicePixels>,
-        shrink: u32,
-    ) -> Option<MTLScissorRect> {
-        let shrink = shrink as f32;
-        let width = (i32::from(viewport_size.width) as f32 / shrink).ceil();
-        let height = (i32::from(viewport_size.height) as f32 / shrink).ceil();
-        let left = (bounds.origin.x.0 / shrink).floor().clamp(0., width);
-        let top = (bounds.origin.y.0 / shrink).floor().clamp(0., height);
-        let right = ((bounds.origin.x.0 + bounds.size.width.0) / shrink)
-            .ceil()
-            .clamp(left, width);
-        let bottom = ((bounds.origin.y.0 + bounds.size.height.0) / shrink)
-            .ceil()
-            .clamp(top, height);
-        if right <= left || bottom <= top {
-            return None;
-        }
-
-        Some(MTLScissorRect {
-            x: left as usize,
-            y: top as usize,
-            width: (right - left) as usize,
-            height: (bottom - top) as usize,
-        })
-    }
-
-    /// Draws one full-screen pass of a filter from `source` into `target`.
-    fn filter_pass(
-        &self,
-        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-        pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
-        source: &ProtocolObject<dyn MTLTexture>,
         target: &ProtocolObject<dyn MTLTexture>,
-        params: Option<&BlurParams>,
-        within: Option<MTLScissorRect>,
-    ) -> Result<()> {
-        let size = size(
-            DevicePixels(target.width() as i32),
-            DevicePixels(target.height() as i32),
-        );
-        // A scissored pass leaves the rest of its target alone, and the passes after it read only
-        // what the passes before them wrote. Clearing the whole target first is a full write of a
-        // window-sized texture, which on a tiled GPU costs more than a narrow blur itself.
-        let encoder = match within {
-            Some(_) => new_discarding_command_encoder(command_buffer, target, size)?,
-            None => new_command_encoder_for_texture(
-                command_buffer,
-                target,
-                size,
-                Some(MTLClearColor {
-                    red: 0.,
-                    green: 0.,
-                    blue: 0.,
-                    alpha: 0.,
-                }),
-            )?,
-        };
-        encoder.setRenderPipelineState(pipeline);
-        // SAFETY: The source texture and the copied parameters match the filter shader's slots.
-        // Metal retains the texture until the pass completes.
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+        if let Some(depth_texture) = &self.depth_texture
+            && depth_texture.width() == target.width()
+            && depth_texture.height() == target.height()
+        {
+            return Ok(depth_texture.clone());
+        }
+        let descriptor = MTLTextureDescriptor::new();
+        // SAFETY: The size is the size of an existing render target, which the device supports.
         unsafe {
-            encoder.setFragmentTexture_atIndex(Some(source), FilterInputIndex::Source as usize);
-            if let Some(params) = params {
-                encoder.setFragmentBytes_length_atIndex(
-                    ptr::NonNull::from(params).cast(),
-                    mem::size_of::<BlurParams>(),
-                    FilterInputIndex::Params as usize,
-                );
-            }
+            descriptor.setWidth(target.width());
+            descriptor.setHeight(target.height());
         }
-        if let Some(within) = within {
-            encoder.setScissorRect(within);
-        }
-        // SAFETY: `filter_vertex` builds the four strip vertices from their ids and reads no buffer.
-        unsafe {
-            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
-        }
-        encoder.endEncoding();
-        Ok(())
-    }
-
-    /// Blurs a source and returns the target holding the result, at full size. A `spare` source
-    /// is a layer nothing reads again, so the blur writes its result back into it rather than
-    /// into a full-size target of its own.
-    fn blur_source(
-        &mut self,
-        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-        source: &ProtocolObject<dyn MTLTexture>,
-        spare: bool,
-        sigma: f32,
-        clip: Option<Bounds<ScaledPixels>>,
-        viewport_size: Size<DevicePixels>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        match BlurPasses::for_sigma(sigma) {
-            BlurPasses::Gaussian(sigma) => {
-                self.gaussian_blur(command_buffer, source, spare, sigma, clip, viewport_size)
-            }
-            BlurPasses::Pyramid(pyramid) => {
-                self.pyramid_blur(command_buffer, source, spare, pyramid, clip, viewport_size)
-            }
-        }
-    }
-
-    /// Blurs a source across into the scratch target and down into level zero, or back into a
-    /// `spare` source, both at full size. The pass across covers the clip grown by the kernel,
-    /// since the pass down reads that far above and below it.
-    fn gaussian_blur(
-        &mut self,
-        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-        source: &ProtocolObject<dyn MTLTexture>,
-        spare: bool,
-        sigma: f32,
-        clip: Option<Bounds<ScaledPixels>>,
-        viewport_size: Size<DevicePixels>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        let extent = [
-            i32::from(viewport_size.width) as f32,
-            i32::from(viewport_size.height) as f32,
-        ];
-        let across = BlurParams {
-            direction: [1., 0.],
-            extent,
-            radius: sigma,
-            pad: 0.,
-        };
-        let down = BlurParams {
-            direction: [0., 1.],
-            extent,
-            radius: sigma,
-            pad: 0.,
-        };
-        let scratch = self.filter_texture(FilterTarget::Scratch, viewport_size)?;
-        let settled = match spare {
-            true => source.retain(),
-            false => self.filter_texture(FilterTarget::Level(0), viewport_size)?,
-        };
-        let within = |margin: f32| {
-            clip.and_then(|clip| Self::scissor(clip.dilate(ScaledPixels(margin)), viewport_size, 1))
-        };
-        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
-
-        self.filter_pass(
-            command_buffer,
-            &self.gaussian_pipeline_state,
-            source,
-            &scratch,
-            Some(&across),
-            within(reach),
-        )?;
-        self.filter_pass(
-            command_buffer,
-            &self.gaussian_pipeline_state,
-            &scratch,
-            &settled,
-            Some(&down),
-            within(1.),
-        )?;
-        Ok(settled)
-    }
-
-    /// Blurs a source with a [`Pyramid`]: down to the deepest level, a gaussian across and down
-    /// there, and back up to full size. Returns the target holding the result: level zero, or a
-    /// `spare` source.
-    fn pyramid_blur(
-        &mut self,
-        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-        source: &ProtocolObject<dyn MTLTexture>,
-        spare: bool,
-        pyramid: Pyramid,
-        clip: Option<Bounds<ScaledPixels>>,
-        viewport_size: Size<DevicePixels>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        let deepest = pyramid.levels;
-        let frame = (
-            i32::from(viewport_size.width) as f32,
-            i32::from(viewport_size.height) as f32,
-        );
-        // A pass reads a level of its own, so each gets its own parameters, which carry how
-        // much of that level holds the frame.
-        let params = |level: usize, direction: [f32; 2], radius: f32| {
-            let shrink = (1u32 << level) as f32;
-            BlurParams {
-                direction,
-                extent: [frame.0 / shrink, frame.1 / shrink],
-                radius,
-                pad: 0.,
-            }
-        };
-        let reads: Vec<BlurParams> = (0..=deepest)
-            .map(|level| params(level, [0., 0.], 0.))
-            .collect();
-        let across = params(deepest, [1., 0.], pyramid.sigma);
-        let along = params(deepest, [0., 1.], pyramid.sigma);
-        let levels: Vec<Retained<ProtocolObject<dyn MTLTexture>>> = (0..=deepest)
-            .map(|level| match (level, spare) {
-                (0, true) => Ok(source.retain()),
-                _ => self.filter_texture(FilterTarget::Level(level), viewport_size),
-            })
-            .collect::<Result<_>>()?;
-        let spread = self.filter_texture(FilterTarget::Spread(deepest), viewport_size)?;
-        // A pass leaves what lies past its scissor undefined, so each writes the clip grown by
-        // everything the passes after it read.
-        let within = |level: usize, margin: f32| {
-            clip.and_then(|clip| {
-                Self::scissor(clip.dilate(ScaledPixels(margin)), viewport_size, 1 << level)
-            })
-        };
-
-        for level in 1..=deepest {
-            let from: &ProtocolObject<dyn MTLTexture> = match level {
-                1 => source,
-                _ => &levels[level - 1],
-            };
-            self.filter_pass(
-                command_buffer,
-                &self.pyramid_down_pipeline_state,
-                from,
-                &levels[level],
-                Some(&reads[level - 1]),
-                within(level, pyramid.down_margin(level)),
-            )?;
-        }
-        self.filter_pass(
-            command_buffer,
-            &self.gaussian_pipeline_state,
-            &levels[deepest],
-            &spread,
-            Some(&across),
-            within(deepest, pyramid.across_margin()),
-        )?;
-        self.filter_pass(
-            command_buffer,
-            &self.gaussian_pipeline_state,
-            &spread,
-            &levels[deepest],
-            Some(&along),
-            within(deepest, pyramid.along_margin()),
-        )?;
-        for level in (0..deepest).rev() {
-            self.filter_pass(
-                command_buffer,
-                &self.pyramid_up_pipeline_state,
-                &levels[level + 1],
-                &levels[level],
-                Some(&reads[level + 1]),
-                within(level, pyramid.up_margin(level)),
-            )?;
-        }
-        Ok(levels[0].clone())
-    }
-
-    /// Draws a filtered layer back into its parent through `encoder`, clipped to the layer's bounds,
-    /// and leaves the encoder open with the scissor lifted for the parent's own draws.
-    fn composite_layer(
-        &self,
-        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-        source: &ProtocolObject<dyn MTLTexture>,
-        layer: LayerEffect,
-        clip: Bounds<ScaledPixels>,
-        viewport_size: Size<DevicePixels>,
-    ) {
-        let Some(within) = Self::scissor(layer.destination_scissor_bounds(clip), viewport_size, 1)
-        else {
-            return;
-        };
-        let masked = layer.filter.fades();
-        encoder.setRenderPipelineState(match masked {
-            true => &self.masked_pipeline_state,
-            false => &self.composite_pipeline_state,
+        descriptor.setPixelFormat(MTLPixelFormat::Depth32Float);
+        descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        // The depth buffer never leaves its render pass, so Apple GPUs can keep
+        // it in tile memory without allocating any backing store.
+        descriptor.setStorageMode(if self.is_apple_gpu {
+            MTLStorageMode::Memoryless
+        } else {
+            MTLStorageMode::Private
         });
-        let params = mask_params(layer, clip);
-        // SAFETY: The layer texture and the copied viewport and mask parameters match the mask
-        // shader's slots. Metal retains the texture until the pass completes.
-        unsafe {
-            encoder.setFragmentTexture_atIndex(Some(source), FilterInputIndex::Source as usize);
-            encoder.setFragmentBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                FilterInputIndex::ViewportSize as usize,
-            );
-            encoder.setFragmentBytes_length_atIndex(
-                ptr::NonNull::from(&params).cast(),
-                mem::size_of::<MaskParams>(),
-                FilterInputIndex::Params as usize,
-            );
-        }
-        encoder.setScissorRect(within);
-        // SAFETY: `filter_vertex` builds the four strip vertices from their ids and reads no buffer.
-        unsafe {
-            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
-        }
-        encoder.setScissorRect(whole_scissor(viewport_size));
+        let depth_texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .context("allocating depth texture")?;
+        self.depth_texture = Some(depth_texture.clone());
+        Ok(depth_texture)
     }
 
-    /// Flattens open layers in source coordinates without changing their eventual composites.
-    fn backdrop_source(
-        &mut self,
-        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-        frame: &ProtocolObject<dyn MTLTexture>,
-        wiped: &[Bounds<ScaledPixels>],
-        viewport_size: Size<DevicePixels>,
-        clip: Option<Bounds<ScaledPixels>>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        let depth = wiped.len();
-        if depth == 0 {
-            return Ok(frame.retain());
-        }
-        let target = self.filter_texture(FilterTarget::Backdrop, viewport_size)?;
-        let bounds = Bounds::new(
-            point(ScaledPixels(0.), ScaledPixels(0.)),
-            size(
-                ScaledPixels(viewport_size.width.0 as f32),
-                ScaledPixels(viewport_size.height.0 as f32),
-            ),
-        );
-        let params = MaskParams {
-            source_bounds: bounds,
-            fade_bounds: bounds,
-            scale: 1.,
-            ..Default::default()
-        };
-        // Each open layer is read only where it was wiped when it opened, since the rest of its
-        // target still holds whatever an earlier layer left there.
-        let mut sources = vec![(frame.retain(), clip)];
-        sources.extend(
-            (0..depth)
-                .map(|level| {
-                    let within = match clip {
-                        Some(clip) => clip.intersect(&wiped[level]),
-                        None => wiped[level],
-                    };
-                    Ok((
-                        self.filter_texture(FilterTarget::Layer(level), viewport_size)?,
-                        Some(within),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        );
-        let encoder = new_command_encoder_for_texture(
-            command_buffer,
-            &target,
-            viewport_size,
-            Some(MTLClearColor {
-                red: 0.,
-                green: 0.,
-                blue: 0.,
-                alpha: 0.,
-            }),
-        )?;
-        encoder.setRenderPipelineState(&self.composite_pipeline_state);
-        // SAFETY: The viewport and mask parameters are copied from live values into the mask
-        // shader's slots.
-        unsafe {
-            encoder.setFragmentBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                FilterInputIndex::ViewportSize as usize,
-            );
-            encoder.setFragmentBytes_length_atIndex(
-                ptr::NonNull::from(&params).cast(),
-                mem::size_of_val(&params),
-                FilterInputIndex::Params as usize,
-            );
-        }
-        for (source, within) in sources {
-            let scissor = match within {
-                Some(within) => match Self::scissor(within, viewport_size, 1) {
-                    Some(scissor) => scissor,
-                    None => continue,
-                },
-                None => whole_scissor(viewport_size),
-            };
-            encoder.setScissorRect(scissor);
-            // SAFETY: The source texture matches the mask shader's slot and Metal retains it until
-            // the pass completes. `filter_vertex` builds the four strip vertices from their ids.
-            unsafe {
-                encoder
-                    .setFragmentTexture_atIndex(Some(&source), FilterInputIndex::Source as usize);
-                encoder.drawPrimitives_vertexStart_vertexCount(
-                    MTLPrimitiveType::TriangleStrip,
-                    0,
-                    4,
-                );
-            }
-        }
-        encoder.endEncoding();
-        Ok(target)
-    }
-
-    fn draw_backdrops(
+    fn draw_opaque_quads(
         &self,
-        backdrops: Range<usize>,
+        quad_count: usize,
         instance_bindings: &InstanceBindings,
-        source: &ProtocolObject<dyn MTLTexture>,
-        viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
-        if backdrops.is_empty() {
+        if quad_count == 0 {
             return;
         }
+        let quad_count_value = quad_count as u32;
 
-        command_encoder.setRenderPipelineState(&self.backdrop_punch_pipeline_state);
-        // SAFETY: The scene's backdrop range matches the uploaded shader layouts and slots. Metal
-        // retains the buffers and texture, writer.finish publishes their writes, and viewport
-        // bytes are copied.
+        command_encoder.setRenderPipelineState(&self.opaque_quads_pipeline_state);
+        command_encoder.setDepthStencilState(Some(&self.depth_write_state));
+        // SAFETY: The scene's quads and the copied count match the shader layouts and slots.
+        // Metal retains the buffer, and writer.finish publishes its writes.
         unsafe {
             command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&instance_bindings.backdrops.buffer),
-                instance_bindings.backdrops.offset,
-                FilterInputIndex::Backdrops as usize,
-            );
-            command_encoder.setFragmentBuffer_offset_atIndex(
-                Some(&instance_bindings.backdrops.buffer),
-                instance_bindings.backdrops.offset,
-                FilterInputIndex::Backdrops as usize,
+                Some(&instance_bindings.quads.buffer),
+                instance_bindings.quads.offset,
+                QuadInputIndex::Quads as usize,
             );
             command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                FilterInputIndex::ViewportSize as usize,
+                ptr::NonNull::from(&quad_count_value).cast(),
+                mem::size_of_val(&quad_count_value),
+                QuadInputIndex::QuadCount as usize,
             );
-            command_encoder.setFragmentBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                FilterInputIndex::ViewportSize as usize,
-            );
-            command_encoder
-                .setFragmentTexture_atIndex(Some(source), FilterInputIndex::Source as usize);
-            // The hole first, the blurred copy into it second: together they are
-            // `dst = mix(dst, blurred, k)`, which leaves a see-through window as clear as it was.
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::TriangleStrip,
                 0,
                 4,
-                backdrops.len(),
-                backdrops.start,
-            );
-        }
-        command_encoder.setRenderPipelineState(&self.backdrops_pipeline_state);
-        // SAFETY: The same bindings serve the second pipeline, which shares the backdrop shader's slots.
-        unsafe {
-            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::TriangleStrip,
+                quad_count,
                 0,
-                4,
-                backdrops.len(),
-                backdrops.start,
             );
         }
     }
@@ -1862,100 +1042,6 @@ impl MetalRenderer {
                 quads.start,
             );
         }
-    }
-
-    /// The pipeline of a custom shader, built the first time a frame draws it. `None` means it
-    /// failed to build, which is logged once and leaves its instances undrawn.
-    fn custom_pipeline_state(
-        &mut self,
-        shader: ShaderId,
-    ) -> Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-        if let Some(pipeline) = self.custom_pipeline_states.get(&shader) {
-            return pipeline.clone();
-        }
-        let pipeline =
-            build_custom_pipeline_state(&self.device, shader, MTLPixelFormat::BGRA8Unorm)
-                .inspect_err(|error| log::error!("{error:#}"))
-                .ok();
-        self.custom_pipeline_states.insert(shader, pipeline.clone());
-        pipeline
-    }
-
-    fn draw_custom_shaders(
-        &self,
-        pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
-        shaders: Range<usize>,
-        instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
-        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-    ) {
-        if shaders.is_empty() {
-            return;
-        }
-
-        // Quads blend straight alpha on Metal, so the prelude leaves its colour unpremultiplied.
-        let globals = CustomShaderGlobals {
-            viewport_size: [
-                i32::from(viewport_size.width) as f32,
-                i32::from(viewport_size.height) as f32,
-            ],
-            premultiplied_alpha: 0,
-            pad: 0,
-        };
-        let buffer = &instance_bindings.shaders;
-        // naga reads the length of the instance buffer from here, though nothing it emits for
-        // the prelude bounds checks against it.
-        let length = buffer.buffer.length().saturating_sub(buffer.offset) as u32;
-
-        command_encoder.setRenderPipelineState(pipeline);
-        let globals_size = mem::size_of::<CustomShaderGlobals>();
-        let globals_bytes = ptr::NonNull::from(&globals).cast();
-        let length_size = mem::size_of::<u32>();
-        let length_bytes = ptr::NonNull::from(&length).cast();
-        // SAFETY: The globals and length are copied from live values, and the instance range lies
-        // within the scene's shader instances at an aligned offset, all in the slots naga's MSL
-        // reads. Metal retains the buffer, and writer.finish publishes its writes.
-        unsafe {
-            command_encoder.setVertexBytes_length_atIndex(
-                globals_bytes,
-                globals_size,
-                gpui::MslShader::GLOBALS_BUFFER as usize,
-            );
-            command_encoder.setFragmentBytes_length_atIndex(
-                globals_bytes,
-                globals_size,
-                gpui::MslShader::GLOBALS_BUFFER as usize,
-            );
-            command_encoder.setVertexBytes_length_atIndex(
-                length_bytes,
-                length_size,
-                gpui::MslShader::SIZES_BUFFER as usize,
-            );
-            command_encoder.setFragmentBytes_length_atIndex(
-                length_bytes,
-                length_size,
-                gpui::MslShader::SIZES_BUFFER as usize,
-            );
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&buffer.buffer),
-                buffer.offset,
-                gpui::MslShader::INSTANCES_BUFFER as usize,
-            );
-            command_encoder.setFragmentBuffer_offset_atIndex(
-                Some(&buffer.buffer),
-                buffer.offset,
-                gpui::MslShader::INSTANCES_BUFFER as usize,
-            );
-            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::TriangleStrip,
-                0,
-                4,
-                shaders.len(),
-                shaders.start,
-            );
-        }
-        // The globals took the slot the viewport is bound at for the whole pass.
-        bind_viewport(command_encoder, viewport_size);
     }
 
     fn draw_underlines(
@@ -2198,97 +1284,12 @@ impl MetalRenderer {
     }
 }
 
-/// Layer filters can be switched off from the environment to tell a rendering problem from a
-/// compositing one.
-fn filters_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GPUI_FILTERS").as_deref() != Ok("0"))
-}
-
-/// Whether `outer` holds all of `inner`.
-fn covers(outer: Bounds<ScaledPixels>, inner: Bounds<ScaledPixels>) -> bool {
-    outer.origin.x <= inner.origin.x
-        && outer.origin.y <= inner.origin.y
-        && outer.bottom_right().x >= inner.bottom_right().x
-        && outer.bottom_right().y >= inner.bottom_right().y
-}
-
-/// The part of a layer's target that has to start transparent: its source area and, for a blurred
-/// layer, as far again as the blur reads past it, plus a pixel for the rounding of the scissor.
-fn layer_wipe(layer: LayerEffect) -> Bounds<ScaledPixels> {
-    let margin = match layer.filter.blurs() {
-        true => BlurPasses::for_sigma(layer.filter.blur).source_margin(),
-        false => ScaledPixels(0.),
-    };
-    layer.source_bounds.dilate(margin + ScaledPixels(1.))
-}
-
-/// Binds the viewport every primitive shader reads at `GlobalInputIndex::ViewportSize`. A pass
-/// starts without it, and the custom shader globals share its slot.
-fn bind_viewport(
-    encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-    viewport_size: Size<DevicePixels>,
-) {
-    // SAFETY: Metal copies the viewport bytes, which match every vertex shader's
-    // `GlobalInputIndex_ViewportSize` argument.
-    unsafe {
-        encoder.setVertexBytes_length_atIndex(
-            ptr::NonNull::from(&viewport_size).cast(),
-            mem::size_of_val(&viewport_size),
-            GlobalInputIndex::ViewportSize as usize,
-        );
-    }
-}
-
-/// A scissor over the whole target, for lifting one that was set for a single draw.
-fn whole_scissor(viewport_size: Size<DevicePixels>) -> MTLScissorRect {
-    MTLScissorRect {
-        x: 0,
-        y: 0,
-        width: i32::from(viewport_size.width).max(0) as usize,
-        height: i32::from(viewport_size.height).max(0) as usize,
-    }
-}
-
-/// Starts a render pass into `texture`. The pass descriptor retains the texture, so it may be a
-/// temporary the caller drops before the encoder ends.
-/// An encoder on `texture` that keeps nothing it held, for a pass that writes everything it later
-/// reads.
-fn new_discarding_command_encoder(
-    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-    texture: &ProtocolObject<dyn MTLTexture>,
-    viewport_size: Size<DevicePixels>,
-) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
-    let render_pass_descriptor = MTLRenderPassDescriptor::new();
-    // SAFETY: Index zero is within the render pass's color attachment array.
-    let color_attachment = unsafe {
-        render_pass_descriptor
-            .colorAttachments()
-            .objectAtIndexedSubscript(0)
-    };
-    color_attachment.setTexture(Some(texture));
-    color_attachment.setLoadAction(MTLLoadAction::DontCare);
-    color_attachment.setStoreAction(MTLStoreAction::Store);
-
-    let command_encoder = command_buffer
-        .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
-        .context("creating render command encoder")?;
-    command_encoder.setViewport(MTLViewport {
-        originX: 0.0,
-        originY: 0.0,
-        width: i32::from(viewport_size.width) as f64,
-        height: i32::from(viewport_size.height) as f64,
-        znear: 0.0,
-        zfar: 1.0,
-    });
-    Ok(command_encoder)
-}
-
 fn new_command_encoder_for_texture(
     command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     texture: &ProtocolObject<dyn MTLTexture>,
+    depth_texture: &ProtocolObject<dyn MTLTexture>,
     viewport_size: Size<DevicePixels>,
-    clear_color: Option<MTLClearColor>,
+    clear_color: MTLClearColor,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
     let render_pass_descriptor = MTLRenderPassDescriptor::new();
     // SAFETY: Index zero is within the render pass's color attachment array.
@@ -2299,12 +1300,15 @@ fn new_command_encoder_for_texture(
     };
     color_attachment.setTexture(Some(texture));
     color_attachment.setStoreAction(MTLStoreAction::Store);
-    if let Some(clear_color) = clear_color {
-        color_attachment.setLoadAction(MTLLoadAction::Clear);
-        color_attachment.setClearColor(clear_color);
-    } else {
-        color_attachment.setLoadAction(MTLLoadAction::Load);
-    }
+    color_attachment.setLoadAction(MTLLoadAction::Clear);
+    color_attachment.setClearColor(clear_color);
+
+    let depth_attachment = render_pass_descriptor.depthAttachment();
+    depth_attachment.setTexture(Some(depth_texture));
+    depth_attachment.setLoadAction(MTLLoadAction::Clear);
+    depth_attachment.setClearDepth(0.0);
+    // The depth buffer is only needed within this pass.
+    depth_attachment.setStoreAction(MTLStoreAction::DontCare);
 
     let command_encoder = command_buffer
         .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
@@ -2352,208 +1356,6 @@ fn read_texture_to_image(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Rgb
     RgbaImage::from_raw(width, height, pixels).context("creating RGBA image from pixel data")
 }
 
-/// An offscreen target created the first time a frame needs it and released once it has gone
-/// `IDLE_RELEASE` without use.
-struct Scratch {
-    texture: Retained<ProtocolObject<dyn MTLTexture>>,
-    used: Instant,
-}
-
-/// One of the offscreen targets filters draw through.
-#[derive(Clone, Copy)]
-enum FilterTarget {
-    /// The accumulated background of all open layers before a backdrop samples it.
-    Backdrop,
-    /// The frame itself, drawn offscreen so a backdrop can sample what lies under it.
-    Frame,
-    /// The target a filtered layer is drawn into, by nesting depth.
-    Layer(usize),
-    /// One blur level, the frame's size halved as many times as its index and rounded up, so the
-    /// last texel of a level can hang past the frame's edge. Level zero holds a finished blur.
-    Level(usize),
-    /// Where a gaussian keeps its pass across before the pass down.
-    Scratch,
-    /// Where the gaussian at the deepest level of a pyramid keeps its pass across, at that
-    /// level's size.
-    Spread(usize),
-}
-
-impl FilterTarget {
-    /// How many times smaller than the frame the target is on each side.
-    fn shrink(self) -> u32 {
-        match self {
-            Self::Level(level) | Self::Spread(level) => 1 << level,
-            Self::Frame | Self::Layer(_) | Self::Scratch | Self::Backdrop => 1,
-        }
-    }
-}
-
-/// Offscreen targets a frame needs to blur and mask what it has drawn, all made for one
-/// drawable size. Each one is allocated the first time a frame draws through it, so a frame
-/// with one shallow blur pays for the targets it touches rather than for every depth and level.
-#[derive(Default)]
-struct FilterTargets {
-    size: Size<DevicePixels>,
-    frame: Option<Scratch>,
-    backdrop: Option<Scratch>,
-    layers: [Option<Scratch>; LAYER_DEPTH],
-    levels: [Option<Scratch>; BLUR_LEVELS + 1],
-    spreads: [Option<Scratch>; BLUR_LEVELS + 1],
-    scratch: Option<Scratch>,
-}
-
-impl FilterTargets {
-    fn slot(&mut self, target: FilterTarget) -> &mut Option<Scratch> {
-        match target {
-            FilterTarget::Backdrop => &mut self.backdrop,
-            FilterTarget::Frame => &mut self.frame,
-            FilterTarget::Layer(depth) => &mut self.layers[depth],
-            FilterTarget::Level(level) => &mut self.levels[level],
-            FilterTarget::Scratch => &mut self.scratch,
-            FilterTarget::Spread(level) => &mut self.spreads[level],
-        }
-    }
-
-    fn slots(&mut self) -> impl Iterator<Item = &mut Option<Scratch>> {
-        std::iter::once(&mut self.frame)
-            .chain(std::iter::once(&mut self.backdrop))
-            .chain(self.layers.iter_mut())
-            .chain(self.levels.iter_mut())
-            .chain(self.spreads.iter_mut())
-            .chain(std::iter::once(&mut self.scratch))
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct BlurParams {
-    pub direction: [f32; 2],
-    /// How many texels of the texture the pass reads hold the frame. A blur level rounds its
-    /// size up, so its last texel can hang past the frame's edge.
-    pub extent: [f32; 2],
-    pub radius: f32,
-    pub pad: f32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct MaskParams {
-    pub source_bounds: Bounds<ScaledPixels>,
-    pub fade_bounds: Bounds<ScaledPixels>,
-    pub transform_origin: [f32; 2],
-    pub translation: [f32; 2],
-    pub scale: f32,
-    pub fade_top: f32,
-    pub fade_bottom: f32,
-    pub fade_left: f32,
-    pub fade_right: f32,
-    pub pad: f32,
-}
-
-const _: () = {
-    assert!(mem::size_of::<MaskParams>() == 18 * mem::size_of::<f32>());
-    assert!(mem::offset_of!(MaskParams, source_bounds) == 0);
-    assert!(mem::offset_of!(MaskParams, fade_bounds) == 16);
-    assert!(mem::offset_of!(MaskParams, transform_origin) == 32);
-    assert!(mem::offset_of!(MaskParams, translation) == 40);
-    assert!(mem::offset_of!(MaskParams, scale) == 48);
-    assert!(mem::offset_of!(MaskParams, fade_top) == 52);
-    assert!(mem::offset_of!(MaskParams, fade_bottom) == 56);
-    assert!(mem::offset_of!(MaskParams, fade_left) == 60);
-    assert!(mem::offset_of!(MaskParams, fade_right) == 64);
-    assert!(mem::offset_of!(MaskParams, pad) == 68);
-};
-
-#[repr(C)]
-pub enum FilterInputIndex {
-    Backdrops = 1,
-    ViewportSize = 2,
-    Params = 3,
-    Source = 4,
-}
-
-fn mask_params(layer: LayerEffect, destination_clip: Bounds<ScaledPixels>) -> MaskParams {
-    MaskParams {
-        source_bounds: if layer.filter.transforms() {
-            layer.source_bounds
-        } else {
-            destination_clip
-        },
-        // Preserve the existing Metal fade clip for unscaled layers. A scaled layer must apply
-        // the fade in source coordinates before the final transform.
-        fade_bounds: if layer.filter.transforms() {
-            layer.source_bounds
-        } else {
-            destination_clip
-        },
-        transform_origin: [layer.transform_origin.x.0, layer.transform_origin.y.0],
-        translation: [layer.filter.translate.x.0, layer.filter.translate.y.0],
-        scale: layer.filter.scale,
-        fade_top: layer.filter.fade_top,
-        fade_bottom: layer.filter.fade_bottom,
-        fade_left: layer.filter.fade_left,
-        fade_right: layer.filter.fade_right,
-        pad: 0.0,
-    }
-}
-
-/// How a filter pipeline lands on what it covers.
-#[derive(Clone, Copy, PartialEq)]
-enum FilterBlend {
-    /// Replaces the destination outright.
-    Replace,
-    /// Premultiplied source-over.
-    Over,
-    /// Adds itself to the destination, for the second half of a backdrop's mix.
-    Add,
-    /// Keeps `1 - src.a` of the destination and contributes nothing of its own, for the first
-    /// half of a backdrop's mix.
-    Punch,
-}
-
-fn build_filter_pipeline_state(
-    device: &ProtocolObject<dyn MTLDevice>,
-    library: &ProtocolObject<dyn MTLLibrary>,
-    label: &str,
-    vertex_fn_name: &str,
-    fragment_fn_name: &str,
-    pixel_format: MTLPixelFormat,
-    blend: FilterBlend,
-) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-    let vertex_fn = library
-        .newFunctionWithName(&NSString::from_str(vertex_fn_name))
-        .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
-    let fragment_fn = library
-        .newFunctionWithName(&NSString::from_str(fragment_fn_name))
-        .with_context(|| format!("locating fragment function {fragment_fn_name}"))?;
-
-    let descriptor = MTLRenderPipelineDescriptor::new();
-    descriptor.setLabel(Some(&NSString::from_str(label)));
-    descriptor.setVertexFunction(Some(vertex_fn.as_ref()));
-    descriptor.setFragmentFunction(Some(fragment_fn.as_ref()));
-    // SAFETY: Index zero is within the pipeline's color attachment array.
-    let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-    color_attachment.setPixelFormat(pixel_format);
-    color_attachment.setBlendingEnabled(blend != FilterBlend::Replace);
-    if let Some((source, destination)) = match blend {
-        FilterBlend::Replace => None,
-        FilterBlend::Over => Some((MTLBlendFactor::One, MTLBlendFactor::OneMinusSourceAlpha)),
-        FilterBlend::Add => Some((MTLBlendFactor::One, MTLBlendFactor::One)),
-        FilterBlend::Punch => Some((MTLBlendFactor::Zero, MTLBlendFactor::OneMinusSourceAlpha)),
-    } {
-        color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
-        color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
-        color_attachment.setSourceRGBBlendFactor(source);
-        color_attachment.setSourceAlphaBlendFactor(source);
-        color_attachment.setDestinationRGBBlendFactor(destination);
-        color_attachment.setDestinationAlphaBlendFactor(destination);
-    }
-
-    device
-        .newRenderPipelineStateWithDescriptor_error(&descriptor)
-        .with_context(|| format!("creating {label} render pipeline"))
-}
-
 fn build_pipeline_state(
     device: &ProtocolObject<dyn MTLDevice>,
     library: &ProtocolObject<dyn MTLLibrary>,
@@ -2561,6 +1363,7 @@ fn build_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: MTLPixelFormat,
+    blending: bool,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
     let vertex_fn = library
         .newFunctionWithName(&NSString::from_str(vertex_fn_name))
@@ -2576,74 +1379,30 @@ fn build_pipeline_state(
     // SAFETY: Index zero is within the pipeline's color attachment array.
     let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
     color_attachment.setPixelFormat(pixel_format);
-    color_attachment.setBlendingEnabled(true);
+    color_attachment.setBlendingEnabled(blending);
     color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
     color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
     color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
     color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
     color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
 
     device
         .newRenderPipelineStateWithDescriptor_error(&descriptor)
         .with_context(|| format!("creating {label} render pipeline"))
 }
 
-/// The globals the custom shader prelude reads, laid out as its `GpuiShaderGlobals`.
-#[repr(C)]
-struct CustomShaderGlobals {
-    viewport_size: [f32; 2],
-    premultiplied_alpha: u32,
-    pad: u32,
-}
-
-/// Translates a custom shader to MSL, compiles it and builds a pipeline that blends it the way
-/// quads are blended.
-fn build_custom_pipeline_state(
+fn build_depth_stencil_state(
     device: &ProtocolObject<dyn MTLDevice>,
-    shader: ShaderId,
-    pixel_format: MTLPixelFormat,
-) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-    let program = gpui::shader_program(shader)
-        .with_context(|| format!("custom shader {} was never registered", shader.0))?;
-    let msl = program.to_msl()?;
-    let library = device
-        .newLibraryWithSource_options_error(
-            &NSString::from_str(&msl.source),
-            Some(&MTLCompileOptions::new()),
-        )
-        .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))?;
-    let function = |name: &str| {
-        library
-            .newFunctionWithName(&NSString::from_str(name))
-            .with_context(|| {
-                format!(
-                    "custom shader `{}`: locating function {name}",
-                    program.label
-                )
-            })
-    };
-    let vertex_fn = function(&msl.vertex_entry)?;
-    let fragment_fn = function(&msl.fragment_entry)?;
-
-    let descriptor = MTLRenderPipelineDescriptor::new();
-    descriptor.setLabel(Some(&NSString::from_str(&program.label)));
-    descriptor.setVertexFunction(Some(vertex_fn.as_ref()));
-    descriptor.setFragmentFunction(Some(fragment_fn.as_ref()));
-    // SAFETY: Index zero is within the pipeline's color attachment array.
-    let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-    color_attachment.setPixelFormat(pixel_format);
-    color_attachment.setBlendingEnabled(true);
-    color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
-    color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
-    color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
-    color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
-    color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-
+    write_depth: bool,
+) -> Result<Retained<ProtocolObject<dyn MTLDepthStencilState>>> {
+    let descriptor = MTLDepthStencilDescriptor::new();
+    descriptor.setDepthCompareFunction(MTLCompareFunction::Greater);
+    descriptor.setDepthWriteEnabled(write_depth);
     device
-        .newRenderPipelineStateWithDescriptor_error(&descriptor)
-        .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))
+        .newDepthStencilStateWithDescriptor(&descriptor)
+        .context("creating depth stencil state")
 }
 
 #[derive(Clone)]
@@ -2653,9 +1412,7 @@ struct InstanceBinding {
 }
 
 struct InstanceBindings {
-    backdrops: InstanceBinding,
     quads: InstanceBinding,
-    shaders: InstanceBinding,
     path_tiles: InstanceBinding,
     path_curves: InstanceBinding,
     path_paints: InstanceBinding,
@@ -2674,9 +1431,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         path.append_to(&mut path_paints, &mut path_curves, &mut path_tiles);
     }
     Ok(InstanceBindings {
-        backdrops: writer.write(&scene.backdrops)?,
         quads: writer.write(&scene.quads)?,
-        shaders: writer.write(&scene.shaders)?,
         path_tiles: writer.write(&path_tiles)?,
         path_curves: writer.write(&path_curves)?,
         path_paints: writer.write(&path_paints)?,
@@ -2833,43 +1588,45 @@ impl InstanceBufferWriter {
 #[repr(C)]
 enum GlobalInputIndex {
     ViewportSize = 0,
+    DepthScale = 1,
 }
 
 #[repr(C)]
 enum ShadowInputIndex {
-    Shadows = 1,
+    Shadows = 2,
 }
 
 #[repr(C)]
 enum QuadInputIndex {
-    Quads = 1,
+    Quads = 2,
+    QuadCount = 3,
 }
 
 #[repr(C)]
 enum UnderlineInputIndex {
-    Underlines = 1,
+    Underlines = 2,
 }
 
 #[repr(C)]
 enum SpriteInputIndex {
-    Sprites = 1,
-    AtlasTextureSize = 2,
-    AtlasTexture = 3,
+    Sprites = 2,
+    AtlasTextureSize = 3,
+    AtlasTexture = 4,
 }
 
 #[repr(C)]
 enum SurfaceInputIndex {
-    Surfaces = 1,
-    TextureSize = 2,
-    YTexture = 3,
-    CbCrTexture = 4,
+    Surfaces = 2,
+    TextureSize = 3,
+    YTexture = 4,
+    CbCrTexture = 5,
 }
 
 #[repr(C)]
 enum PathTileInputIndex {
-    Tiles = 1,
-    Curves = 2,
-    Paints = 3,
+    Tiles = 2,
+    Curves = 3,
+    Paints = 4,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3082,18 +1839,4 @@ mod tests {
         assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(read_texture_to_image(&target_texture).unwrap(), image);
     }
-}
-
-#[cfg(test)]
-#[path = "../../gpui/src/backdrop_test_fixture.rs"]
-mod render_fixture;
-
-#[cfg(test)]
-#[test]
-fn render_fixture_cases() -> anyhow::Result<()> {
-    use gpui::PlatformHeadlessRenderer as _;
-    let mut renderer = MetalHeadlessRenderer::new()?;
-    render_fixture::run("", &[], |scene, size| {
-        renderer.render_scene_to_image(scene, size)
-    })
 }

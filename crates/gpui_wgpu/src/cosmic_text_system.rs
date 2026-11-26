@@ -424,7 +424,7 @@ impl CosmicTextSystemState {
                             let loaded =
                                 self.load_family(fallback_name, features, None, weight, true)?;
                             self.fallback_ids_by_family_cache
-                                .insert(fb_key.clone(), loaded.clone());
+                                .insert(fb_key, loaded.clone());
                             loaded
                         };
                     // a family can hold several static weights, so match the requested
