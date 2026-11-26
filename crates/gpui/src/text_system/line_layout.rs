@@ -462,7 +462,6 @@ pub struct WrapBoundary {
 
 impl WrappedLineLayout {
     /// The length of the underlying text, in utf8 bytes.
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.unwrapped_layout.len
     }
@@ -1500,5 +1499,23 @@ mod tests {
 
         assert_eq!(glyph_x_positions(&layout), vec![0., 0., 16.]);
         assert_eq!(layout.width, px(116.));
+    }
+
+    #[test]
+    fn test_wrap_ignores_the_sign_of_a_zero_wrap_width_in_the_cache() {
+        let runs = [FontRun {
+            len: 2,
+            font_id: FontId(1),
+            letter_spacing: LetterSpacing::default(),
+        }];
+
+        let cold_cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()), Arc::default());
+        let cold = cold_cache.layout_wrapped_line("ab", px(0.), &runs, Some(px(0.)), None);
+
+        let warm_cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()), Arc::default());
+        warm_cache.layout_wrapped_line("ab", px(0.), &runs, Some(-px(0.)), None);
+        let warm = warm_cache.layout_wrapped_line("ab", px(0.), &runs, Some(px(0.)), None);
+
+        assert_eq!(warm.wrap_boundaries, cold.wrap_boundaries);
     }
 }
