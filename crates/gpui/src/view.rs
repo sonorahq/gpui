@@ -4,7 +4,7 @@ use crate::{
     LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
     StyleRefinement, TextStyle, WeakEntity,
 };
-use crate::{Empty, Window};
+use crate::{Empty, Window, taffy::Unrounded};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
@@ -266,6 +266,8 @@ pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
+    /// The node the view took in its parent's layout, from [`Element::request_layout`].
+    layout_id: Option<LayoutId>,
     #[cfg(feature = "profiler")]
     view_type_name: &'static str,
     #[cfg(debug_assertions)]
@@ -288,6 +290,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            layout_id: None,
             #[cfg(feature = "profiler")]
             view_type_name,
             view: Some(view),
@@ -335,6 +338,9 @@ struct ViewElementCacheKey {
     /// What a rem is inside the view, which a parent can change without moving its bounds.
     rem_size: Pixels,
     opacity: f32,
+    /// Where the view sat in its parent's layout before rounding, which moves the edges inside it
+    /// without always moving its bounds.
+    unrounded: Option<Unrounded>,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -390,6 +396,7 @@ impl<V: View> Element for ViewElement<V> {
                 cx,
                 &mut |window, cx| render_view(view.take().unwrap(), window, cx),
             );
+            self.layout_id = Some(layout.0);
             #[cfg(feature = "profiler")]
             window.window_profiler.end_view(
                 start,
@@ -421,6 +428,8 @@ impl<V: View> Element for ViewElement<V> {
             let prepainted = prepaint_view(
                 entity_id,
                 global_id,
+                self.layout_id
+                    .expect("a view requests its layout before it prepaints"),
                 bounds,
                 element,
                 window,
@@ -528,6 +537,7 @@ fn request_layout_component(
 fn prepaint_view(
     entity_id: EntityId,
     global_id: Option<&GlobalElementId>,
+    layout_id: LayoutId,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
     window: &mut Window,
@@ -549,6 +559,7 @@ fn prepaint_view(
                 let text_style = window.text_style();
                 let rem_size = window.rem_size();
                 let opacity = window.element_opacity();
+                let unrounded = window.layout_unrounded(layout_id);
                 let last_frame = |frame: u64| frame + 1 == window.drawn_frames;
 
                 // A replay does not restore the accessibility nodes the view's elements push
@@ -561,6 +572,7 @@ fn prepaint_view(
                     && element_state.cache_key.text_style == text_style
                     && element_state.cache_key.rem_size == rem_size
                     && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
+                    && element_state.cache_key.unrounded == unrounded
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                     && !window.a11y.is_active()
@@ -587,8 +599,13 @@ fn prepaint_view(
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
+                    // Laid out in place of the view's own node, the subtree rounds every edge
+                    // where it would round drawn inline. Its layout then already holds the
+                    // node's place, so it is offset only as far as the parent was.
+                    let root = element.request_layout(window, cx);
+                    window.stand_in(root, layout_id);
                     element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
-                    element.prepaint_at(bounds.origin, window, cx);
+                    element.prepaint_at(window.element_offset(), window, cx);
                     element
                 });
 
@@ -608,6 +625,7 @@ fn prepaint_view(
                             text_style,
                             rem_size,
                             opacity,
+                            unrounded,
                         },
                     },
                 )
@@ -695,8 +713,9 @@ fn paint_component(
 mod tests {
     use super::*;
     use crate::{
-        AppContext as _, Hsla, InspectorElementId, ParentElement as _, Styled as _, TestAppContext,
-        WindowHandle, blue, div, green, px, red, rems, size, util::FluentBuilder as _,
+        AnyWindowHandle, AppContext as _, Hsla, InspectorElementId, ParentElement as _,
+        Styled as _, TestAppContext, WindowHandle, blue, div, green, px, red, relative, rems, size,
+        util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -988,5 +1007,332 @@ mod tests {
         let resized = drawn.shown(cx);
         assert_ne!(resized, shown, "a rem wide box inside the pane grows");
         assert_eq!(resized, drawn.refreshed(cx));
+    }
+
+    /// Four quads on a four-track grid, whose fractional track edges round differently by
+    /// where the grid starts, and a bar standing out 4 px to the left of it, whose edges round
+    /// on the other side of zero. Off the grid it keeps every edge where layout put it, shifted
+    /// as one by what the nearest box spanning whole pixels around it needs.
+    struct Tracks {
+        off_grid: bool,
+        renders: usize,
+    }
+
+    impl Render for Tracks {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            div()
+                .size_full()
+                .when(self.off_grid, |this| this.pixel_snap(false))
+                .grid()
+                .grid_cols(4)
+                .gap(px(10.))
+                .children([red(), green(), blue(), red()].map(|color| div().h_full().bg(color)))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(-4.))
+                        .w(px(2.))
+                        .h_full()
+                        .bg(green()),
+                )
+        }
+    }
+
+    /// A 301 px column holding the tracks inline or cached, `lead` of the window's width from
+    /// its left edge, or centred while there is none. Tracks off the grid get a column 300.5 px
+    /// wide, which spans no whole number of pixels.
+    struct Column {
+        tracks: Entity<Tracks>,
+        cached: bool,
+        lead: Option<f32>,
+        off_grid: bool,
+    }
+
+    impl Render for Column {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let tracks = match self.cached {
+                true => self
+                    .tracks
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                false => self.tracks.clone().into_any_element(),
+            };
+            div()
+                .size_full()
+                .flex()
+                .when_none(&self.lead, |this| this.justify_center())
+                .when_some(self.lead, |this, lead| {
+                    this.child(div().flex_none().w(relative(lead)))
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .map(|this| match self.off_grid {
+                            true => this.w(relative(0.3005)),
+                            false => this.w(px(301.)),
+                        })
+                        .h(px(20.))
+                        .child(tracks),
+                )
+        }
+    }
+
+    /// A window at scale 1 showing a [`Column`].
+    fn column(
+        cached: bool,
+        lead: Option<f32>,
+        off_grid: bool,
+        cx: &mut TestAppContext,
+    ) -> WindowHandle<Column> {
+        let window = cx.open_window(size(px(1000.), px(20.)), |_, cx| Column {
+            tracks: cx.new(|_| Tracks {
+                off_grid,
+                renders: 0,
+            }),
+            cached,
+            lead,
+            off_grid,
+        });
+        cx.simulate_window_scale_factor_change(window.into(), 1.);
+        window
+    }
+
+    /// Where every quad of a frame drawn now lands, and in what colour.
+    fn painted(window: AnyWindowHandle, cx: &mut TestAppContext) -> Vec<String> {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .map(|quad| format!("{:?} {:?}", quad.bounds, quad.background))
+                .collect()
+        })
+        .expect("the window is open")
+    }
+
+    #[crate::test]
+    fn a_cached_view_rounds_its_edges_where_it_would_inline(cx: &mut TestAppContext) {
+        for off_grid in [false, true] {
+            let inline = column(false, None, off_grid, cx);
+            let cached = column(true, None, off_grid, cx);
+            for scale_factor in [1., 1.25, 2.] {
+                for window in [inline, cached] {
+                    cx.simulate_window_scale_factor_change(window.into(), scale_factor);
+                }
+                assert_eq!(
+                    painted(cached.into(), cx),
+                    painted(inline.into(), cx),
+                    "a column centred off the grid at scale {scale_factor}, tracks off the grid: \
+                     {off_grid}"
+                );
+            }
+        }
+    }
+
+    #[crate::test]
+    fn a_cached_view_moved_less_than_a_pixel_renders(cx: &mut TestAppContext) {
+        let window = column(true, Some(0.0001), false, cx);
+        let root = window.root(cx).expect("the window has a root");
+        let tracks = root.read_with(cx, |column, _| column.tracks.clone());
+        let renders = |cx: &mut TestAppContext| tracks.read_with(cx, |tracks, _| tracks.renders);
+        painted(window.into(), cx);
+        let before = renders(cx);
+
+        // From 0.1 to 0.35 px the column keeps its rounded bounds, while the last track's
+        // start, 233.25 px into it, crosses a half pixel.
+        root.update(cx, |column, cx| {
+            column.lead = Some(0.00035);
+            cx.notify();
+        });
+        let shown = painted(window.into(), cx);
+        assert_eq!(renders(cx), before + 1);
+
+        let inline = column(false, Some(0.00035), false, cx);
+        assert_eq!(shown, painted(inline.into(), cx));
+    }
+
+    /// Two rows in a uniform list, which lays one row out as a root while it requests its layout.
+    struct Rows;
+
+    impl Render for Rows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                crate::uniform_list("rows", 2, |range, _, _| {
+                    range
+                        .map(|_| div().w_full().h(px(5.)).bg(red()))
+                        .collect::<Vec<_>>()
+                })
+                .size_full(),
+            )
+        }
+    }
+
+    /// A box `width` wide and 20 px tall holding `content` inline or cached, behind a spacer
+    /// `lead` wide, or centred while there is none. Off the grid the box is 30.05 percent of the
+    /// window wide and keeps its fractional edges.
+    struct Slot<V: 'static> {
+        content: Entity<V>,
+        cached: bool,
+        lead: Option<Pixels>,
+        width: Pixels,
+        off_grid: bool,
+    }
+
+    impl<V: Render> Render for Slot<V> {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let content = match self.cached {
+                true => self
+                    .content
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                false => self.content.clone().into_any_element(),
+            };
+            div()
+                .size_full()
+                .flex()
+                .when_none(&self.lead, |this| this.justify_center())
+                .when_some(self.lead, |this, lead| {
+                    this.child(div().flex_none().w(lead))
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .when(self.off_grid, |this| {
+                            this.pixel_snap(false).w(relative(0.3005))
+                        })
+                        .when(!self.off_grid, |this| this.w(self.width))
+                        .h(px(20.))
+                        .child(content),
+                )
+        }
+    }
+
+    /// A view that fills its box with one quad.
+    struct Fill;
+
+    impl Render for Fill {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().bg(red())
+        }
+    }
+
+    /// A view whose root element is another view, cached or inline.
+    struct Wrapper {
+        inner: Entity<Tracks>,
+        cached: bool,
+    }
+
+    impl Render for Wrapper {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            match self.cached {
+                true => self
+                    .inner
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                false => self.inner.clone().into_any_element(),
+            }
+        }
+    }
+
+    #[crate::test]
+    fn a_cached_view_holding_a_uniform_list_paints_where_it_would_inline(cx: &mut TestAppContext) {
+        let open = |cached: bool, cx: &mut TestAppContext| {
+            let window = cx.open_window(size(px(1000.), px(20.)), |_, cx| Slot {
+                content: cx.new(|_| Rows),
+                cached,
+                lead: Some(px(250.)),
+                width: px(300.),
+                off_grid: false,
+            });
+            cx.simulate_window_scale_factor_change(window.into(), 1.);
+            window
+        };
+        let inline = open(false, cx);
+        let cached = open(true, cx);
+        assert_eq!(painted(cached.into(), cx), painted(inline.into(), cx));
+    }
+
+    #[crate::test]
+    fn a_cached_view_at_scale_1_1_is_as_wide_as_inline(cx: &mut TestAppContext) {
+        let open = |cached: bool, cx: &mut TestAppContext| {
+            let window = cx.open_window(size(px(800.), px(20.)), |_, cx| Slot {
+                content: cx.new(|_| Fill),
+                cached,
+                lead: None,
+                width: px(525.),
+                off_grid: false,
+            });
+            cx.simulate_window_scale_factor_change(window.into(), 1.1);
+            window
+        };
+        let inline = open(false, cx);
+        let cached = open(true, cx);
+        let mut differing = Vec::new();
+        for width in 100..700 {
+            for window in [inline, cached] {
+                window
+                    .update(cx, |slot, _, cx| {
+                        slot.width = px(width as f32);
+                        cx.notify();
+                    })
+                    .unwrap();
+            }
+            let (cached, inline) = (painted(cached.into(), cx), painted(inline.into(), cx));
+            if cached != inline {
+                differing.push((width, cached, inline));
+            }
+        }
+        assert!(
+            differing.is_empty(),
+            "{} of 600 widths differ, first: {:?}",
+            differing.len(),
+            differing.first()
+        );
+    }
+
+    #[crate::test]
+    fn a_cached_view_inside_a_cached_view_keeps_its_shift_off_the_grid(cx: &mut TestAppContext) {
+        let open = |outer: bool, inner: bool, cx: &mut TestAppContext| {
+            let window = cx.open_window(size(px(1000.), px(20.)), |_, cx| {
+                let tracks = cx.new(|_| Tracks {
+                    off_grid: false,
+                    renders: 0,
+                });
+                Slot {
+                    content: cx.new(|_| Wrapper {
+                        inner: tracks,
+                        cached: inner,
+                    }),
+                    cached: outer,
+                    lead: Some(px(100.25)),
+                    width: px(300.),
+                    off_grid: true,
+                }
+            });
+            cx.simulate_window_scale_factor_change(window.into(), 1.);
+            window
+        };
+        let inline = painted(open(false, false, cx).into(), cx);
+        assert_eq!(
+            painted(open(true, false, cx).into(), cx),
+            inline,
+            "outer cached"
+        );
+        assert_eq!(
+            painted(open(false, true, cx).into(), cx),
+            inline,
+            "inner cached"
+        );
+        assert_eq!(
+            painted(open(true, true, cx).into(), cx),
+            inline,
+            "both cached"
+        );
     }
 }

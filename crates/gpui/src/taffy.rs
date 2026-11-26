@@ -113,6 +113,10 @@ pub struct TaffyLayoutEngine {
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
+    /// For a root laid out in place of a node of another tree, that node. The root is placed as
+    /// its only child, filling its unrounded box, so its subtree rounds every edge where it
+    /// would round inline.
+    stand_ins: FxHashMap<LayoutId, LayoutId>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
     /// The nodes whose style chose on or off the device pixel grid along an axis, `false` for
@@ -144,6 +148,7 @@ impl TaffyLayoutEngine {
             writes: 0,
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
+            stand_ins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
             pixel_snap: FxHashMap::default(),
@@ -158,6 +163,7 @@ impl TaffyLayoutEngine {
         }
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
+        self.stand_ins.clear();
         self.computed_layouts.clear();
         self.pixel_snap.clear();
         self.grid_shifts.clear();
@@ -603,6 +609,12 @@ impl TaffyLayoutEngine {
             transform(available_space.width),
             transform(available_space.height),
         );
+        // A root standing in for a node fills the box that node has before rounding.
+        let available_space = match self.stand_ins.get(&id) {
+            Some(node) => Size::from(self.taffy.layout(node.0).expect(EXPECT_MESSAGE).size)
+                .map(|length: f32| AvailableSpace::Definite(Pixels(length))),
+            None => available_space,
+        };
 
         self.taffy
             .compute_layout_with_measure(
@@ -750,6 +762,7 @@ impl TaffyLayoutEngine {
         let layout_location = layout.location;
         let layout_size = layout.size;
         let parent = self.taffy.parent(id.0);
+        let parent = parent.or_else(|| self.stand_ins.get(&id).map(|node| node.0));
 
         let absolute_outer_origin = match parent {
             Some(parent_id) => {
@@ -806,6 +819,30 @@ impl TaffyLayoutEngine {
         bounds
     }
 
+    /// Lays `root` out in place of `node`, a node of another tree laid out this frame. Call it
+    /// before [`Self::compute_layout`] computes `root`.
+    pub(crate) fn stand_in(&mut self, root: LayoutId, node: LayoutId) {
+        self.stand_ins.insert(root, node);
+    }
+
+    /// Where a node was placed before rounding. `None` before [`Self::layout_bounds`] has placed
+    /// it this frame.
+    pub(crate) fn unrounded(&self, id: LayoutId) -> Option<Unrounded> {
+        Some(Unrounded {
+            origin: *self.absolute_outer_origins.get(&id)?,
+            size: Size::from(self.taffy.layout(id.into()).ok()?.size),
+            shift: self.grid_shifts.get(&id).copied().unwrap_or_default(),
+        })
+    }
+
+    /// The node above `id`: its parent, or for a root standing in for another node, that node.
+    fn above(&self, id: LayoutId) -> Option<LayoutId> {
+        match self.taffy.parent(id.0) {
+            Some(parent) => Some(LayoutId::from(parent)),
+            None => self.stand_ins.get(&id).copied(),
+        }
+    }
+
     /// How far the subtree rooted at `id` shifts as one to land on the device pixel grid. Each
     /// axis takes the shift from the nearest box, from `id` outwards, whose edges both land on
     /// the grid under one shift along it. The origins of `id` and its ancestors must already be
@@ -825,7 +862,7 @@ impl TaffyLayoutEngine {
             if y.is_none() && spans_whole(origin.y, size.height) {
                 y = Some(residual(origin.y));
             }
-            node = self.taffy.parent(at.into()).map(LayoutId::from);
+            node = self.above(at);
         }
         let origin = self.absolute_outer_origins[&id];
         Point {
@@ -856,6 +893,18 @@ fn axis_snap(style: &Style) -> Point<Option<bool>> {
 /// it keeps the grid both ways. `snapping` is what the subtree it sits in does.
 fn grid_snap(snap: Point<Option<bool>>, snapping: bool) -> bool {
     snap.x.unwrap_or(snapping) && snap.y.unwrap_or(snapping)
+}
+
+/// Where a node sits in its layout before its edges round to the device pixel grid, which decides
+/// where the edges of a root laid out in its place land.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Unrounded {
+    /// The origin in device pixels from the outermost root above the node, through any stand-ins.
+    pub(crate) origin: Point<f32>,
+    /// The size in device pixels.
+    pub(crate) size: Size<f32>,
+    /// How far the node and its subtree are shifted off the grid along each axis.
+    pub(crate) shift: Point<Option<f32>>,
 }
 
 /// A unique identifier for a layout node, generated when requesting a layout from Taffy
