@@ -3575,17 +3575,23 @@ pub struct WgpuHeadlessRenderer {
 ))]
 impl WgpuHeadlessRenderer {
     pub fn new() -> anyhow::Result<Self> {
+        Self::with_alpha_mode(wgpu::CompositeAlphaMode::Opaque)
+    }
+
+    /// A renderer that draws as it would for a surface compositing premultiplied colours, the
+    /// mode a transparent window takes, so tests can cover both of the shaders' alpha paths.
+    #[cfg(test)]
+    fn new_premultiplied() -> anyhow::Result<Self> {
+        Self::with_alpha_mode(wgpu::CompositeAlphaMode::PreMultiplied)
+    }
+
+    fn with_alpha_mode(alpha_mode: wgpu::CompositeAlphaMode) -> anyhow::Result<Self> {
         let (context, target_format) = WgpuContext::new_headless()?;
         // The device may be shared with earlier renderers; observe only errors raised from
         // here on, including any while this renderer builds its pipelines.
         let observed_error_generation = context.errors().current_generation();
         let atlas = Arc::new(WgpuAtlas::from_context(&context));
-        let core = WgpuRendererCore::new(
-            &context,
-            atlas,
-            target_format,
-            wgpu::CompositeAlphaMode::Opaque,
-        );
+        let core = WgpuRendererCore::new(&context, atlas, target_format, alpha_mode);
 
         Ok(Self {
             context,
@@ -4080,13 +4086,10 @@ mod tests {
             ),
         };
 
-        for alpha_mode in [
-            wgpu::CompositeAlphaMode::Opaque,
-            wgpu::CompositeAlphaMode::PreMultiplied,
+        for mut renderer in [
+            WgpuHeadlessRenderer::new()?,
+            WgpuHeadlessRenderer::new_premultiplied()?,
         ] {
-            let mut renderer = WgpuHeadlessRenderer::new()?;
-            let format = renderer.core.target_format;
-            renderer.core.rebuild_pipelines(format, alpha_mode);
             let mut scene = Scene::default();
             scene.insert_primitive(solid_quad(0.0, 0.0, 64.0, 32.0, gpui::blue()));
             scene.insert_primitive(gpui::PaintedPath::new(
@@ -4384,24 +4387,18 @@ mod tests {
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../../gpui/src/backdrop_test_fixture.rs"]
-mod backdrop_fixture;
+mod render_fixture;
 
 #[cfg(all(test, target_os = "linux"))]
 #[test]
-fn nested_backdrops_sample_ancestor_layers() -> anyhow::Result<()> {
+fn render_fixture_cases() -> anyhow::Result<()> {
     use gpui::PlatformHeadlessRenderer as _;
     let mut renderer = crate::WgpuHeadlessRenderer::new()?;
-    for blur in [3., 12.] {
-        for depth in [0, 1, 2] {
-            for inside in [false, true] {
-                let scene = backdrop_fixture::scene(depth, blur, inside);
-                let image = renderer.render_scene_to_image(
-                    &scene,
-                    gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)),
-                )?;
-                backdrop_fixture::check(&image);
-            }
-        }
-    }
-    Ok(())
+    render_fixture::run("", &[], |scene, size| {
+        renderer.render_scene_to_image(scene, size)
+    })?;
+    let mut renderer = crate::WgpuHeadlessRenderer::new_premultiplied()?;
+    render_fixture::run(".premultiplied", &[], |scene, size| {
+        renderer.render_scene_to_image(scene, size)
+    })
 }
