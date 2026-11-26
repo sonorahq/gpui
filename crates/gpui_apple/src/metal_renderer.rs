@@ -3549,24 +3549,14 @@ mod tests {
 
 #[cfg(test)]
 #[path = "../../gpui/src/backdrop_test_fixture.rs"]
-mod backdrop_fixture;
+mod render_fixture;
 
 #[cfg(test)]
 #[test]
-fn nested_backdrops_sample_ancestor_layers() -> anyhow::Result<()> {
+fn render_fixture_cases() -> anyhow::Result<()> {
     use gpui::PlatformHeadlessRenderer as _;
     let mut renderer = MetalHeadlessRenderer::new()?;
-    for blur in [3., 12.] {
-        for depth in [0, 1, 2] {
-            for inside in [false, true] {
-                let scene = backdrop_fixture::scene(depth, blur, inside);
-                let image = renderer.render_scene_to_image(
-                    &scene,
-                    gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)),
-                )?;
-                backdrop_fixture::check(&image);
-            }
-        }
-    }
-    Ok(())
+    render_fixture::run("", |scene, size| {
+        renderer.render_scene_to_image(scene, size)
+    })
 }
