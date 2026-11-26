@@ -619,7 +619,7 @@ mod tests {
         assert_eq!(lines[1], "1%   99.0 MS");
         assert_eq!(lines[2], "10%  90.0 MS");
         assert_eq!(lines[3], "MAX 100.0 MS");
-        assert_eq!(lines[4], "FRAMES   100");
+        assert_eq!(lines.last().unwrap(), "FRAMES   100");
     }
 
     #[test]
@@ -633,11 +633,11 @@ mod tests {
         let lines = overlay.lines();
         assert_eq!(lines[0], "CUR    -- MS");
         assert_eq!(lines[3], "MAX    -- MS");
-        assert_eq!(lines[4], "FRAMES    10");
+        assert_eq!(lines.last().unwrap(), "FRAMES    10");
         overlay.record_frame(Duration::from_millis(20));
         let lines = overlay.lines();
         assert_eq!(lines[0], "CUR  20.0 MS");
-        assert_eq!(lines[4], "FRAMES    11");
+        assert_eq!(lines.last().unwrap(), "FRAMES    11");
     }
 
     #[test]
@@ -650,11 +650,11 @@ mod tests {
         assert_eq!(overlay.lines(), vec![" 10.0 MS".to_string()]);
         overlay.set_mode(DebugFrameOverlayMode::Full);
         overlay.record_frame(Duration::from_millis(10));
-        assert_eq!(overlay.lines()[4], "FRAMES     4");
+        assert_eq!(overlay.lines().last().unwrap(), "FRAMES     4");
         overlay.set_mode(DebugFrameOverlayMode::Hidden);
         overlay.record_frame(Duration::from_millis(10));
         overlay.set_mode(DebugFrameOverlayMode::Full);
-        assert_eq!(overlay.lines()[4], "FRAMES     5");
+        assert_eq!(overlay.lines().last().unwrap(), "FRAMES     5");
     }
 
     #[test]
@@ -662,11 +662,11 @@ mod tests {
         let mut overlay = DebugFrameOverlay::new();
         overlay.set_mode(DebugFrameOverlayMode::Full);
         overlay.record_frame(Duration::from_millis(10));
-        assert_eq!(overlay.lines()[4], "FRAMES     1");
+        assert_eq!(overlay.lines().last().unwrap(), "FRAMES     1");
         overlay.total_frame_count = 99_999;
-        assert_eq!(overlay.lines()[4], "FRAMES 99999");
+        assert_eq!(overlay.lines().last().unwrap(), "FRAMES 99999");
         overlay.total_frame_count = 100_000;
-        assert_eq!(overlay.lines()[4], "FRAMES  LOTS");
+        assert_eq!(overlay.lines().last().unwrap(), "FRAMES  LOTS");
     }
 
     #[test]

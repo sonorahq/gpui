@@ -139,6 +139,7 @@ pub struct WaylandWindowState {
     /// Set from a commit that asked for a frame callback until that callback fires. A frame
     /// drawn in that interval is held and presented on the callback.
     awaiting_frame_callback: bool,
+    last_present_timing: Option<(Instant, Instant)>,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -554,7 +555,6 @@ pub struct WaylandWindowStatePtr {
     callbacks: Rc<RefCell<Callbacks>>,
     frame_loop: Rc<Cell<FrameLoop>>,
     frame_ping: Ping,
-    scheduled_frame_at: Rc<Cell<Option<Instant>>>,
 }
 
 impl WaylandWindowState {
@@ -644,6 +644,7 @@ impl WaylandWindowState {
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
             awaiting_frame_callback: false,
+            last_present_timing: None,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -664,7 +665,11 @@ impl WaylandWindowState {
             self.pending_frame_callback =
                 Some(self.surface.frame(&self.globals.qh, self.surface.id()));
         }
-        self.awaiting_frame_callback |= renderer.present_held();
+        let present_start = PlatformFrameSignal::capture(Instant::now);
+        if renderer.present_held() {
+            self.awaiting_frame_callback = true;
+            self.last_present_timing = present_start.map(|start| (start, Instant::now()));
+        }
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -920,7 +925,6 @@ impl WaylandWindow {
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             frame_loop: Rc::new(Cell::new(FrameLoop::Unconfigured)),
             frame_ping,
-            scheduled_frame_at: Rc::new(Cell::new(None)),
         });
 
         // Kick things off
@@ -1086,8 +1090,12 @@ impl WaylandWindowStatePtr {
             self.frame_loop.get(),
             FrameLoop::Scheduled | FrameLoop::DrawAhead
         ) {
+            // Stamped when the frame turn starts rather than when it was
+            // scheduled, as display-driven signals are on other platforms:
+            // input dispatched before then isn't the frame's work. The wait
+            // from the first invalidation is journaled as the pending frame.
             self.frame(
-                self.scheduled_frame_at.take(),
+                PlatformFrameSignal::capture(Instant::now),
                 FrameRequestSource::LocalSchedule,
             );
         }
@@ -1110,8 +1118,6 @@ impl WaylandWindowStatePtr {
         match self.frame_loop.get() {
             FrameLoop::Parked => {
                 self.frame_loop.set(FrameLoop::Scheduled);
-                self.scheduled_frame_at
-                    .set(PlatformFrameSignal::capture(Instant::now));
                 self.frame_ping.ping();
             }
             FrameLoop::Ticking => {
@@ -2177,7 +2183,11 @@ impl PlatformWindow for WaylandWindow {
                     let callback = state.surface.frame(&state.globals.qh, state.surface.id());
                     state.pending_frame_callback = Some(callback);
                 }
+                let present_start = PlatformFrameSignal::capture(Instant::now);
                 let presented = renderer.draw(scene);
+                if presented {
+                    state.last_present_timing = present_start.map(|start| (start, Instant::now()));
+                }
                 state.awaiting_frame_callback |= presented;
                 presented
             }
@@ -2193,6 +2203,10 @@ impl PlatformWindow for WaylandWindow {
         if renderer.needs_redraw() {
             state.redraw_requested = true;
         }
+    }
+
+    fn take_present_timing(&self, _draw_start: Option<Instant>) -> Option<(Instant, Instant)> {
+        self.borrow_mut().last_present_timing.take()
     }
 
     fn schedule_frame(&self) {
