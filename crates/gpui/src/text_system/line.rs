@@ -76,7 +76,6 @@ impl ShapedLine {
     }
 
     /// The length of the line in utf-8 bytes.
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.layout.len
     }
@@ -459,7 +458,6 @@ pub struct WrappedLine {
 
 impl WrappedLine {
     /// The length of the underlying, unwrapped layout, in utf-8 bytes.
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.layout.len()
     }

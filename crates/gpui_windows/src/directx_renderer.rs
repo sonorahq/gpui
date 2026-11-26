@@ -1299,6 +1299,8 @@ impl DirectXRenderer {
                     Ok(())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Native views are only composited on macOS.
+                PrimitiveBatch::NativeViews(_) => Ok(()),
             }
             .with_context(|| {
                 format!(

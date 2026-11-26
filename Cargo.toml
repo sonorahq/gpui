@@ -567,6 +567,10 @@ features = [
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }
 
+[workspace.lints.cargo]
+unused_dependencies = "allow"
+unused_workspace_dependencies = "allow"
+
 [workspace.lints.clippy]
 dbg_macro = "deny"
 todo = "deny"

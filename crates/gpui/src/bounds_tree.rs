@@ -162,7 +162,7 @@ where
             // Its kind sorts last, so nothing shares the ordering the layer ends at.
             let key = Key {
                 ordering: end,
-                kind: PrimitiveKind::Surface,
+                kind: PrimitiveKind::NativeView,
             };
             let leaf = self.insert_leaf(footprint, key);
             self.max_leaf = Some(leaf);
