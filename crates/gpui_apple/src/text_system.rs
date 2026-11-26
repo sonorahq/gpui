@@ -882,6 +882,7 @@ mod tests {
                 &[FontRun {
                     font_id,
                     len: text.len(),
+                    letter_spacing: Default::default(),
                 }],
             );
             assert_eq!(f32::from(layout.width), width, "{size} px");
@@ -894,10 +895,12 @@ mod tests {
                     FontRun {
                         font_id,
                         len: bom.len(),
+                        letter_spacing: Default::default(),
                     },
                     FontRun {
                         font_id,
                         len: text.len(),
+                        letter_spacing: Default::default(),
                     },
                 ],
             );
@@ -918,7 +921,11 @@ mod tests {
         let glyphs = |text: &str, runs: &[(FontId, usize)]| -> Vec<GlyphId> {
             let runs = runs
                 .iter()
-                .map(|&(font_id, len)| FontRun { font_id, len })
+                .map(|&(font_id, len)| FontRun {
+                    font_id,
+                    len,
+                    letter_spacing: Default::default(),
+                })
                 .collect::<Vec<_>>();
             fonts
                 .layout_line(text, px(16.), &runs)

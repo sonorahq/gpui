@@ -11597,6 +11597,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn filled_rounded_quad_is_one_scene_quad(cx: &mut TestAppContext) {
+        struct Card;
+
+        impl Render for Card {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size(px(100.))
+                    .rounded(px(12.))
+                    .bg(crate::rgb(0xff0000))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Card);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let side = ScaledPixels(100. * window.scale_factor());
+            let quads = window.painted_quads();
+            assert_eq!(quads.len(), 1, "{quads:#?}");
+            assert_eq!(
+                quads[0].bounds,
+                Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), size(side, side))
+            );
+        })
+        .expect("draw window");
+    }
+
+    #[gpui::test]
     fn cached_view_follows_inherited_opacity(cx: &mut TestAppContext) {
         struct Child {
             renders: usize,

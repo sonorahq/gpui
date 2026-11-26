@@ -3583,18 +3583,18 @@ fn level_size(viewport: &D3D11_VIEWPORT, shrink: u32) -> (u32, u32) {
 
 #[cfg(test)]
 #[path = "../../gpui/src/backdrop_test_fixture.rs"]
-mod backdrop_fixture;
+mod render_fixture;
 
 #[cfg(test)]
 #[::core::prelude::v1::test]
-fn nested_backdrops_sample_ancestor_layers() -> anyhow::Result<()> {
+fn render_fixture_cases() -> anyhow::Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::core::w;
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
-            w!("backdrop regression"),
+            w!("render fixture"),
             WS_POPUP,
             0,
             0,
@@ -3609,18 +3609,12 @@ fn nested_backdrops_sample_ancestor_layers() -> anyhow::Result<()> {
     let result = (|| {
         let devices = DirectXDevices::new()?;
         let mut renderer = DirectXRenderer::new(hwnd, &devices, true)?;
-        renderer.resize(size(DevicePixels(64), DevicePixels(64)))?;
-        for blur in [3., 12.] {
-            for depth in [0, 1, 2] {
-                for inside in [false, true] {
-                    let scene = backdrop_fixture::scene(depth, blur, inside);
-                    let image =
-                        renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
-                    backdrop_fixture::check(&image);
-                }
-            }
-        }
-        Ok(())
+        // The DirectX renderer ignores `Scene::overscan`, so a backdrop at the right or bottom
+        // edge blurs only what lies inside the window.
+        render_fixture::run("", &["overscan"], |scene, size| {
+            renderer.resize(size)?;
+            renderer.render_to_image(scene, WindowBackgroundAppearance::Opaque)
+        })
     })();
     unsafe {
         DestroyWindow(hwnd)?;
