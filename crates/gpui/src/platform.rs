@@ -1429,6 +1429,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Takes a presentation's start and end timestamps. Synchronous backends use the draw
+    /// start, while backends that hold a frame return its timestamps only after presenting it.
+    fn take_present_timing(&self, draw_start: Option<Instant>) -> Option<(Instant, Instant)> {
+        draw_start.map(|start| (start, Instant::now()))
+    }
     fn schedule_frame(&self) {}
     /// Whether presenting an unchanged frame keeps the display at its full refresh rate, so the
     /// window goes on presenting for a moment after high-rate input. A compositor that only

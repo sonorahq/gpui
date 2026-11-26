@@ -1184,6 +1184,17 @@ enum WindowActivity {
     },
 }
 
+/// Draw and input samples for a submitted frame that has yet to present.
+#[cfg(feature = "profiler")]
+pub(crate) struct PendingPresent {
+    frame: Option<FrameTiming>,
+    first_input_at: Option<Instant>,
+    input_count: u64,
+    throttled: bool,
+    next_frame_scheduled: bool,
+    scene_animating: bool,
+}
+
 /// Collects profiling information for one window.
 ///
 /// Aggregate histograms are always populated when the `profiler` feature is
@@ -1500,26 +1511,56 @@ impl WindowProfiler {
         next_frame_scheduled: bool,
         scene_animating: bool,
     ) {
-        let throttled = std::mem::take(&mut self.throttled_since_present);
+        let pending = self.take_pending_present(next_frame_scheduled, scene_animating);
+        self.record_pending_present(present_start, present_end, window_active, pending);
+    }
+
+    /// Takes the samples belonging to this submission before another input or draw begins.
+    pub(crate) fn take_pending_present(
+        &mut self,
+        next_frame_scheduled: bool,
+        scene_animating: bool,
+    ) -> PendingPresent {
+        PendingPresent {
+            frame: self.pending_frame.take(),
+            first_input_at: self.first_input_at.take(),
+            input_count: std::mem::take(&mut self.pending_input_count),
+            throttled: std::mem::take(&mut self.throttled_since_present),
+            next_frame_scheduled,
+            scene_animating,
+        }
+    }
+
+    /// Records a submitted frame when the platform actually presents it.
+    pub(crate) fn record_pending_present(
+        &mut self,
+        present_start: Instant,
+        present_end: Instant,
+        window_active: bool,
+        pending: PendingPresent,
+    ) {
+        let PendingPresent {
+            frame,
+            first_input_at,
+            input_count,
+            throttled,
+            next_frame_scheduled,
+            scene_animating,
+        } = pending;
         let mut responded_to_input = false;
-        if let Some(first_input_at) = self.first_input_at.take()
+        if let Some(first_input_at) = first_input_at
             && !throttled
             && journal::frame_sample_is_valid(self.window_id, first_input_at)
         {
             responded_to_input = true;
             let latency_nanos = present_end.duration_since(first_input_at).as_nanos() as u64;
             self.input_latency_histogram.record(latency_nanos).ok();
-            if self.pending_input_count > 0 {
-                self.events_per_frame_histogram
-                    .record(self.pending_input_count)
-                    .ok();
+            if input_count > 0 {
+                self.events_per_frame_histogram.record(input_count).ok();
             }
         }
-        self.pending_input_count = 0;
 
-        let frame = self
-            .pending_frame
-            .take()
+        let frame = frame
             .filter(|frame| journal::frame_sample_is_valid(self.window_id, frame.draw_start))
             .map(|mut frame| {
                 frame.dirty_at = frame

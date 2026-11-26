@@ -1343,6 +1343,8 @@ pub struct Window {
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
     #[cfg(feature = "profiler")]
     pub(crate) window_profiler: profiler::WindowProfiler,
+    #[cfg(feature = "profiler")]
+    pending_present: Option<profiler::PendingPresent>,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     /// Touchpad momentum, on a platform that leaves it to gpui.
@@ -2012,7 +2014,11 @@ impl Window {
                     mem::take(&mut deferred_force_render) || request_frame_options.force_render;
 
                 let power_state = handle
-                    .update(&mut cx, |_, _, cx| (cx.thermal_state(), cx.power_mode()))
+                    .update(&mut cx, |_, _window, cx| {
+                        #[cfg(feature = "profiler")]
+                        _window.record_deferred_present();
+                        (cx.thermal_state(), cx.power_mode())
+                    })
                     .with_context(|| {
                         format!(
                             "reading power state for frame request for window {:?}",
@@ -2570,6 +2576,8 @@ impl Window {
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
+            #[cfg(feature = "profiler")]
+            pending_present: None,
             last_input_modality: InputModality::Mouse,
             touch_gestures: TouchGestureRecognizer::new(gesture_tuning),
             scroll_coast: cx.platform.coasts_scrolls().then(ScrollCoast::new),
@@ -4210,16 +4218,41 @@ impl Window {
         self.platform_window.draw(&self.rendered_frame.scene);
         crate::frame_stats::record(crate::frame_stats::Phase::Present, frame_stats_present);
         #[cfg(feature = "profiler")]
-        self.window_profiler.record_present(
-            present_start,
-            Instant::now(),
-            self.active.get(),
-            !self.next_frame_callbacks.borrow().is_empty()
-                || self.scene_animation_interval.get().is_some(),
-            self.scene_animation_interval.get().is_some(),
-        );
+        {
+            let scene_animating = self.scene_animation_interval.get().is_some();
+            let next_frame_scheduled =
+                scene_animating || !self.next_frame_callbacks.borrow().is_empty();
+            if let Some((start, end)) = self
+                .platform_window
+                .take_present_timing(Some(present_start))
+            {
+                self.window_profiler.record_present(
+                    start,
+                    end,
+                    self.active.get(),
+                    next_frame_scheduled,
+                    scene_animating,
+                );
+            } else {
+                self.pending_present = Some(
+                    self.window_profiler
+                        .take_pending_present(next_frame_scheduled, scene_animating),
+                );
+            }
+        }
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Takes the draw-ahead result before starting work on the next frame.
+    #[cfg(feature = "profiler")]
+    fn record_deferred_present(&mut self) {
+        if let Some(pending) = self.pending_present.take()
+            && let Some((start, end)) = self.platform_window.take_present_timing(None)
+        {
+            self.window_profiler
+                .record_pending_present(start, end, self.active.get(), pending);
+        }
     }
 
     /// Notes that the window just presented and makes sure a task is waiting to free the

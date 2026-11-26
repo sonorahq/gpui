@@ -139,6 +139,7 @@ pub struct WaylandWindowState {
     /// Set from a commit that asked for a frame callback until that callback fires. A frame
     /// drawn in that interval is held and presented on the callback.
     awaiting_frame_callback: bool,
+    last_present_timing: Option<(Instant, Instant)>,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -643,6 +644,7 @@ impl WaylandWindowState {
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
             awaiting_frame_callback: false,
+            last_present_timing: None,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -663,7 +665,11 @@ impl WaylandWindowState {
             self.pending_frame_callback =
                 Some(self.surface.frame(&self.globals.qh, self.surface.id()));
         }
-        self.awaiting_frame_callback |= renderer.present_held();
+        let present_start = PlatformFrameSignal::capture(Instant::now);
+        if renderer.present_held() {
+            self.awaiting_frame_callback = true;
+            self.last_present_timing = present_start.map(|start| (start, Instant::now()));
+        }
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -2177,7 +2183,11 @@ impl PlatformWindow for WaylandWindow {
                     let callback = state.surface.frame(&state.globals.qh, state.surface.id());
                     state.pending_frame_callback = Some(callback);
                 }
+                let present_start = PlatformFrameSignal::capture(Instant::now);
                 let presented = renderer.draw(scene);
+                if presented {
+                    state.last_present_timing = present_start.map(|start| (start, Instant::now()));
+                }
                 state.awaiting_frame_callback |= presented;
                 presented
             }
@@ -2193,6 +2203,10 @@ impl PlatformWindow for WaylandWindow {
         if renderer.needs_redraw() {
             state.redraw_requested = true;
         }
+    }
+
+    fn take_present_timing(&self, _draw_start: Option<Instant>) -> Option<(Instant, Instant)> {
+        self.borrow_mut().last_present_timing.take()
     }
 
     fn schedule_frame(&self) {
