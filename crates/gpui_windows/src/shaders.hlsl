@@ -97,6 +97,9 @@ struct TransformationMatrix {
 };
 
 static const float M_PI_F = 3.141592653f;
+// How much further along each edge a fully smoothed corner starts than a round one, as a share
+// of its radius. The same as `SQUIRCLE_REACH` in gpui.
+static const float SQUIRCLE_REACH = 0.528665f;
 static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
 
 static const uint SIMPLE_PRIMITIVE_FLAG = 1u << 31;
@@ -121,6 +124,25 @@ float4 distance_from_clip_rect_impl(float2 position, Bounds clip_bounds) {
     float2 tl = position - clip_bounds.origin;
     float2 br = clip_bounds.origin + clip_bounds.size - position;
     return float4(tl.x, br.x, tl.y, br.y);
+}
+
+// The device pixels `bounds` reach into: the bounds grown out to whole pixels, so an edge that
+// falls between pixels still draws the pixel it partly covers. Bounds on the pixel grid stay as
+// they are.
+Bounds pixel_cover(Bounds bounds) {
+    Bounds cover;
+    cover.origin = floor(bounds.origin);
+    cover.size = ceil(bounds.origin + bounds.size) - cover.origin;
+    return cover;
+}
+
+// How much of the pixel centred on `position` the bounds cover: 1 inside them, and the share
+// left where an edge falls through the pixel.
+float pixel_coverage(float2 position, Bounds bounds) {
+    float2 near_edge = max(position - 0.5, bounds.origin);
+    float2 far_edge = min(position + 0.5, bounds.origin + bounds.size);
+    float2 overlap = saturate(far_edge - near_edge);
+    return overlap.x * overlap.y;
 }
 
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bounds clip_bounds, TransformationMatrix transformation) {
@@ -284,32 +306,59 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds bounds,
     return float4(device_position, 0.0, 1.0);
 }
 
+// The shape of a corner of `radius` smoothed by `smoothing`: how far along each edge it starts,
+// and the exponent of the superellipse it follows, 2 for a circular arc. The exponent is picked
+// so that the corner crosses its diagonal where a round corner of `radius` would, which keeps
+// it the same size to the eye. A corner with no room to reach further stays round.
+float2 corner_shape(float radius, float smoothing, float2 half_size) {
+    if (smoothing <= 0.0 || radius <= 0.0) {
+        return float2(radius, 2.0);
+    }
+    float room = min(half_size.x, half_size.y);
+    float extent = max(radius, min(radius * (1.0 + SQUIRCLE_REACH * smoothing), room));
+    float inset = (1.0 - sqrt(0.5)) * radius / extent;
+    return float2(extent, -1.0 / log2(1.0 - inset));
+}
+
+// Signed distance from a point, measured from a corner's center, to a superellipse corner of
+// `radius` and `exponent`. The superellipse's norm divided by the length of its gradient is a
+// true distance near the curve, which is where antialiasing reads it.
+float superellipse_sdf(float2 pt, float radius, float exponent) {
+    float2 component = abs(pt);
+    float norm = pow(pow(component.x, exponent) + pow(component.y, exponent), 1.0 / exponent);
+    if (norm <= 0.0) {
+        return -radius;
+    }
+    float slope = length(pow(component / norm, float2(exponent - 1.0, exponent - 1.0)));
+    return (norm - radius) / slope;
+}
+
 // Implementation of quad signed distance field
-float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius, float corner_exponent) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
-        // Signed distance of the point from a quad that is inset by corner_radius
-        // It is negative inside this quad, and positive outside
-        float signed_distance_to_inset_quad =
-            // 0 inside the inset quad, and positive outside
-            length(max(float2(0.0, 0.0), corner_center_to_point)) +
-            // 0 outside the inset quad, and negative inside
-            min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
-
-        return signed_distance_to_inset_quad - corner_radius;
+        // 0 inside the quad inset by corner_radius, and positive outside
+        float2 outside = max(float2(0.0, 0.0), corner_center_to_point);
+        // 0 outside the inset quad, and negative inside
+        float inside = min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
+        if (corner_exponent == 2.0) {
+            return length(outside) + inside - corner_radius;
+        }
+        return superellipse_sdf(outside, corner_radius, corner_exponent) + inside;
     }
 }
 
-float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
+float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii, float corner_smoothing) {
     float2 half_size = bounds.size / 2.;
     float2 center = bounds.origin + half_size;
     float2 center_to_point = pt - center;
-    float corner_radius = pick_corner_radius(center_to_point, corner_radii);
+    float2 corner = corner_shape(pick_corner_radius(center_to_point, corner_radii),
+                                 corner_smoothing, half_size);
     float2 corner_to_point = abs(center_to_point) - half_size;
-    float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    float2 corner_center_to_point = corner_to_point + corner.x;
+    return quad_sdf_impl(corner_center_to_point, corner.x, corner.y);
 }
 
 PreparedBackground prepare_background(Background background) {
@@ -493,6 +542,8 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    float corner_smoothing;
+    uint pad;
 };
 
 bool has_rounded_corners(Corners corner_radii) {
@@ -520,12 +571,11 @@ struct QuadFragmentInput {
     PreparedBackground background;
 };
 
-// Opaque rectangles are drawn by the opaque pass instead of the quad pass.
+// Opaque rectangles are drawn by the opaque pass instead of the quad pass. The fork draws no
+// opaque pass (`DEPTH_PREPASS` in scene.rs), so the quad pass keeps every quad. Upstream's test is
+// a solid opaque background with neither rounded corners nor a border.
 bool is_opaque_rectangle(Quad quad) {
-    return quad.background.tag == 0u
-        && quad.background.solid.a >= 1.0
-        && !has_rounded_corners(quad.corner_radii)
-        && !has_border(quad.border_widths);
+    return false;
 }
 
 StructuredBuffer<Quad> quads: register(t1);
@@ -541,7 +591,8 @@ QuadFragmentInput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_
     }
 
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
-    ClippedVertex vertex = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask);
+    Bounds cover = pixel_cover(quad.bounds);
+    ClippedVertex vertex = clip_to_mask(unit_vertex, cover, quad.content_mask);
     float4 device_position = to_device_position_impl(vertex.position);
 
     float4 border_color = hsla_to_rgba(quad.border_color);
@@ -550,7 +601,10 @@ QuadFragmentInput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_
     output.position = device_position;
     output.position.z = quad_depth(quad_id);
     output.border_color = border_color;
-    bool simple = !is_shaped(quad) && quad.background.tag == 0u;
+    // A quad off the pixel grid partly covers the pixels its edges fall through, so only one on
+    // the grid fills every pixel it draws.
+    bool on_grid = all(cover.origin == quad.bounds.origin) && all(cover.size == quad.bounds.size);
+    bool simple = !is_shaped(quad) && quad.background.tag == 0u && on_grid;
     output.quad_id = quad_id | (simple ? SIMPLE_PRIMITIVE_FLAG : 0u);
     output.background = prepare_background(quad.background);
     return output;
@@ -566,6 +620,15 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         background_color(input.background, quad.background, quad.bounds, input.position.xy);
     bool unrounded = !has_rounded_corners(quad.corner_radii);
 
+    // A quad off the pixel grid partly covers the pixels its edges fall through. On the grid
+    // this is 1 for every pixel drawn.
+    float coverage = pixel_coverage(input.position.xy, quad.bounds);
+
+    // Fast path when the quad is not rounded and doesn't have any border
+    if (!is_shaped(quad)) {
+        return background * float4(1.0, 1.0, 1.0, coverage);
+    }
+
     float2 size = quad.bounds.size;
     float2 half_size = size / 2.;
     float2 the_point = input.position.xy - quad.bounds.origin;
@@ -575,8 +638,10 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     // minimum distance between the center of the pixel and the edge.
     const float antialias_threshold = 0.5;
 
-    // Radius of the nearest corner
-    float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+    // How far along the edges the nearest corner reaches, and the exponent of its curve
+    float2 corner = corner_shape(pick_corner_radius(center_to_point, quad.corner_radii),
+                                 quad.corner_smoothing, half_size);
+    float corner_radius = corner.x;
 
     float2 border = float2(
         center_to_point.x < 0.0 ? quad.border_widths.left : quad.border_widths.right,
@@ -622,11 +687,11 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path for points that must be part of the background
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return background;
+        return background * float4(1.0, 1.0, 1.0, coverage);
     }
 
     // Signed distance of the point to the outside edge of the quad's border
-    float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, corner.y);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
@@ -644,9 +709,10 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     } else if (is_beyond_inner_straight_border) {
         // Fast path for points that must be outside the inner edge
         inner_sdf = -1.0;
-    } else if (reduced_border.x == reduced_border.y) {
-        // Fast path for circular inner edge.
-        inner_sdf = -(outer_sdf + reduced_border.x);
+    } else if (reduced_border.x == reduced_border.y || corner.y != 2.0) {
+        // Fast path for circular inner edge. A smoothed corner offsets its outer edge by the
+        // wider border, since its inner edge has no exact form either way.
+        inner_sdf = -(outer_sdf + max(reduced_border.x, reduced_border.y));
     } else {
         float2 ellipse_radii = max(float2(0.0, 0.0), float2(corner_radius, corner_radius) - reduced_border);
         inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
@@ -832,7 +898,9 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         color = over(background, border_color);
     }
 
-    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+    // The distance field knows nothing of how much of the pixel the quad covers, so a quad
+    // thinner than a pixel would come out stronger than the share of the pixel it fills.
+    return color * float4(1.0, 1.0, 1.0, min(coverage, saturate(antialias_threshold - outer_sdf)));
 }
 
 /*
@@ -879,14 +947,23 @@ float4 opaque_quad_fragment(OpaqueQuadFragmentInput input): SV_Target {
 struct Shadow {
     uint order;
     float blur_radius;
+    // The area the shadow paints: the blurred extent of a drop shadow, or the element
+    // that an inset shadow is clipped to.
     Bounds bounds;
     Corners corner_radii;
     Bounds content_mask;
     Hsla color;
+    // The shape that is blurred: the silhouette of a drop shadow, or the hole of an
+    // inset shadow.
     Bounds shape_bounds;
     Corners shape_corner_radii;
+    // 0 = drop shadow, 1 = inset shadow.
     uint inset;
-    uint pad; // align to 8 bytes
+    float element_corner_smoothing;
+    // The element that clips the shadow: a drop shadow is drawn only outside it, an inset one
+    // only inside it.
+    Bounds element_bounds;
+    Corners element_corner_radii;
 };
 
 struct PreparedBlurredRoundedRect {
@@ -986,7 +1063,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
 
     float alpha;
     if (shadow.blur_radius == 0.) {
-        float distance = quad_sdf(input.position.xy, shadow.shape_bounds, shadow.shape_corner_radii);
+        float distance = quad_sdf(input.position.xy, shadow.shape_bounds, shadow.shape_corner_radii, 0.0);
         alpha = saturate(0.5 - distance);
     } else {
         float2 center = shadow.shape_bounds.origin + shadow.shape_bounds.size / 2.;
@@ -997,8 +1074,15 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        float element_distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                          shadow.element_corner_radii, shadow.element_corner_smoothing);
         alpha *= saturate(0.5 - element_distance);
+    } else {
+        // A drop shadow is clipped to outside the element, the way CSS draws one, so an
+        // element with a translucent fill never shows its own shadow through it.
+        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                          shadow.element_corner_radii, shadow.element_corner_smoothing);
+        alpha *= saturate(0.5 + element_distance);
     }
 
     return input.color * float4(1., 1., 1., alpha);
@@ -1313,6 +1397,25 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
     return output;
 }
 
+// Drawn from `subpixel_sprite_vertex`, so this half has no vertex entry point of its own.
+//
+// `subpixel_sprite_fragment`'s dual-source blend always writes alpha = 1, which is
+// fine on the opaque frame but wrong in an offscreen filter layer: those start
+// transparent, and get composited onto their parent by that alpha afterward, so an
+// antialiased glyph pixel would overwrite the parent instead of blending into it.
+// This collapses ClearType's three channels into one coverage value and writes a
+// normal premultiplied color instead, trading subpixel fringing for a correct blend.
+float4 subpixel_sprite_layered_fragment(MonochromeSpriteFragmentInput input): SV_Target {
+    float3 sample = t_sprite.Sample(s_sprite, input.tile_position).rgb;
+    if (is_bgr) {
+        sample = sample.bgr;
+    }
+    float3 alpha_corrected = apply_contrast_and_gamma_correction3(sample, input.color.rgb, subpixel_enhanced_contrast, gamma_ratios);
+    float average_coverage = (alpha_corrected.r + alpha_corrected.g + alpha_corrected.b) / 3.0f;
+    float coverage = input.color.a * average_coverage;
+    return float4(input.color.rgb * coverage, coverage);
+}
+
 /*
 **
 **              Polychrome sprites
@@ -1366,7 +1469,291 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     if (sprite.grayscale != 0u) {
         color.rgb = dot(color.rgb, GRAYSCALE_FACTORS);
     }
-    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii, 0.0);
     color.a *= input.opacity * saturate(0.5 - distance);
     return color;
+}
+
+/*
+**
+**              Backdrops
+**
+*/
+
+struct Backdrop {
+    uint order;
+    float corner_smoothing;
+    float blur;
+    float opacity;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+};
+
+struct BackdropFragmentInput {
+    float4 position: SV_Position;
+    nointerpolation uint backdrop_id: TEXCOORD0;
+};
+
+StructuredBuffer<Backdrop> backdrops: register(t1);
+
+BackdropFragmentInput backdrop_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint backdrop_id = batch_start_index + instance_id;
+    Backdrop backdrop = backdrops[backdrop_id];
+    ClippedVertex vertex = clip_to_mask(unit_vertex, backdrop.bounds, backdrop.content_mask);
+
+    BackdropFragmentInput output;
+    output.position = to_device_position_impl(vertex.position);
+    output.backdrop_id = backdrop_id;
+    return output;
+}
+
+// A backdrop replaces what it covers with the blurred copy of it rather than laying that copy
+// over it: `dst = mix(dst, blurred, k)`, k being the coverage times the instance's opacity.
+// Over an opaque frame the two are one picture, since a copy of alpha one hides what it
+// covers; over a see-through window laying it over left `a + a(1 - a)` where the window asked
+// for `a`. The mix is two draws over one instance buffer: `backdrop_punch_fragment` for
+// `dst *= (1 - k)`, then this one, added on top.
+float4 backdrop_fragment(BackdropFragmentInput input): SV_Target {
+    Backdrop backdrop = backdrops[input.backdrop_id];
+    float2 position = input.position.xy;
+    float4 sampled = t_sprite.Sample(s_sprite, position / global_viewport_size);
+    float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
+    float coverage = saturate(0.5 - distance);
+
+    return sampled * coverage * backdrop.opacity;
+}
+
+// The hole the blurred copy lands in: alpha alone, blended so what it covers keeps `1 - k` of
+// itself, colour and alpha together.
+float4 backdrop_punch_fragment(BackdropFragmentInput input): SV_Target {
+    Backdrop backdrop = backdrops[input.backdrop_id];
+    float2 position = input.position.xy;
+    float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
+    float coverage = saturate(0.5 - distance);
+
+    return float4(0.0, 0.0, 0.0, coverage * backdrop.opacity);
+}
+
+/*
+**
+**              Layer filters
+**
+*/
+
+struct FilterParams {
+    Bounds source_bounds;
+    Bounds fade_bounds;
+    float2 direction;
+    float2 transform_origin;
+    float radius;
+    float scale;
+    float fade_top;
+    float fade_bottom;
+    float fade_left;
+    float fade_right;
+    float2 translation;
+    // How many texels of the texture a blur pass reads hold the frame.
+    float2 extent;
+};
+
+struct FilterVertexOutput {
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD0;
+};
+
+struct FilterFragmentInput {
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD0;
+};
+
+StructuredBuffer<FilterParams> filter_params: register(t1);
+
+FilterVertexOutput filter_vertex_impl(uint vertex_id) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+
+    FilterVertexOutput output;
+    output.position = float4(unit_vertex.x * 2.0 - 1.0, 1.0 - unit_vertex.y * 2.0, 0.0, 1.0);
+    output.uv = unit_vertex;
+    return output;
+}
+
+FilterVertexOutput gaussian_vertex(uint vertex_id: SV_VertexID) {
+    return filter_vertex_impl(vertex_id);
+}
+
+FilterVertexOutput pyramid_down_vertex(uint vertex_id: SV_VertexID) {
+    return filter_vertex_impl(vertex_id);
+}
+
+FilterVertexOutput blit_vertex(uint vertex_id: SV_VertexID) {
+    return filter_vertex_impl(vertex_id);
+}
+
+FilterVertexOutput mask_vertex(uint vertex_id: SV_VertexID) {
+    return filter_vertex_impl(vertex_id);
+}
+
+// How much of a texel wide footprint centred at `at`, in texels, lies within `0..extent` on both
+// axes. Nothing lies past the frame's edges, so every blur pass weighs its taps by this and
+// divides by the weight it kept, with `extent` as how many texels of the texture it reads hold
+// the frame. A blur against an edge then averages what is there instead of stretching the border
+// row across the kernel, which made every row that scrolled out under the edge flash through the
+// blur on its way.
+float blur_inside(float2 at, float2 extent) {
+    float2 span = saturate(min(at + 0.5, extent) - max(at - 0.5, float2(0.0, 0.0)));
+    return span.x * span.y;
+}
+
+// How much of a texel wide span centred at `at`, in texels, lies within `0..limit` along one
+// axis. A gaussian pass reads along one axis only, so a texel's coverage across it is the same
+// for every tap and must not weigh the taps against the centre.
+float blur_along(float at, float limit) {
+    return saturate(min(at + 0.5, limit) - max(at - 0.5, 0.0));
+}
+
+// A narrow blur runs `gaussian_fragment` across and then down at full resolution, with `radius`
+// as its standard deviation, and a wide one runs it across and down the deepest level of a
+// pyramid. It pairs neighbouring taps into one bilinear fetch placed between them by their
+// weights, which halves the fetches, and relies on sampling a texture of the same size as the
+// target, so every pair lands between two texel centres along the axis. Every tap, the centre
+// too, counts by how much of it lies inside the frame along the axis, so a tap past the frame's
+// edge drops out of the pair it belongs to.
+float4 gaussian_fragment(FilterFragmentInput input): SV_Target {
+    FilterParams params = filter_params[batch_start_index];
+    float width;
+    float height;
+    t_sprite.GetDimensions(width, height);
+    float2 size = float2(width, height);
+    float2 texel = params.direction / size;
+    float axis = dot(input.uv * size, params.direction);
+    float limit = dot(params.extent, params.direction);
+    float sigma = max(params.radius, 0.0001);
+    float reach = min(ceil(sigma * 3.0), 24.0);
+    float spread = 2.0 * sigma * sigma;
+
+    float own = blur_along(axis, limit);
+    float4 total = own * t_sprite.Sample(s_sprite, input.uv);
+    float weight = own;
+    for (float inner = 1.0; inner <= reach; inner += 2.0) {
+        float outer = inner + 1.0;
+        float inner_weight = exp(-inner * inner / spread);
+        float outer_weight = outer <= reach ? exp(-outer * outer / spread) : 0.0;
+        [unroll]
+        for (int i = 0; i < 2; i++) {
+            float side = i == 0 ? -1.0 : 1.0;
+            float inner_tap = inner_weight * blur_along(axis + inner * side, limit);
+            float outer_tap = outer_weight * blur_along(axis + outer * side, limit);
+            float pair = inner_tap + outer_tap;
+            float2 at = texel * (side * (inner * inner_tap + outer * outer_tap) / max(pair, 0.0001));
+            total += pair * t_sprite.Sample(s_sprite, input.uv + at);
+            weight += pair;
+        }
+    }
+
+    return total / max(weight, 0.0001);
+}
+
+// Four bilinear taps at `centre` plus `offset` mirrored into each quadrant, in texels of the
+// texture read, each weighed by how much of it falls within `extent`.
+float4 pyramid_taps(float2 centre, float2 offset, float2 extent) {
+    float width;
+    float height;
+    t_sprite.GetDimensions(width, height);
+    float2 size = float2(width, height);
+    float4 total = float4(0.0, 0.0, 0.0, 0.0);
+    float weight = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; i++) {
+        float2 corner = float2((i & 1) ? 1.0 : -1.0, (i & 2) ? 1.0 : -1.0);
+        float2 at = centre + offset * corner;
+        float tap = blur_inside(at, extent);
+        total += tap * t_sprite.Sample(s_sprite, at / size);
+        weight += tap;
+    }
+    return total / max(weight, 0.0001);
+}
+
+// Halves the level it reads, the first passes of a pyramid. A target texel sits over the corner
+// of four source texels, and a bilinear tap on each of the four corners around that one averages
+// the four by four texels under it.
+float4 pyramid_down_fragment(FilterFragmentInput input): SV_Target {
+    FilterParams params = filter_params[batch_start_index];
+    return pyramid_taps(input.position.xy * 2.0, float2(1.0, 1.0), params.extent);
+}
+
+// Doubles the level it reads, back towards full size. Four bilinear taps half a texel out on
+// each diagonal lay a box of one texel over the bilinear tent, which rounds off the corners a
+// tent alone leaves at every texel of the level below and keeps its grid from showing.
+float4 pyramid_up_fragment(FilterFragmentInput input): SV_Target {
+    FilterParams params = filter_params[batch_start_index];
+    return pyramid_taps(input.position.xy * 0.5, float2(0.5, 0.5), params.extent);
+}
+
+
+float4 blit_fragment(FilterFragmentInput input): SV_Target {
+    return t_sprite.Sample(s_sprite, input.uv);
+}
+
+// Where a point of a layer's source lands in the frame, applying the layer's transform.
+float2 mask_destination(FilterParams params, float2 source_point) {
+    return params.transform_origin + (source_point - params.transform_origin) * params.scale
+        + params.translation;
+}
+
+float4 mask_fragment(FilterFragmentInput input): SV_Target {
+    FilterParams params = filter_params[batch_start_index];
+    float2 destination_point = input.position.xy;
+    float2 source_point = params.transform_origin
+        + (destination_point - params.translation - params.transform_origin) / params.scale;
+    // Only the part of the source inside the frame was drawn, so only that part covers pixels.
+    float2 source_start = max(params.source_bounds.origin, float2(0.0, 0.0));
+    float2 source_end = min(params.source_bounds.origin + params.source_bounds.size,
+        global_viewport_size);
+
+    // An untransformed layer keeps the frame's pixel grid, so a pixel is in or out. A
+    // transformed one covers each pixel as far as its transformed bounds overlap it, which
+    // smooths the edge the clamped sample below leaves hard.
+    float coverage = 1.0;
+    if (params.scale == 1.0 && all(params.translation == float2(0.0, 0.0))) {
+        if (any(source_point < source_start) || any(source_point >= source_end)) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+    } else {
+        float2 start = mask_destination(params, source_start);
+        float2 end = mask_destination(params, source_end);
+        float2 overlap = saturate(min(destination_point + 0.5, end) - max(destination_point - 0.5, start));
+        coverage = overlap.x * overlap.y;
+        if (coverage <= 0.0) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+    }
+
+    float top = source_point.y - params.fade_bounds.origin.y;
+    float bottom = params.fade_bounds.origin.y + params.fade_bounds.size.y - source_point.y;
+
+    float fade = 1.0;
+    if (params.fade_top > 0.0) {
+        fade = min(fade, smoothstep(0.0, params.fade_top, top));
+    }
+    if (params.fade_bottom > 0.0) {
+        fade = min(fade, smoothstep(0.0, params.fade_bottom, bottom));
+    }
+    if (params.fade_left > 0.0) {
+        float left = source_point.x - params.fade_bounds.origin.x;
+        fade = min(fade, smoothstep(0.0, params.fade_left, left));
+    }
+    if (params.fade_right > 0.0) {
+        float right = params.fade_bounds.origin.x + params.fade_bounds.size.x - source_point.x;
+        fade = min(fade, smoothstep(0.0, params.fade_right, right));
+    }
+
+    // The sample stays half a texel inside the texels the layer covers and inside the frame, so
+    // a stretched edge repeats the layer's last texels rather than blending them with whatever
+    // lies past it. A pixel centre of an untransformed layer is already inside and does not move.
+    float2 low = max(floor(source_start), float2(0.0, 0.0)) + 0.5;
+    float2 high = min(ceil(source_end), global_viewport_size) - 0.5;
+    float2 texel = clamp(source_point, low, max(low, high));
+    return t_sprite.Sample(s_sprite, texel / global_viewport_size) * coverage * fade;
 }
