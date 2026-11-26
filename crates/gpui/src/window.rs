@@ -765,6 +765,14 @@ type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
 
+/// A mouse listener registered for one concrete event type.
+///
+/// Dispatch compares `event` with the type of the incoming event and skips the call on a mismatch.
+pub(crate) struct MouseListener {
+    event: TypeId,
+    call: AnyMouseListener,
+}
+
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
     pub(crate) hitbox_id: Option<HitboxId>,
@@ -1162,7 +1170,7 @@ pub(crate) struct Frame {
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
-    pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    pub(crate) mouse_listeners: Vec<Option<MouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -6686,13 +6694,16 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame.mouse_listeners.push(Some(Box::new(
-            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref() {
-                    listener(event, phase, window, cx)
-                }
-            },
-        )));
+        self.next_frame.mouse_listeners.push(Some(MouseListener {
+            event: TypeId::of::<Event>(),
+            call: Box::new(
+                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                    if let Some(event) = event.downcast_ref() {
+                        listener(event, phase, window, cx)
+                    }
+                },
+            ),
+        }));
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
@@ -7253,12 +7264,16 @@ impl Window {
         }
 
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
+        let wanted = event.type_id();
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
         // special purposes, such as detecting events outside of a given Bounds.
         for listener in &mut mouse_listeners {
             let listener = listener.as_mut().unwrap();
-            listener(event, DispatchPhase::Capture, self, cx);
+            if listener.event != wanted {
+                continue;
+            }
+            (listener.call)(event, DispatchPhase::Capture, self, cx);
             if !cx.propagate_event {
                 break;
             }
@@ -7268,7 +7283,10 @@ impl Window {
         if cx.propagate_event {
             for listener in mouse_listeners.iter_mut().rev() {
                 let listener = listener.as_mut().unwrap();
-                listener(event, DispatchPhase::Bubble, self, cx);
+                if listener.event != wanted {
+                    continue;
+                }
+                (listener.call)(event, DispatchPhase::Bubble, self, cx);
                 if !cx.propagate_event {
                     break;
                 }
@@ -9241,10 +9259,10 @@ mod tests {
         ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle, InputEvent as _,
         InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, LongPressEvent, MouseButton,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point,
-        Render, RequestFrameOptions, ScaledPixels, StatefulInteractiveElement as _, Styled,
-        TestAppContext, ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline,
-        UnderlineStyle, Window, WindowAppearance, WindowOptions, canvas, div, hsla, point, px,
-        size,
+        Render, RequestFrameOptions, ScaledPixels, ScrollEvent, StatefulInteractiveElement as _,
+        Styled, TestAppContext, ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase,
+        Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions, canvas, div, hsla,
+        point, px, size,
     };
 
     #[gpui::test]
@@ -11748,6 +11766,89 @@ mod tests {
             cursor_observer.test_platform().cursor_style(),
             CursorStyle::IBeam
         );
+    }
+
+    struct MouseKindListeners {
+        downs: Rc<Cell<usize>>,
+        scrolls: Rc<RefCell<Vec<DispatchPhase>>>,
+        stop_in_capture: Rc<Cell<bool>>,
+    }
+
+    impl Render for MouseKindListeners {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let downs = self.downs.clone();
+            let scrolls = self.scrolls.clone();
+            let stop_in_capture = self.stop_in_capture.clone();
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    window.on_mouse_event(move |_: &MouseDownEvent, phase, _, _| {
+                        if phase == DispatchPhase::Bubble {
+                            downs.set(downs.get() + 1);
+                        }
+                    });
+                    window.on_mouse_event(move |_: &ScrollEvent, phase, _, cx| {
+                        scrolls.borrow_mut().push(phase);
+                        if phase == DispatchPhase::Capture && stop_in_capture.get() {
+                            cx.stop_propagation();
+                        }
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    async fn test_mouse_listeners_only_run_for_their_event_type(cx: &mut TestAppContext) {
+        let downs = Rc::new(Cell::new(0));
+        let scrolls = Rc::new(RefCell::new(Vec::new()));
+        let stop_in_capture = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let (downs, scrolls, stop_in_capture) =
+                (downs.clone(), scrolls.clone(), stop_in_capture.clone());
+            move |_, _| MouseKindListeners {
+                downs,
+                scrolls,
+                stop_in_capture,
+            }
+        });
+        let wheel = || {
+            ScrollEvent {
+                position: point(px(1.), px(1.)),
+                ..Default::default()
+            }
+            .to_platform_input()
+        };
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(wheel(), cx);
+            assert_eq!(downs.get(), 0);
+            assert_eq!(
+                *scrolls.borrow(),
+                [DispatchPhase::Capture, DispatchPhase::Bubble]
+            );
+
+            scrolls.borrow_mut().clear();
+            stop_in_capture.set(true);
+            window.dispatch_event(wheel(), cx);
+            assert_eq!(downs.get(), 0);
+            assert_eq!(*scrolls.borrow(), [DispatchPhase::Capture]);
+
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: point(px(1.), px(1.)),
+                    button: MouseButton::Left,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(downs.get(), 1);
+            assert_eq!(scrolls.borrow().len(), 1);
+        })
+        .unwrap();
     }
 }
 
