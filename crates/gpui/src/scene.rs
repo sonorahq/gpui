@@ -570,12 +570,13 @@ impl Scene {
         let first_mark = prev_scene
             .marks
             .partition_point(|(index, _)| *index < range.start);
-        let keep = prev_scene.marks.get(first_mark) == Some(&(range.start, self.history));
+        // Inside an open paint layer every primitive takes the layer's order when it closes,
+        // which the history does not foresee, so nothing there keeps its order.
+        let keep = self.layer_stack.is_empty()
+            && prev_scene.marks.get(first_mark) == Some(&(range.start, self.history));
         // A paint layer gets its order when the outermost one closes, so a layer keeps its
         // order only when the replay opens every layer around it and closes it again.
-        let layers_kept = keep
-            && self.layer_stack.is_empty()
-            && closes_its_layers(&prev_scene.paint_operations[range.clone()]);
+        let layers_kept = keep && closes_its_layers(&prev_scene.paint_operations[range.clone()]);
         let mut marks = prev_scene.marks[first_mark..]
             .iter()
             .map(|(index, _)| *index)
@@ -1648,6 +1649,32 @@ mod layer_filter_tests {
             })
             .collect();
         assert_eq!(batches, vec![0..2, 2..3]);
+    }
+
+    #[test]
+    fn a_replay_that_closes_an_open_paint_layer_orders_afresh() {
+        let mut painted = Scene::default();
+        painted.push_layer();
+        painted.insert_primitive(underline(rect(0.0, 0.0, 10.0, 10.0)));
+        painted.mark();
+        let start = painted.len();
+        painted.pop_layer();
+        painted.insert_primitive(quad(rect(50.0, 0.0, 10.0, 10.0)));
+        let range = start..painted.len();
+
+        // The history leaves out what goes into an open layer, so it matches although the layer
+        // now ends under the quad.
+        let mut replayed = Scene::default();
+        replayed.push_layer();
+        replayed.insert_primitive(underline(rect(50.0, 0.0, 10.0, 10.0)));
+        replayed.replay(range, &painted);
+
+        assert!(
+            replayed.quads[0].order > replayed.underlines[0].order,
+            "the quad at {} draws under the underline at {}",
+            replayed.quads[0].order,
+            replayed.underlines[0].order
+        );
     }
 
     #[test]
