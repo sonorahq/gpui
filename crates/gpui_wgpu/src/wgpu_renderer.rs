@@ -4530,3 +4530,60 @@ fn render_fixture_cases() -> anyhow::Result<()> {
         renderer.render_scene_to_image(scene, size)
     })
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn collapsed_inset_shadow_hole_fills_element() -> anyhow::Result<()> {
+    use gpui::{
+        Bounds, ContentMask, Corners, DevicePixels, Hsla, PlatformHeadlessRenderer as _,
+        ScaledPixels, Scene, Shadow, Size, point, size,
+    };
+
+    let mut renderer = crate::WgpuHeadlessRenderer::new()?;
+    let viewport = Size::new(DevicePixels(64), DevicePixels(64));
+    let full = Bounds::new(
+        point(ScaledPixels(0.0), ScaledPixels(0.0)),
+        size(ScaledPixels(64.0), ScaledPixels(64.0)),
+    );
+    let element = Bounds::new(
+        point(ScaledPixels(8.0), ScaledPixels(8.0)),
+        size(ScaledPixels(48.0), ScaledPixels(48.0)),
+    );
+    let collapsed_hole = Bounds::new(
+        point(ScaledPixels(32.0), ScaledPixels(32.0)),
+        size(ScaledPixels(0.0), ScaledPixels(0.0)),
+    );
+    for blur_radius in [8.0, 0.0] {
+        let mut scene = Scene::default();
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(blur_radius),
+            bounds: element,
+            content_mask: ContentMask { bounds: full },
+            corner_radii: Corners::default(),
+            color: Hsla {
+                h: 0.0,
+                s: 1.0,
+                l: 0.5,
+                a: 1.0,
+            },
+            shape_bounds: collapsed_hole,
+            shape_corner_radii: Corners::default(),
+            inset: true.into(),
+            element_corner_smoothing: 0.0,
+            element_bounds: element,
+            element_corner_radii: Corners::default(),
+        });
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, viewport)?;
+        for (x, y) in [(32, 32), (20, 20), (44, 44)] {
+            let pixel = image.get_pixel(x, y).0;
+            assert_eq!(
+                pixel,
+                [255, 0, 0, 255],
+                "collapsed inset shadow (blur={blur_radius}) at ({x},{y}) must fill element"
+            );
+        }
+    }
+    Ok(())
+}

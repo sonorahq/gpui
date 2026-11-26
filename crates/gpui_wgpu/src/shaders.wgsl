@@ -1108,9 +1108,17 @@ fn erf7(input: f32) -> f32 {
 // Raph Levien's blurred rounded rectangle approximation, whose blur s is sigma * sqrt(2):
 // https://raphlinus.github.io/graphics/2020/04/21/blurred-rounded-rects.html
 fn prepare_blurred_rounded_rect(size: vec2<f32>, corner_radii: Corners, sigma: f32) -> PreparedBlurredRoundedRect {
+    let min_edge = min(size.x, size.y);
+    if (min_edge <= 0.0) {
+        var empty: PreparedBlurredRoundedRect;
+        empty.shape = vec4<f32>(0.0);
+        empty.r1 = vec4<f32>(0.0);
+        empty.exponent = vec4<f32>(2.0);
+        empty.scale = vec4<f32>(0.0);
+        return empty;
+    }
     let s = max(sigma * sqrt(2.0), 1e-6);
     let s_inv = 1.0 / s;
-    let min_edge = min(size.x, size.y);
     let r_max = 0.5 * min_edge;
     let radii = vec4<f32>(corner_radii.top_left, corner_radii.top_right,
                           corner_radii.bottom_right, corner_radii.bottom_left);
@@ -1179,7 +1187,9 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     let shadow = load_shadow(input.shadow_id);
 
     var alpha: f32;
-    if (shadow.blur_radius == 0.0) {
+    if (shadow.shape_bounds.size.x <= 0.0 || shadow.shape_bounds.size.y <= 0.0) {
+        alpha = 0.0;
+    } else if (shadow.blur_radius == 0.0) {
         let distance = quad_sdf(input.position.xy, shadow.shape_bounds, shadow.shape_corner_radii,
             0.0);
         alpha = saturate(0.5 - distance);
