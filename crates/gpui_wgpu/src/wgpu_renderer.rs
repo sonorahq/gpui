@@ -4378,11 +4378,11 @@ mod render_fixture;
 fn render_fixture_cases() -> anyhow::Result<()> {
     use gpui::PlatformHeadlessRenderer as _;
     let mut renderer = crate::WgpuHeadlessRenderer::new()?;
-    render_fixture::run("", |scene, size| {
+    render_fixture::run("", &[], |scene, size| {
         renderer.render_scene_to_image(scene, size)
     })?;
     let mut renderer = crate::WgpuHeadlessRenderer::new_premultiplied()?;
-    render_fixture::run(".premultiplied", |scene, size| {
+    render_fixture::run(".premultiplied", &[], |scene, size| {
         renderer.render_scene_to_image(scene, size)
     })
 }

@@ -3609,7 +3609,9 @@ fn render_fixture_cases() -> anyhow::Result<()> {
     let result = (|| {
         let devices = DirectXDevices::new()?;
         let mut renderer = DirectXRenderer::new(hwnd, &devices, true)?;
-        render_fixture::run("", |scene, size| {
+        // The DirectX renderer ignores `Scene::overscan`, so a backdrop at the right or bottom
+        // edge blurs only what lies inside the window.
+        render_fixture::run("", &["overscan"], |scene, size| {
             renderer.resize(size)?;
             renderer.render_to_image(scene, WindowBackgroundAppearance::Opaque)
         })

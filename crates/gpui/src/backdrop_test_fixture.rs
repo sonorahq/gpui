@@ -74,9 +74,12 @@ pub fn cases() -> Vec<Case> {
 
 /// Draws every case with `render`, writes its PNG when `GPUI_RENDER_FIXTURE_OUT` is set and
 /// checks it. `suffix` is appended to each PNG's name so a backend can write several variants.
-/// Every case is drawn even after one fails to draw or to pass, and the error lists them all.
+/// `known_failures` names the cases the backend is known to draw wrong. Those must still fail
+/// their check, so fixing the backend shows up as an error until the name is removed. Every case
+/// is drawn even after one fails, and the error lists them all.
 pub fn run(
     suffix: &str,
+    known_failures: &[&str],
     mut render: impl FnMut(&Scene, Size<DevicePixels>) -> anyhow::Result<image::RgbaImage>,
 ) -> anyhow::Result<()> {
     let out = std::env::var_os("GPUI_RENDER_FIXTURE_OUT").map(std::path::PathBuf::from);
@@ -95,8 +98,15 @@ pub fn run(
         if let Some(out) = &out {
             image.save(out.join(format!("{}{suffix}.png", case.name)))?;
         }
-        if let Err(message) = (case.check)(&image) {
-            failures.push(format!("{}: {message}", case.name));
+        let known = known_failures.contains(&case.name.as_str());
+        match ((case.check)(&image), known) {
+            (Ok(()), false) => {}
+            (Err(message), false) => failures.push(format!("{}: {message}", case.name)),
+            (Ok(()), true) => failures.push(format!(
+                "{}: passes now, remove it from the known failures",
+                case.name
+            )),
+            (Err(message), true) => eprintln!("{}: known failure: {message}", case.name),
         }
     }
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
