@@ -66,6 +66,7 @@ use std::{
     cmp,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
+    iter,
     marker::PhantomData,
     mem,
     ops::Range,
@@ -5104,18 +5105,19 @@ impl Window {
         bounds
     }
 
-    /// Carries a solid quad that ends at the right or bottom edge on through the overscan, so
-    /// the panels and backgrounds a backdrop near that edge blurs go on past it as the window
-    /// would if it were larger. A quad shallower than the overscan is a row or a control that
-    /// only happens to end at the edge, and stays where it is. The strips go past the edge
-    /// only, so nothing in the window changes.
-    fn paint_quad_past_edges(&mut self, quad: &Quad) {
+    /// The strips that carry a solid quad that ends at the right or bottom edge on through the
+    /// overscan, so the panels and backgrounds a backdrop near that edge blurs go on past it as
+    /// the window would if it were larger. A quad shallower than the overscan is a row or a
+    /// control that only happens to end at the edge, and gets none. The strips lie past the
+    /// edge only, so nothing in the window changes.
+    fn strips_past_edges(&self, quad: &Quad) -> SmallVec<[Quad; 3]> {
+        let mut strips = SmallVec::new();
         let overscan = self.backdrop_overscan;
         if self.overscan_suppressed > 0 || (overscan.width.0 == 0 && overscan.height.0 == 0) {
-            return;
+            return strips;
         }
         if quad.background.as_solid().is_none() {
-            return;
+            return strips;
         }
         let scale = self.scale_factor();
         let width = (self.viewport_size.width.0 * scale).round();
@@ -5137,7 +5139,6 @@ impl Window {
             corner_radii: Corners::default(),
             ..*quad
         };
-        let mut strips = SmallVec::<[Quad; 3]>::new();
         if right {
             strips.push(strip(
                 width,
@@ -5162,9 +5163,7 @@ impl Window {
                 height + past_bottom,
             ));
         }
-        for strip in strips {
-            self.next_frame.scene.insert_primitive(strip);
-        }
+        strips
     }
 
     /// Moves the overscan towards what the last frame's backdrops needed: at once when it has
@@ -5875,8 +5874,14 @@ impl Window {
         };
 
         if !quad.background.is_transparent() {
-            self.next_frame.scene.insert_primitive(quad);
-            self.paint_quad_past_edges(&quad);
+            let strips = self.strips_past_edges(&quad);
+            let scene = &mut self.next_frame.scene;
+            match strips.is_empty() {
+                true => scene.insert_primitive(quad),
+                // The strips take the quad's order, so a backdrop the quad tints blurs none of
+                // them.
+                false => scene.insert_as_one(iter::once(quad).chain(strips)),
+            }
             return;
         }
 
@@ -11419,6 +11424,69 @@ mod tests {
                 past.ids.is_empty(),
                 "a pointer past the window edge must not reach a hitbox in the overscan"
             );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_a_tint_carried_past_the_edge_draws_over_its_backdrop(cx: &mut TestAppContext) {
+        const TINT: crate::Hsla = crate::Hsla {
+            h: 0.6,
+            s: 0.5,
+            l: 0.5,
+            a: 0.5,
+        };
+
+        struct EdgePaneView;
+
+        impl Render for EdgePaneView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .relative()
+                    .bg(hsla(0., 0., 0.1, 1.))
+                    // a frosted pane along the right edge, its translucent tint wider than the
+                    // overscan
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(px(200.))
+                            .backdrop_blur(px(12.))
+                            .bg(TINT),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| EdgePaneView);
+        // The first frame finds the backdrop and the next one draws with the overscan.
+        for _ in 0..2 {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(window.backdrop_overscan.width.0 > 0);
+            let scene = &window.rendered_frame.scene;
+            let width = (window.viewport_size.width.0 * window.scale_factor()).round();
+            let backdrop = scene.backdrops.first().expect("the pane's backdrop");
+            let strips: Vec<_> = scene
+                .quads
+                .iter()
+                .filter(|quad| {
+                    quad.bounds.left().0 >= width && quad.background.as_solid() == Some(TINT)
+                })
+                .collect();
+            assert!(!strips.is_empty());
+            for strip in strips {
+                assert!(
+                    strip.order >= backdrop.order,
+                    "a strip of the tint at {} draws under its backdrop at {}",
+                    strip.order,
+                    backdrop.order
+                );
+            }
         })
         .unwrap();
     }

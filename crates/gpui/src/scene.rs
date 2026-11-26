@@ -453,6 +453,25 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Inserts the pieces of one shape at one order between them, the one the highest piece
+    /// needs, so whatever lies under any piece draws before all of them.
+    pub(crate) fn insert_as_one<P: Into<Primitive>>(
+        &mut self,
+        pieces: impl IntoIterator<Item = P>,
+    ) {
+        // The innermost open paint layer already gives everything in it one order.
+        let layered = self.layer_stack.is_empty();
+        if layered {
+            self.push_layer();
+        }
+        for piece in pieces {
+            self.insert_primitive(piece);
+        }
+        if layered {
+            self.pop_layer();
+        }
+    }
+
     /// Inserts a primitive replayed from a scene whose history matched this one's where the
     /// replay began, with the order it was drawn at there.
     fn keep_primitive(&mut self, primitive: Primitive) {
