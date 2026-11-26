@@ -419,7 +419,8 @@ impl Scene {
         self.push_span(id, span.bounds);
         // A span pushed by hand can open a layer or a filter it does not close, or close one
         // it did not open. The replay keeps count, so it never closes the caller's and never
-        // leaves one of its own open.
+        // leaves one of its own open. A paint layer opens only inside a filter, so the layers
+        // left open close first.
         let (mut layers, mut filters) = (0usize, 0usize);
         for operation in &prev_scene.paint_operations[span.operations.clone()] {
             match operation {
@@ -452,11 +453,11 @@ impl Scene {
                 | PaintOperation::EndSpan => {}
             }
         }
-        for _ in 0..filters {
-            self.pop_filter();
-        }
         for _ in 0..layers {
             self.pop_layer();
+        }
+        for _ in 0..filters {
+            self.pop_filter();
         }
         self.pop_span();
         true
@@ -533,6 +534,25 @@ impl Scene {
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
         true
+    }
+
+    /// Inserts the pieces of one shape at one order between them, the one the highest piece
+    /// needs, so whatever lies under any piece draws before all of them.
+    pub(crate) fn insert_as_one<P: Into<Primitive>>(
+        &mut self,
+        pieces: impl IntoIterator<Item = P>,
+    ) {
+        // The innermost open paint layer already gives everything in it one order.
+        let layered = self.layer_stack.is_empty();
+        if layered {
+            self.push_layer();
+        }
+        for piece in pieces {
+            self.insert_primitive(piece);
+        }
+        if layered {
+            self.pop_layer();
+        }
     }
 
     /// Inserts a primitive replayed from a scene whose history matched this one's where the
@@ -633,12 +653,13 @@ impl Scene {
         let first_mark = prev_scene
             .marks
             .partition_point(|(index, _)| *index < range.start);
-        let keep = prev_scene.marks.get(first_mark) == Some(&(range.start, self.history));
+        // Inside an open paint layer every primitive takes the layer's order when it closes,
+        // which the history does not foresee, so nothing there keeps its order.
+        let keep = self.layer_stack.is_empty()
+            && prev_scene.marks.get(first_mark) == Some(&(range.start, self.history));
         // A paint layer gets its order when the outermost one closes, so a layer keeps its
         // order only when the replay opens every layer around it and closes it again.
-        let layers_kept = keep
-            && self.layer_stack.is_empty()
-            && closes_its_layers(&prev_scene.paint_operations[range.clone()]);
+        let layers_kept = keep && closes_its_layers(&prev_scene.paint_operations[range.clone()]);
         let mut marks = prev_scene.marks[first_mark..]
             .iter()
             .map(|(index, _)| *index)
@@ -859,11 +880,12 @@ impl PrimitiveKind {
     /// paint order. So, a primitive can only share the draw order of the
     /// topmost primitive it overlaps if that primitive's kind is at most the
     /// one returned here. Otherwise, it needs a new draw order. A backdrop shares only
-    /// with shadows and other backdrops, so every quad it overlaps is drawn before it blurs.
-    /// A custom shader shares at most with a quad, since shaders sharing an order are sorted by
-    /// their id rather than in paint order.
+    /// with shadows, so everything it overlaps, another backdrop included, is drawn before it
+    /// blurs. A custom shader shares at most with a quad, since shaders sharing an order are
+    /// sorted by their id rather than in paint order.
     fn max_shared_kind(self) -> Self {
         match self {
+            Self::Backdrop => Self::Shadow,
             Self::Shader => Self::Quad,
             Self::MonochromeSprite => Self::Underline,
             Self::SubpixelSprite => Self::MonochromeSprite,
@@ -1761,6 +1783,87 @@ mod layer_filter_tests {
     }
 
     #[test]
+    fn a_backdrop_over_another_blurs_once_the_one_under_it_is_drawn() {
+        let content_mask = ContentMask {
+            bounds: rect(0.0, 0.0, 500.0, 500.0),
+        };
+        let backdrop = |bounds| Backdrop {
+            blur: 8.0,
+            opacity: 1.0,
+            bounds,
+            content_mask,
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0.0, 0.0, 200.0, 100.0)));
+        // Two frosted panes apart from each other, and a third over both.
+        scene.insert_primitive(backdrop(rect(0.0, 0.0, 50.0, 50.0)));
+        scene.insert_primitive(backdrop(rect(100.0, 0.0, 50.0, 50.0)));
+        scene.insert_primitive(backdrop(rect(25.0, 25.0, 100.0, 50.0)));
+        scene.finish();
+
+        let batches: Vec<_> = scene
+            .batches()
+            .filter_map(|batch| match batch {
+                PrimitiveBatch::Backdrops(range) => Some(range),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batches, vec![0..2, 2..3]);
+    }
+
+    #[test]
+    fn a_replay_that_closes_an_open_paint_layer_orders_afresh() {
+        let mut painted = Scene::default();
+        painted.push_layer();
+        painted.insert_primitive(underline(rect(0.0, 0.0, 10.0, 10.0)));
+        painted.mark();
+        let start = painted.len();
+        painted.pop_layer();
+        painted.insert_primitive(quad(rect(50.0, 0.0, 10.0, 10.0)));
+        let range = start..painted.len();
+
+        // The history leaves out what goes into an open layer, so it matches although the layer
+        // now ends under the quad.
+        let mut replayed = Scene::default();
+        replayed.push_layer();
+        replayed.insert_primitive(underline(rect(50.0, 0.0, 10.0, 10.0)));
+        replayed.replay(range, &painted);
+
+        assert!(
+            replayed.quads[0].order > replayed.underlines[0].order,
+            "the quad at {} draws under the underline at {}",
+            replayed.quads[0].order,
+            replayed.underlines[0].order
+        );
+    }
+
+    #[test]
+    fn a_replayed_span_closes_its_paint_layers_inside_its_filters() {
+        let mut painted = Scene::default();
+        painted.push_span(1, Bounds::default());
+        painted.push_filter(
+            rect(0.0, 0.0, 100.0, 100.0),
+            origin(50.0, 50.0),
+            rect(0.0, 0.0, 500.0, 500.0),
+            Filter {
+                blur: 4.0,
+                ..Default::default()
+            },
+        );
+        painted.push_layer();
+        painted.insert_primitive(quad(rect(10.0, 10.0, 20.0, 20.0)));
+        // The span ends with the filter and the layer inside it still open.
+        painted.pop_span();
+        painted.pop_layer();
+        painted.pop_filter();
+
+        let mut replayed = Scene::default();
+        assert!(replayed.replay_span(1, &painted, 1.0));
+        assert_eq!(replayed.filtered(replayed.quads[0].order), Some(0));
+    }
+
+    #[test]
     fn an_order_shared_inside_a_filter_stays_inside_its_range() {
         let content_mask = rect(0.0, 0.0, 500.0, 500.0);
         let mut scene = Scene::default();
@@ -2118,6 +2221,8 @@ impl<'a> Iterator for BatchIterator<'a> {
             PrimitiveKind::Backdrop => {
                 // The renderer blurs a batch once at a single radius, so a backdrop of another
                 // radius starts a batch of its own rather than taking on its neighbours' blur.
+                // A backdrop of a later order may lie over one in this batch, so it has to blur
+                // what the batch drew and waits for a batch of its own too.
                 let backdrops_start = self.backdrops_start;
                 let mut backdrops_end = backdrops_start + 1;
                 let blur = self
@@ -2126,9 +2231,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .map_or(0., |backdrop| backdrop.blur);
                 while self
                     .backdrops_iter
-                    .next_if(|backdrop| {
-                        (backdrop.order, batch_kind) < max_order_and_kind && backdrop.blur == blur
-                    })
+                    .next_if(|backdrop| backdrop.order == first_order && backdrop.blur == blur)
                     .is_some()
                 {
                     backdrops_end += 1;
