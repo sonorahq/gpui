@@ -311,14 +311,6 @@ impl<V: View> ViewElement<V> {
     }
 }
 
-impl<V: View> IntoElement for ViewElement<V> {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 struct ViewElementState {
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
@@ -330,11 +322,9 @@ struct ViewElementState {
     /// prepaint on a frame that does not paint it, which leaves its paint range older than its
     /// prepaint range, so a replay needs both from the frame drawn last.
     painted: Option<u64>,
-    /// The inherited opacity the view last painted under. Painting multiplies colours by it,
-    /// so a replay under another one shows the old colours, and the view renders next frame.
-    /// It is only known at paint, after prepaint chose to replay.
-    opacity: f32,
     cache_key: ViewElementCacheKey,
+    /// The entities the view accessed while it was last drawn, in any phase,
+    /// restored when its prepaint is reused so the window stays subscribed.
     accessed_entities: FxHashSet<EntityId>,
 }
 
@@ -344,6 +334,7 @@ struct ViewElementCacheKey {
     text_style: TextStyle,
     /// What a rem is inside the view, which a parent can change without moving its bounds.
     rem_size: Pixels,
+    opacity: f32,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -557,16 +548,19 @@ fn prepaint_view(
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
                 let rem_size = window.rem_size();
+                let opacity = window.element_opacity();
                 let last_frame = |frame: u64| frame + 1 == window.drawn_frames;
 
                 // A replay does not restore the accessibility nodes the view's elements push
                 // while they prepaint, and the tree is built anew each frame, so a screen reader
-                // would lose the view.
+                // would lose the view. Opacity is compared by bits so that a NaN opacity still
+                // matches itself and the view keeps using its cache.
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
                     && element_state.cache_key.rem_size == rem_size
+                    && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                     && !window.a11y.is_active()
@@ -577,7 +571,7 @@ fn prepaint_view(
                     window.note_view_cache(true);
                     window.reuse_prepaint(element_state.prepaint_range.clone());
                     cx.entities
-                        .extend_accessed(&element_state.accessed_entities);
+                        .extend_accessed(element_state.accessed_entities.iter().copied());
                     let prepaint_end = window.prepaint_index();
                     element_state.prepaint_range = prepaint_start..prepaint_end;
                     element_state.frame = window.drawn_frames;
@@ -608,12 +602,12 @@ fn prepaint_view(
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         frame: window.drawn_frames,
                         painted: None,
-                        opacity: window.element_opacity(),
                         cache_key: ViewElementCacheKey {
                             bounds,
                             content_mask,
                             text_style,
                             rem_size,
+                            opacity,
                         },
                     },
                 )
@@ -655,13 +649,20 @@ fn paint_view(
                     let paint_start = window.paint_index();
                     let opacity = window.element_opacity();
 
+                    // Prepaint can only predict the opacity paint applies: an ancestor's
+                    // hover or drag-over style depends on this frame's hit test, which
+                    // isn't known until prepaint finishes. The key records what was
+                    // actually painted, and output replayed under a different opacity is
+                    // redrawn on the next frame.
                     if let Some(element) = element {
-                        element.paint(window, cx);
-                        element_state.opacity = opacity;
+                        let ((), accessed_entities) =
+                            cx.detect_accessed_entities(|cx| element.paint(window, cx));
+                        element_state.accessed_entities.extend(accessed_entities);
+                        element_state.cache_key.opacity = opacity;
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());
-                        if element_state.opacity != opacity {
-                            window.faded_views.push(entity_id);
+                        if element_state.cache_key.opacity.to_bits() != opacity.to_bits() {
+                            window.request_animation_frame();
                         }
                     }
 
@@ -779,14 +780,6 @@ mod tests {
             }
             let child = &mut self.child;
             window.with_rem_size(self.rem_size, |window| child.paint(window, cx));
-        }
-    }
-
-    impl IntoElement for Veil {
-        type Element = Self;
-
-        fn into_element(self) -> Self {
-            self
         }
     }
 

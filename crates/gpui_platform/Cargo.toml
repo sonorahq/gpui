@@ -29,6 +29,11 @@ wayland = ["gpui_linux/wayland"]
 x11 = ["gpui_linux/x11"]
 
 [[bench]]
+name = "atlas_upload"
+harness = false
+required-features = ["bench-support"]
+
+[[bench]]
 name = "focus_cleanup"
 path = "../gpui/benches/focus_cleanup.rs"
 harness = false
@@ -41,6 +46,11 @@ required-features = ["bench-support"]
 
 [[bench]]
 name = "randomized_element_tree"
+harness = false
+required-features = ["bench-support"]
+
+[[bench]]
+name = "primitives"
 harness = false
 required-features = ["bench-support"]
 

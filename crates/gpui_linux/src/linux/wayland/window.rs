@@ -33,9 +33,9 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
-use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
+use crate::linux::{Globals, Output, PendingActivation, WaylandClientStatePtr, get_window};
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload,
+    AnyWindowHandle, Bounds, Capslock, Corners, Decorations, DevicePixels, ExternalDragPayload,
     FrameRequestSource, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
     PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
@@ -109,11 +109,8 @@ pub struct WaylandWindowState {
     pub surface: wl_surface::WlSurface,
     app_id: Option<String>,
     appearance: WindowAppearance,
-    blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
-    background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
-    /// The radius the client rounds the window's corners with, so the blur behind it can
-    /// leave the cut corners clear.
-    corner_radius: Pixels,
+    kde_blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    background_effects: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -147,6 +144,7 @@ pub struct WaylandWindowState {
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
+    client_corner_radii: Corners<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
 }
 
@@ -618,9 +616,8 @@ impl WaylandWindowState {
             children: FxHashMap::default(),
             surface,
             app_id: options.app_id,
-            blur: None,
-            background_effect: None,
-            corner_radius: Pixels::ZERO,
+            kde_blur: None,
+            background_effects: None,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -650,6 +647,7 @@ impl WaylandWindowState {
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
+            client_corner_radii: Corners::default(),
             accesskit_adapter: None,
         })
     }
@@ -823,11 +821,13 @@ impl Drop for WaylandWindow {
         state.renderer.take();
 
         // Destroy blur first, this has no dependencies.
-        if let Some(blur) = &state.blur {
+        if let Some(blur) = &state.kde_blur {
             blur.release();
         }
-        if let Some(effect) = &state.background_effect {
-            effect.destroy();
+
+        // Destroy background effects, this has no dependencies.
+        if let Some(background_effects) = &state.background_effects {
+            background_effects.destroy();
         }
 
         // Decorations must be destroyed before the xdg state.
@@ -1188,12 +1188,11 @@ impl WaylandWindowStatePtr {
 
                 if let Some(mut configure) = state.in_progress_configure.take() {
                     let got_unmaximized = state.maximized && !configure.maximized;
+                    let fullscreen_changed = state.fullscreen != configure.fullscreen;
+                    let mode_changed = fullscreen_changed || state.maximized != configure.maximized;
                     state.fullscreen = configure.fullscreen;
                     state.maximized = configure.maximized;
-                    if state.tiling != configure.tiling {
-                        state.tiling = configure.tiling;
-                        update_blur(&mut state);
-                    }
+                    state.tiling = configure.tiling;
                     let visibility_changed = state.visibility != configure.visibility;
                     state.visibility = configure.visibility;
                     // Limit interactive resizes to once per vblank
@@ -1218,15 +1217,27 @@ impl WaylandWindowStatePtr {
                             }
                         }
                     }
+                    let resized = configure.size.is_some_and(|size| size != state.bounds.size);
                     drop(state);
                     if visibility_changed {
                         self.report_visibility(configure.visibility);
                     }
+                    if !throttled && let Some(size) = configure.size {
+                        self.resize(size);
+                    }
+                    if fullscreen_changed {
+                        self.notify_resize();
+                    }
                     if throttled {
                         return;
                     }
-                    if let Some(size) = configure.size {
-                        self.resize(size);
+                    // Same-size mode changes skip the resize callback, so report them as a move.
+                    if mode_changed && !resized && !fullscreen_changed {
+                        let callback = self.callbacks.borrow_mut().moved.take();
+                        if let Some(mut fun) = callback {
+                            fun();
+                            self.callbacks.borrow_mut().moved = Some(fun);
+                        }
                     }
                 }
             }
@@ -1249,7 +1260,7 @@ impl WaylandWindowStatePtr {
             );
 
             let initial_configure = self.frame_loop.get() == FrameLoop::Unconfigured;
-            drop(state);
+            update_window(state);
             if initial_configure {
                 self.frame(None, FrameRequestSource::NativeCallback);
             } else {
@@ -1618,12 +1629,22 @@ impl WaylandWindowStatePtr {
             self.callbacks.borrow_mut().resize = Some(fun);
         }
 
-        {
+        let state = self.state.borrow_mut();
+        if let Some(viewport) = &state.viewport {
+            viewport.set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
+        }
+        update_window(state);
+    }
+
+    fn notify_resize(&self) {
+        let (size, scale) = {
             let state = self.state.borrow();
-            if let Some(viewport) = &state.viewport {
-                viewport
-                    .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
-            }
+            (state.bounds.size, state.scale)
+        };
+        let callback = self.callbacks.borrow_mut().resize.take();
+        if let Some(mut fun) = callback {
+            fun(size, scale);
+            self.callbacks.borrow_mut().resize = Some(fun);
         }
     }
 
@@ -1957,18 +1978,23 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn activate(&self) {
-        // Try to request an activation token. Even though the activation is likely going to be rejected,
-        // KWin and Mutter can use the app_id to visually indicate we're requesting attention.
         let state = self.borrow();
         if let (Some(activation), Some(app_id)) = (&state.globals.activation, state.app_id.clone())
         {
-            state.client.set_pending_activation(state.surface.id());
-            let token = activation.get_activation_token(&state.globals.qh, ());
-            // The serial isn't exactly important here, since the activation is probably going to be rejected anyway.
-            let serial = state.client.get_serial(SerialKind::MousePress);
+            let token = activation.get_activation_token(
+                &state.globals.qh,
+                PendingActivation::Window(state.surface.id()),
+            );
             token.set_app_id(app_id);
-            token.set_serial(serial.as_raw(), &state.globals.seat);
-            token.set_surface(&state.surface);
+            // Without a recent press the compositor won't grant focus, but still request a
+            // token: KWin and Mutter mark the window as demanding attention and end their
+            // launch feedback once the token is passed to `activate`.
+            if let Some(context) = state.client.activation_context() {
+                token.set_serial(context.serial.as_raw(), &state.globals.seat);
+                token.set_surface(&context.requesting_surface);
+            } else {
+                token.set_surface(&state.surface);
+            }
             token.commit();
         }
     }
@@ -2017,18 +2043,7 @@ impl PlatformWindow for WaylandWindow {
 
     fn is_background_blur_supported(&self) -> bool {
         let state = self.borrow();
-        state.globals.background_blur.get() || state.globals.blur_manager.borrow().is_some()
-    }
-
-    fn set_window_corner_radius(&self, radius: Pixels) {
-        let mut state = self.borrow_mut();
-        if state.corner_radius == radius {
-            return;
-        }
-        state.corner_radius = radius;
-        update_blur(&mut state);
-        drop(state);
-        self.0.request_redraw();
+        state.globals.background_blur.get() || state.globals.kde_blur_manager.borrow().is_some()
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -2345,6 +2360,15 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    fn set_client_corner_radii(&self, radii: Corners<Pixels>) {
+        let mut state = self.borrow_mut();
+        if radii != state.client_corner_radii {
+            state.client_corner_radii = radii;
+            update_window(state);
+            self.0.request_redraw();
+        }
+    }
+
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let state = self.borrow();
         if !state.active {
@@ -2424,31 +2448,166 @@ impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
     }
 }
 
+fn add_rounded_rect(
+    area: Bounds<i32>,
+    radii: Corners<Pixels>,
+    mut add_rectangle: impl FnMut(i32, i32, i32, i32),
+) {
+    if area.size.width <= 0 || area.size.height <= 0 {
+        return;
+    }
+
+    let clamp_radius = |radius: Pixels| {
+        radius
+            .to_i32()
+            .max(0)
+            .min(area.size.width / 2)
+            .min(area.size.height / 2)
+    };
+    let top_left = clamp_radius(radii.top_left);
+    let top_right = clamp_radius(radii.top_right);
+    let bottom_left = clamp_radius(radii.bottom_left);
+    let bottom_right = clamp_radius(radii.bottom_right);
+
+    let corner_inset = |radius: i32, row: i32| {
+        if row >= radius {
+            return 0;
+        }
+        let y = f64::from(radius) - (f64::from(row) + 0.5);
+        let x = (f64::from(radius).powi(2) - y * y).sqrt();
+        (f64::from(radius) - x - 0.5).ceil() as i32
+    };
+
+    for (left_radius, right_radius, bottom) in [
+        (top_left, top_right, false),
+        (bottom_left, bottom_right, true),
+    ] {
+        for row in 0..left_radius.max(right_radius) {
+            let left_inset = corner_inset(left_radius, row);
+            let right_inset = corner_inset(right_radius, row);
+            let width = area.size.width - left_inset - right_inset;
+            if width <= 0 {
+                continue;
+            }
+            let y = if bottom {
+                area.origin.y + area.size.height - row - 1
+            } else {
+                area.origin.y + row
+            };
+            add_rectangle(area.origin.x + left_inset, y, width, 1);
+        }
+    }
+
+    let top_height = top_left.max(top_right);
+    let bottom_height = bottom_left.max(bottom_right);
+    let height = area.size.height - top_height - bottom_height;
+    if height > 0 {
+        add_rectangle(
+            area.origin.x,
+            area.origin.y + top_height,
+            area.size.width,
+            height,
+        );
+    }
+}
+
+#[cfg(test)]
+mod rounded_rect_tests {
+    use super::add_rounded_rect;
+    use gpui::{Bounds, Corners, Pixels, point, px, size};
+
+    fn rectangles(area: Bounds<i32>, radii: Corners<Pixels>) -> Vec<(i32, i32, i32, i32)> {
+        let mut rectangles = Vec::new();
+        add_rounded_rect(area, radii, |x, y, width, height| {
+            rectangles.push((x, y, width, height));
+        });
+        rectangles
+    }
+
+    #[test]
+    fn square_corners() {
+        let area = Bounds::new(point(10, 20), size(8, 8));
+        assert_eq!(rectangles(area, Corners::default()), vec![(10, 20, 8, 8)]);
+    }
+
+    #[test]
+    fn independent_corners() {
+        let area = Bounds::new(point(10, 20), size(8, 8));
+        let radii = Corners {
+            top_left: px(4.0),
+            top_right: px(0.0),
+            bottom_left: px(0.0),
+            bottom_right: px(4.0),
+        };
+        assert_eq!(
+            rectangles(area, radii),
+            vec![
+                (12, 20, 6, 1),
+                (11, 21, 7, 1),
+                (10, 22, 8, 1),
+                (10, 23, 8, 1),
+                (10, 27, 6, 1),
+                (10, 26, 7, 1),
+                (10, 25, 8, 1),
+                (10, 24, 8, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn clamps_radii() {
+        let area = Bounds::new(point(10, 20), size(10, 6));
+        assert_eq!(
+            rectangles(area, Corners::all(px(100.0))),
+            rectangles(area, Corners::all(px(3.0)))
+        );
+        assert_eq!(
+            rectangles(area, Corners::all(px(-1.0))),
+            rectangles(area, Corners::default())
+        );
+    }
+
+    #[test]
+    fn empty_area() {
+        for dimensions in [size(0, 10), size(10, 0), size(-1, 10), size(10, -1)] {
+            let area = Bounds::new(point(10, 20), dimensions);
+            assert!(rectangles(area, Corners::all(px(4.0))).is_empty());
+        }
+    }
+}
+
 fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
     if let Some(renderer) = &mut state.renderer {
         renderer.update_transparency(!opaque);
     }
-    let opaque_area = state.window_bounds.map(|v| f32::from(v) as i32);
-    opaque_area.inset(f32::from(state.inset()) as i32);
+
+    let area = inset_by_tiling(
+        state.bounds.map_origin(|_| px(0.0)),
+        state.inset(),
+        state.tiling,
+    )
+    .map(|value| value.to_i32())
+    .map_size(|value| value.max(0));
 
     let region = state
         .globals
         .compositor
         .create_region(&state.globals.qh, ());
-    region.add(
-        opaque_area.origin.x,
-        opaque_area.origin.y,
-        opaque_area.size.width,
-        opaque_area.size.height,
-    );
 
-    // Note that rounded corners make this rectangle API hard to work with.
-    // As this is common when using CSD, let's just disable this API.
+    // Client decorations include transparent shadows and antialiased corners,
+    // so don't promise the compositor an opaque region.
     if state.background_appearance == WindowBackgroundAppearance::Opaque
         && state.decorations == WindowDecorations::Server
     {
+        region.add(
+            area.origin.x,
+            area.origin.y,
+            area.size.width,
+            area.size.height,
+        );
+
         // Promise the compositor that this region of the window surface
         // contains no transparent pixels. This allows the compositor to skip
         // updating whatever is behind the surface for better performance.
@@ -2468,19 +2627,19 @@ fn update_blur(state: &mut WaylandWindowState) {
     let blurred = state.background_appearance == WindowBackgroundAppearance::Blurred;
     let effect_manager = state
         .globals
-        .background_effect_manager
+        .background_effects_manager
         .clone()
         .filter(|_| state.globals.background_blur.get());
 
     if let Some(manager) = effect_manager {
-        if let Some(blur) = state.blur.take() {
-            if let Some(blur_manager) = state.globals.blur_manager.borrow().as_ref() {
+        if let Some(blur) = state.kde_blur.take() {
+            if let Some(blur_manager) = state.globals.kde_blur_manager.borrow().as_ref() {
                 blur_manager.unset(&state.surface);
             }
             blur.release();
         }
         let region = blurred.then(|| blur_region(state));
-        let effect = state.background_effect.get_or_insert_with(|| {
+        let effect = state.background_effects.get_or_insert_with(|| {
             manager.get_background_effect(&state.surface, &state.globals.qh, ())
         });
         effect.set_blur_region(region.as_ref());
@@ -2490,11 +2649,11 @@ fn update_blur(state: &mut WaylandWindowState) {
         return;
     }
 
-    if let Some(effect) = &state.background_effect {
+    if let Some(effect) = &state.background_effects {
         effect.set_blur_region(None);
     }
-    let Some(blur_manager) = state.globals.blur_manager.borrow().clone() else {
-        if let Some(blur) = state.blur.take() {
+    let Some(blur_manager) = state.globals.kde_blur_manager.borrow().clone() else {
+        if let Some(blur) = state.kde_blur.take() {
             blur.release();
         }
         return;
@@ -2508,13 +2667,13 @@ fn update_blur(state: &mut WaylandWindowState) {
             blur.set_region(Some(&region));
             blur.commit();
             region.destroy();
-            if let Some(stale) = state.blur.replace(blur) {
+            if let Some(stale) = state.kde_blur.replace(blur) {
                 stale.release();
             }
         }
         false => {
             blur_manager.unset(&state.surface);
-            if let Some(blur) = state.blur.take() {
+            if let Some(blur) = state.kde_blur.take() {
                 blur.release();
             }
         }
@@ -2522,29 +2681,22 @@ fn update_blur(state: &mut WaylandWindowState) {
 }
 
 /// The part of the surface the compositor blurs behind: the window inside its client-side
-/// shadow, with each corner cut in one pixel rows to follow the window's corner radius.
+/// shadow, with its corners cut to follow the client's corner radii.
 fn blur_region(state: &WaylandWindowState) -> wl_region::WlRegion {
-    let window = inset_by_tiling(
-        Bounds::new(Point::default(), state.bounds.size),
+    let area = inset_by_tiling(
+        state.bounds.map_origin(|_| px(0.0)),
         state.inset(),
         state.tiling,
     )
-    .map(|value| f32::from(value) as i32);
-    let (x, y) = (window.origin.x, window.origin.y);
-    let (width, height) = (window.size.width.max(0), window.size.height.max(0));
-    let radius = (f32::from(state.corner_radius).round() as i32).clamp(0, width.min(height) / 2);
-
+    .map(|value| value.to_i32())
+    .map_size(|value| value.max(0));
     let region = state
         .globals
         .compositor
         .create_region(&state.globals.qh, ());
-    region.add(x, y + radius, width, height - 2 * radius);
-    for row in 0..radius {
-        let rise = (radius - row) as f32 - 0.5;
-        let cut = radius - ((radius * radius) as f32 - rise * rise).sqrt().round() as i32;
-        region.add(x + cut, y + row, width - 2 * cut, 1);
-        region.add(x + cut, y + height - 1 - row, width - 2 * cut, 1);
-    }
+    add_rounded_rect(area, state.client_corner_radii, |x, y, width, height| {
+        region.add(x, y, width, height);
+    });
     region
 }
 
