@@ -6496,6 +6496,17 @@ impl Window {
         self.layout_engine = Some(layout_engine);
     }
 
+    /// Where a laid out node was placed before rounding. `None` until its bounds are read this
+    /// frame.
+    pub(crate) fn layout_unrounded(&self, layout_id: LayoutId) -> Option<crate::taffy::Unrounded> {
+        self.layout_engine.as_ref()?.unrounded(layout_id)
+    }
+
+    /// Lays `root` out in place of `node`, so its edges round where they would inside it.
+    pub(crate) fn stand_in(&mut self, root: LayoutId, node: LayoutId) {
+        self.layout_engine.as_mut().unwrap().stand_in(root, node);
+    }
+
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
     /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
     ///
