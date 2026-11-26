@@ -718,11 +718,12 @@ impl PrimitiveKind {
     /// paint order. So, a primitive can only share the draw order of the
     /// topmost primitive it overlaps if that primitive's kind is at most the
     /// one returned here. Otherwise, it needs a new draw order. A backdrop shares only
-    /// with shadows and other backdrops, so every quad it overlaps is drawn before it blurs.
-    /// A custom shader shares at most with a quad, since shaders sharing an order are sorted by
-    /// their id rather than in paint order.
+    /// with shadows, so everything it overlaps, another backdrop included, is drawn before it
+    /// blurs. A custom shader shares at most with a quad, since shaders sharing an order are
+    /// sorted by their id rather than in paint order.
     fn max_shared_kind(self) -> Self {
         match self {
+            Self::Backdrop => Self::Shadow,
             Self::Shader => Self::Quad,
             Self::MonochromeSprite => Self::Underline,
             Self::SubpixelSprite => Self::MonochromeSprite,
@@ -1620,6 +1621,36 @@ mod layer_filter_tests {
     }
 
     #[test]
+    fn a_backdrop_over_another_blurs_once_the_one_under_it_is_drawn() {
+        let content_mask = ContentMask {
+            bounds: rect(0.0, 0.0, 500.0, 500.0),
+        };
+        let backdrop = |bounds| Backdrop {
+            blur: 8.0,
+            opacity: 1.0,
+            bounds,
+            content_mask,
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0.0, 0.0, 200.0, 100.0)));
+        // Two frosted panes apart from each other, and a third over both.
+        scene.insert_primitive(backdrop(rect(0.0, 0.0, 50.0, 50.0)));
+        scene.insert_primitive(backdrop(rect(100.0, 0.0, 50.0, 50.0)));
+        scene.insert_primitive(backdrop(rect(25.0, 25.0, 100.0, 50.0)));
+        scene.finish();
+
+        let batches: Vec<_> = scene
+            .batches()
+            .filter_map(|batch| match batch {
+                PrimitiveBatch::Backdrops(range) => Some(range),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batches, vec![0..2, 2..3]);
+    }
+
+    #[test]
     fn an_order_shared_inside_a_filter_stays_inside_its_range() {
         let content_mask = rect(0.0, 0.0, 500.0, 500.0);
         let mut scene = Scene::default();
@@ -1977,6 +2008,8 @@ impl<'a> Iterator for BatchIterator<'a> {
             PrimitiveKind::Backdrop => {
                 // The renderer blurs a batch once at a single radius, so a backdrop of another
                 // radius starts a batch of its own rather than taking on its neighbours' blur.
+                // A backdrop of a later order may lie over one in this batch, so it has to blur
+                // what the batch drew and waits for a batch of its own too.
                 let backdrops_start = self.backdrops_start;
                 let mut backdrops_end = backdrops_start + 1;
                 let blur = self
@@ -1985,9 +2018,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .map_or(0., |backdrop| backdrop.blur);
                 while self
                     .backdrops_iter
-                    .next_if(|backdrop| {
-                        (backdrop.order, batch_kind) < max_order_and_kind && backdrop.blur == blur
-                    })
+                    .next_if(|backdrop| backdrop.order == first_order && backdrop.blur == blur)
                     .is_some()
                 {
                     backdrops_end += 1;
