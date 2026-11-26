@@ -26,13 +26,26 @@ const HISTORY_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
 /// What a scene tells its bounds tree, as folded into [`Scene::history`].
 #[derive(Clone, Copy)]
-#[repr(u64)]
 enum TreeEvent {
-    Insert = 1,
+    /// Bounds going in with the kind they take and the highest kind they may share an order
+    /// with, which together decide the order they get.
+    Insert(PrimitiveKind, PrimitiveKind),
     PushLayer,
     PopLayer,
     Open,
     Close,
+}
+
+impl TreeEvent {
+    fn word(self) -> u64 {
+        match self {
+            Self::Insert(kind, shared) => 1 | (kind as u64) << 8 | (shared as u64) << 16,
+            Self::PushLayer => 2,
+            Self::PopLayer => 3,
+            Self::Open => 4,
+            Self::Close => 5,
+        }
+    }
 }
 
 /// Where a named span sits among a scene's paint operations, with the bounds it was given.
@@ -79,9 +92,9 @@ struct Layer {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    /// A running hash of every primitive this frame inserted, in or out of a paint layer, and
-    /// of every layer and filter it opened and closed, in order. Two scenes with the same history
-    /// hand out the same orders from there on.
+    /// A running hash of every insert into the bounds tree this frame, a primitive's or a closed
+    /// paint layer's, and of every layer and filter it opened and closed, in order. Two scenes
+    /// with the same history hand out the same orders from there on.
     history: u64,
     /// The history at chosen paint operation indices, in rising index order, so a later frame
     /// that replays from one of them can tell whether its orders still hold.
@@ -148,11 +161,7 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self) {
-        self.record(
-            TreeEvent::PushLayer,
-            PrimitiveKind::default(),
-            Bounds::default(),
-        );
+        self.record(TreeEvent::PushLayer, Bounds::default());
         self.layer_stack.push(self.layers.len());
         self.layers.push_back(Layer {
             primitives: SmallVec::new(),
@@ -165,11 +174,7 @@ impl Scene {
     }
 
     pub fn pop_layer(&mut self) {
-        self.record(
-            TreeEvent::PopLayer,
-            PrimitiveKind::default(),
-            Bounds::default(),
-        );
+        self.record(TreeEvent::PopLayer, Bounds::default());
         self.layer_stack.pop();
         if self.layer_stack.is_empty() {
             while let Some(layer) = self.layers.pop_front() {
@@ -185,6 +190,10 @@ impl Scene {
         if layer.primitives.is_empty() {
             return;
         }
+        self.record(
+            TreeEvent::Insert(layer.max_kind, layer.max_shared_kind),
+            layer.bounds,
+        );
         let order = match layer.known {
             Some(order) => {
                 self.primitive_bounds
@@ -226,7 +235,7 @@ impl Scene {
             self.layer_stack.is_empty(),
             "a filtered layer opened inside a paint layer"
         );
-        self.record(TreeEvent::Open, PrimitiveKind::default(), Bounds::default());
+        self.record(TreeEvent::Open, Bounds::default());
         let start = self.primitive_bounds.open();
         let mut destination_bounds =
             scale_bounds_around(source_bounds, transform_origin, filter.scale);
@@ -253,7 +262,7 @@ impl Scene {
     pub fn pop_filter(&mut self) {
         if let Some(index) = self.effect_stack.pop() {
             let footprint = self.effects[index].destination_clip();
-            self.record(TreeEvent::Close, PrimitiveKind::default(), footprint);
+            self.record(TreeEvent::Close, footprint);
             self.effects[index].end = self.primitive_bounds.close(footprint);
         }
         self.paint_operations.push(PaintOperation::EndFilter);
@@ -383,8 +392,11 @@ impl Scene {
         }
 
         let kind = primitive.kind();
-        self.record(TreeEvent::Insert, kind, clipped_bounds);
         if !self.add_to_layer(clipped_bounds, kind, None) {
+            self.record(
+                TreeEvent::Insert(kind, kind.max_shared_kind()),
+                clipped_bounds,
+            );
             let order = self
                 .primitive_bounds
                 .insert(clipped_bounds, kind, kind.max_shared_kind());
@@ -402,8 +414,11 @@ impl Scene {
         let clipped_bounds = primitive.clipped_bounds();
         let kind = primitive.kind();
         let order = primitive.order();
-        self.record(TreeEvent::Insert, kind, clipped_bounds);
         if !self.add_to_layer(clipped_bounds, kind, layers_kept.then_some(order)) {
+            self.record(
+                TreeEvent::Insert(kind, kind.max_shared_kind()),
+                clipped_bounds,
+            );
             self.primitive_bounds
                 .insert_known(clipped_bounds, order, kind);
             self.push_primitive(primitive.clone(), order);
@@ -516,14 +531,13 @@ impl Scene {
         }
     }
 
-    /// Folds one event into the history. An insert names its kind, which the tree keeps with
-    /// the order and which decides whether that order can be shared.
-    fn record(&mut self, event: TreeEvent, kind: PrimitiveKind, bounds: Bounds<ScaledPixels>) {
+    /// Folds one event into the history.
+    fn record(&mut self, event: TreeEvent, bounds: Bounds<ScaledPixels>) {
         let pair = |a: ScaledPixels, b: ScaledPixels| {
             (u64::from(a.0.to_bits()) << 32) | u64::from(b.0.to_bits())
         };
         for word in [
-            event as u64 | (kind as u64) << 8,
+            event.word(),
             pair(bounds.origin.x, bounds.origin.y),
             pair(bounds.size.width, bounds.size.height),
         ] {
