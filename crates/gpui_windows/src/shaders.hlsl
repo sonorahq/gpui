@@ -1070,7 +1070,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
     Shadow shadow = shadows[input.shadow_id];
 
     float alpha;
-    if (shadow.shape_bounds.size.width <= 0. || shadow.shape_bounds.size.height <= 0.) {
+    if (shadow.shape_bounds.size.x <= 0. || shadow.shape_bounds.size.y <= 0.) {
         alpha = 0.;
     } else if (shadow.blur_radius == 0.) {
         float distance = quad_sdf(input.position.xy, shadow.shape_bounds, shadow.shape_corner_radii, 0.0);

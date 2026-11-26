@@ -4550,7 +4550,7 @@ fn collapsed_inset_shadow_hole_fills_element() -> anyhow::Result<()> {
         size(ScaledPixels(48.0), ScaledPixels(48.0)),
     );
     let collapsed_hole = Bounds::new(
-        point(ScaledPixels(32.0), ScaledPixels(32.0)),
+        point(ScaledPixels(32.5), ScaledPixels(32.5)),
         size(ScaledPixels(0.0), ScaledPixels(0.0)),
     );
     for blur_radius in [8.0, 0.0] {

@@ -5577,6 +5577,13 @@ impl Window {
                 continue;
             }
             let hole = (bounds + shadow.offset).dilate(-shadow.spread_radius);
+            // Keep an empty hole empty rather than letting cover_bounds expand a fractional
+            // collapsed rect into a 1px hole.
+            let shape_bounds = if hole.is_empty() {
+                Bounds::default()
+            } else {
+                self.cover_bounds(hole)
+            };
             // Clamp at zero so a large spread can't produce negative radii, which would
             // break the SDF in the shader.
             let zero = Pixels::ZERO;
@@ -5593,7 +5600,7 @@ impl Window {
                 content_mask,
                 corner_radii: element_corner_radii,
                 color: shadow.color.opacity(opacity),
-                shape_bounds: self.cover_bounds(hole),
+                shape_bounds,
                 shape_corner_radii: hole_corner_radii.scale(scale_factor),
                 inset: true.into(),
                 element_corner_smoothing: corner_smoothing,
@@ -12276,5 +12283,45 @@ mod inspector_tests {
         let square_interior = Window::largest_border_interior(&quad);
         assert_eq!(square_interior.origin.y, ScaledPixels(2.0));
         assert_eq!(square_interior.origin.x, ScaledPixels(51.0));
+    }
+
+    #[gpui::test]
+    fn test_collapsed_inset_shadow_hole_stays_empty_at_fractional_origin(cx: &mut TestAppContext) {
+        struct BlankView;
+        impl Render for BlankView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let window = cx.add_window(|_, _| BlankView);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.invalidator.set_phase(DrawPhase::Paint);
+            let bounds = Bounds::new(point(px(10.5), px(10.5)), size(px(20.0), px(20.0)));
+            window.paint_inset_shadows(
+                bounds,
+                Corners::default(),
+                0.0,
+                &[BoxShadow {
+                    color: crate::black(),
+                    offset: point(px(0.0), px(0.0)),
+                    blur_radius: px(4.0),
+                    spread_radius: px(10.0),
+                    inset: true,
+                }],
+            );
+            let shadow = window
+                .next_frame
+                .scene
+                .shadows
+                .last()
+                .expect("collapsed inset shadow inserted");
+            assert!(
+                shadow.shape_bounds.is_empty(),
+                "collapsed inset hole at fractional origin must stay empty, got {:?}",
+                shadow.shape_bounds
+            );
+        })
+        .unwrap();
     }
 }
