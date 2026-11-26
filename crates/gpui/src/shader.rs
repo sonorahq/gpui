@@ -250,8 +250,8 @@ impl ShaderProgram {
     /// Translates the shader to HLSL for shader model 5.0. The globals are bound at constant
     /// buffer [`HlslShader::GLOBALS_REGISTER`], the batch's first instance at
     /// [`HlslShader::CONSTANTS_REGISTER`] and the instances, as a raw buffer, at texture register
-    /// [`HlslShader::INSTANCES_REGISTER`]. They sit past the registers the built in shaders use,
-    /// so drawing a custom shader leaves those bindings alone.
+    /// [`HlslShader::INSTANCES_REGISTER`]. That texture register is also where the built in path
+    /// shader reads its curves, so a renderer binds the path buffers again before it draws paths.
     #[cfg(any(target_os = "windows", test))]
     pub fn to_hlsl(&self) -> Result<HlslShader, ShaderError> {
         use naga::back::hlsl;

@@ -152,7 +152,7 @@ fn load_quad(instance_id: u32) -> Quad {
 }
 
 fn load_shadow(instance_id: u32) -> Shadow {
-    var cursor = instance_cursor(instance_id * 28u);
+    var cursor = instance_cursor(instance_id * 36u);
     return Shadow(
         read_word(&cursor),
         read_f32(&cursor),
@@ -164,22 +164,48 @@ fn load_shadow(instance_id: u32) -> Shadow {
         read_corners(&cursor),
         read_word(&cursor),
         read_f32(&cursor),
-    );
-}
-
-fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    var cursor = instance_cursor(vertex_id * 26u);
-    return PathRasterizationVertex(
-        read_vec2_f32(&cursor),
-        read_vec2_f32(&cursor),
-        read_background(&cursor),
         read_bounds(&cursor),
+        read_corners(&cursor),
     );
 }
 
-fn load_path_sprite(instance_id: u32) -> PathSprite {
-    var cursor = instance_cursor(instance_id * 4u);
-    return PathSprite(read_bounds(&cursor));
+fn load_path_tile(instance_id: u32) -> PathTile {
+    var cursor = instance_cursor(instance_id * 14u);
+    return PathTile(
+        read_word(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
+        read_i32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+    );
+}
+
+// Tiles index this frame's paint and curve arrays, which start at the bases in `globals`.
+fn load_path_curve(index: u32) -> PathCurve {
+    var cursor = instance_cursor((globals.path_curve_base + index) * 10u);
+    return PathCurve(
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_f32(&cursor),
+        read_word(&cursor),
+    );
+}
+
+fn load_path_paint(index: u32) -> PathPaint {
+    var cursor = instance_cursor((globals.path_paint_base + index) * 28u);
+    return PathPaint(
+        read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_background(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
+    );
 }
 
 fn load_underline(instance_id: u32) -> Underline {

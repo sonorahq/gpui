@@ -1,4 +1,5 @@
 use std::{
+    ops::Range,
     slice,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -27,14 +28,12 @@ use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
-// This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
-const PATH_MULTISAMPLE_COUNT: u32 = 4;
 /// How deeply filtered layers can nest before the innermost ones stop being filtered. Each depth
 /// keeps one offscreen target, made the first time a frame nests that deep.
 const LAYER_DEPTH: usize = 8;
 /// How long an offscreen target may go unused before its memory is given back. A frame with a
-/// blur, layer or path on screen touches its targets every time, so only targets that nothing
-/// on screen draws through are released.
+/// blur or layer on screen touches its targets every time, so only targets that nothing on
+/// screen draws through are released.
 const IDLE_RELEASE: Duration = Duration::from_secs(2);
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
@@ -84,9 +83,6 @@ struct DirectXResources {
     swap_chain: IDXGISwapChain1,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
-
-    /// Path intermediate textures (with MSAA), created by the first frame that draws a path.
-    paths: Option<PathTargets>,
 
     // Offscreen targets the frame blurs and masks through
     filters: FilterTargets,
@@ -235,15 +231,6 @@ impl FilterTargets {
     }
 }
 
-/// The textures paths are rasterized through, made for the swap chain's size.
-struct PathTargets {
-    texture: ID3D11Texture2D,
-    srv: Option<ID3D11ShaderResourceView>,
-    msaa_texture: ID3D11Texture2D,
-    msaa_view: Option<ID3D11RenderTargetView>,
-    used: Instant,
-}
-
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct FilterParams {
@@ -297,8 +284,9 @@ struct DirectXRenderPipelines {
     mask_pipeline: PipelineState<FilterParams>,
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
-    path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
-    path_sprite_pipeline: PipelineState<PathSprite>,
+    path_tile_pipeline: PipelineState<PathTile>,
+    path_curves: StructuredBuffer<PathCurve>,
+    path_paints: StructuredBuffer<PathPaint>,
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
@@ -1164,6 +1152,7 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+        let mut path_tile_cursor = 0;
         for batch in scene.batches() {
             let _annotation = annotation
                 .as_ref()
@@ -1219,10 +1208,12 @@ impl DirectXRenderer {
                     self.draw_custom_shaders(shader, range.start, range.len())
                 }
                 PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.resume_target(&stack, mirrored)?;
-                    self.draw_paths_from_intermediate(paths)
+                    let tiles_start = path_tile_cursor;
+                    path_tile_cursor += scene.paths[range]
+                        .iter()
+                        .map(PaintedPath::tile_count)
+                        .sum::<usize>();
+                    self.draw_paths(tiles_start..path_tile_cursor)
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -1294,13 +1285,6 @@ impl DirectXRenderer {
             return;
         };
         resources.filters.release_idle(now);
-        if resources
-            .paths
-            .as_ref()
-            .is_some_and(|paths| now.duration_since(paths.used) >= IDLE_RELEASE)
-        {
-            resources.paths = None;
-        }
     }
 
     /// One filter target, created if no frame has drawn through it since it was last released.
@@ -1312,29 +1296,6 @@ impl DirectXRenderer {
             .context("resources missing")?
             .filters
             .touch(device, target, now)
-    }
-
-    /// The path textures, created if no frame has drawn a path since they were last released.
-    fn path_targets(&mut self) -> Result<&PathTargets> {
-        let now = self.frame_time;
-        let (width, height) = (self.width, self.height);
-        let device = &self.devices.as_ref().context("devices missing")?.device;
-        let resources = self.resources.as_mut().context("resources missing")?;
-        if resources.paths.is_none() {
-            let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
-            let (msaa_texture, msaa_view) =
-                create_path_intermediate_msaa_texture_and_view(device, width, height)?;
-            resources.paths = Some(PathTargets {
-                texture,
-                srv,
-                msaa_texture,
-                msaa_view,
-                used: now,
-            });
-        }
-        let paths = resources.paths.as_mut().context("missing path targets")?;
-        paths.used = now;
-        Ok(paths)
     }
 
     /// Render `scene` to an offscreen CPU image **without presenting** so
@@ -1494,6 +1455,27 @@ impl DirectXRenderer {
             )?;
         }
 
+        if !scene.paths.is_empty() {
+            let mut paints = Vec::with_capacity(scene.paths.len());
+            let mut curves = Vec::new();
+            let mut tiles = Vec::new();
+            for path in &scene.paths {
+                path.append_to(&mut paints, &mut curves, &mut tiles);
+            }
+
+            self.pipelines.path_tile_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &tiles,
+            )?;
+            self.pipelines
+                .path_curves
+                .write(&devices.device, &devices.device_context, &curves)?;
+            self.pipelines
+                .path_paints
+                .write(&devices.device, &devices.device_context, &paints)?;
+        }
+
         if !scene.underlines.is_empty() {
             self.pipelines.underline_pipeline.update_buffer(
                 &devices.device,
@@ -1581,118 +1563,34 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
-        if paths.is_empty() {
+    /// Draws a range of the frame's path tiles. The curves and paints are bound here for every
+    /// draw rather than once per frame, since a custom shader takes register `t2` for its
+    /// instances.
+    fn draw_paths(&mut self, tile_range: Range<usize>) -> Result<()> {
+        if tile_range.is_empty() {
             return Ok(());
         }
-
-        let (texture, msaa_texture, msaa_view) = {
-            let targets = self.path_targets()?;
-            (
-                targets.texture.clone(),
-                targets.msaa_texture.clone(),
-                targets.msaa_view.clone(),
-            )
-        };
         let devices = self.devices.as_ref().context("devices missing")?;
-        // Clear intermediate MSAA texture
+        let buffers = [
+            self.pipelines.path_curves.view.clone(),
+            self.pipelines.path_paints.view.clone(),
+        ];
         unsafe {
-            devices.device_context.ClearRenderTargetView(
-                msaa_view.as_ref().context("missing path target")?,
-                &[0.0; 4],
-            );
-            // Set intermediate MSAA texture as render target
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&msaa_view)), None);
+                .VSSetShaderResources(2, Some(&buffers));
+            devices
+                .device_context
+                .PSSetShaderResources(2, Some(&buffers));
         }
-
-        // Collect all vertices and sprites for a single draw call
-        let mut vertices = Vec::new();
-
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.clipped_bounds(),
-            }));
-        }
-
-        self.pipelines.path_rasterization_pipeline.update_buffer(
-            &devices.device,
+        self.pipelines.path_tile_pipeline.draw_range(
             &devices.device_context,
-            &vertices,
-        )?;
-
-        self.pipelines.path_rasterization_pipeline.draw(
-            &devices.device_context,
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-            vertices.len() as u32,
-            1,
-        )?;
-
-        // Resolve MSAA to non-MSAA intermediate texture
-        unsafe {
-            devices.device_context.ResolveSubresource(
-                &texture,
-                0,
-                &msaa_texture,
-                0,
-                RENDER_TARGET_FORMAT,
-            );
-        }
-
-        Ok(())
-    }
-
-    fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
-        let Some(first_path) = paths.first() else {
-            return Ok(());
-        };
-
-        // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
-        let sprites = if paths.last().unwrap().order == first_path.order {
-            paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect::<Vec<_>>()
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            vec![PathSprite { bounds }]
-        };
-
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
-        self.pipelines.path_sprite_pipeline.update_buffer(
-            &devices.device,
-            &devices.device_context,
-            &sprites,
-        )?;
-
-        // Draw the sprites with the path texture
-        self.pipelines.path_sprite_pipeline.draw_with_texture(
-            &devices.device_context,
-            slice::from_ref(
-                &resources
-                    .paths
-                    .as_ref()
-                    .context("missing path targets")?
-                    .srv,
-            ),
-            slice::from_ref(&self.globals.sampler),
-            sprites.len() as u32,
+            self.globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?,
+            tile_range.start as u32,
+            tile_range.len() as u32,
         )
     }
 
@@ -1887,7 +1785,6 @@ impl DirectXResources {
             filters,
             render_target: Some(render_target),
             render_target_view,
-            paths: None,
             viewport,
         })
     }
@@ -1903,7 +1800,6 @@ impl DirectXResources {
             create_resources(devices, &self.swap_chain, width, height)?;
         // The offscreen targets are rebuilt at the new size by the first frame that needs them.
         self.filters = FilterTargets::new(width, height);
-        self.paths = None;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         self.viewport = viewport;
@@ -1984,20 +1880,15 @@ impl DirectXRenderPipelines {
             64,
             create_blend_state(device)?,
         )?;
-        let path_rasterization_pipeline = PipelineState::new(
+        let path_tile_pipeline = PipelineState::new(
             device,
-            "path_rasterization_pipeline",
-            ShaderModule::PathRasterization,
-            32,
-            create_blend_state_for_path_rasterization(device)?,
+            "path_tile_pipeline",
+            ShaderModule::PathTile,
+            64,
+            create_blend_state(device)?,
         )?;
-        let path_sprite_pipeline = PipelineState::new(
-            device,
-            "path_sprite_pipeline",
-            ShaderModule::PathSprite,
-            4,
-            create_blend_state_for_path_sprite(device)?,
-        )?;
+        let path_curves = StructuredBuffer::new(device, "path_curves", 256)?;
+        let path_paints = StructuredBuffer::new(device, "path_paints", 64)?;
         let underline_pipeline = PipelineState::new(
             device,
             "underline_pipeline",
@@ -2045,8 +1936,9 @@ impl DirectXRenderPipelines {
             mask_pipeline,
             shadow_pipeline,
             quad_pipeline,
-            path_rasterization_pipeline,
-            path_sprite_pipeline,
+            path_tile_pipeline,
+            path_curves,
+            path_paints,
             underline_pipeline,
             mono_sprites,
             subpixel_sprites,
@@ -2115,16 +2007,11 @@ struct BatchParams {
     _padding: [u32; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<BatchParams>() == 16);
-
-struct PipelineState<T> {
+struct StructuredBuffer<T> {
     label: &'static str,
-    vertex: ID3D11VertexShader,
-    fragment: ID3D11PixelShader,
     buffer: ID3D11Buffer,
-    buffer_size: usize,
+    capacity: usize,
     view: Option<ID3D11ShaderResourceView>,
-    blend_state: ID3D11BlendState,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -2152,6 +2039,64 @@ impl Shading {
     }
 }
 
+impl<T> StructuredBuffer<T> {
+    fn new(device: &ID3D11Device, label: &'static str, capacity: usize) -> Result<Self> {
+        let buffer = create_buffer(device, std::mem::size_of::<T>(), capacity)?;
+        let view = create_buffer_view(device, &buffer)?;
+        Ok(StructuredBuffer {
+            label,
+            buffer,
+            capacity,
+            view,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn write(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        data: &[T],
+    ) -> Result<()> {
+        self.ensure_capacity(device, data.len())?;
+        update_buffer(device_context, &self.buffer, data)
+    }
+
+    fn ensure_capacity(&mut self, device: &ID3D11Device, len: usize) -> Result<()> {
+        if self.capacity < len {
+            let element_size = std::mem::size_of::<T>().max(1);
+            let required_size = len.checked_mul(element_size);
+            anyhow::ensure!(
+                required_size.is_some_and(|size| size <= MAX_INSTANCE_BUFFER_SIZE),
+                "{} buffer needs {len} elements of {element_size} bytes, above the maximum of {MAX_INSTANCE_BUFFER_SIZE} bytes",
+                self.label
+            );
+            let new_capacity = len
+                .next_power_of_two()
+                .min(MAX_INSTANCE_BUFFER_SIZE / element_size);
+            log::debug!(
+                "Updating {} buffer size from {} to {}",
+                self.label,
+                self.capacity,
+                new_capacity
+            );
+            let buffer = create_buffer(device, std::mem::size_of::<T>(), new_capacity)?;
+            let view = create_buffer_view(device, &buffer)?;
+            self.buffer = buffer;
+            self.view = view;
+            self.capacity = new_capacity;
+        }
+        Ok(())
+    }
+}
+
+struct PipelineState<T> {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+    instances: StructuredBuffer<T>,
+    blend_state: ID3D11BlendState,
+}
+
 impl<T> PipelineState<T> {
     fn new(
         device: &ID3D11Device,
@@ -2168,18 +2113,12 @@ impl<T> PipelineState<T> {
             let raw_shader = RawShaderBytes::new(shader_module, ShaderTarget::Fragment)?;
             create_fragment_shader(device, raw_shader.as_bytes())?
         };
-        let buffer = create_buffer(device, std::mem::size_of::<T>(), buffer_size)?;
-        let view = create_buffer_view(device, &buffer)?;
 
         Ok(PipelineState {
-            label,
             vertex,
             fragment,
-            buffer,
-            buffer_size,
-            view,
+            instances: StructuredBuffer::new(device, label, buffer_size)?,
             blend_state,
-            _marker: std::marker::PhantomData,
         })
     }
 
@@ -2189,77 +2128,7 @@ impl<T> PipelineState<T> {
         device_context: &ID3D11DeviceContext,
         data: &[T],
     ) -> Result<()> {
-        if self.buffer_size < data.len() {
-            let element_size = std::mem::size_of::<T>();
-            let required_size = std::mem::size_of_val(data);
-            anyhow::ensure!(
-                required_size <= MAX_INSTANCE_BUFFER_SIZE,
-                "{} buffer needs {required_size} bytes, above the maximum of {MAX_INSTANCE_BUFFER_SIZE}",
-                self.label
-            );
-            let new_buffer_size = data
-                .len()
-                .next_power_of_two()
-                .min(MAX_INSTANCE_BUFFER_SIZE / element_size);
-            log::debug!(
-                "Updating {} buffer size from {} to {}",
-                self.label,
-                self.buffer_size,
-                new_buffer_size
-            );
-            let buffer = create_buffer(device, std::mem::size_of::<T>(), new_buffer_size)?;
-            let view = create_buffer_view(device, &buffer)?;
-            self.buffer = buffer;
-            self.view = view;
-            self.buffer_size = new_buffer_size;
-        }
-        update_buffer(device_context, &self.buffer, data)
-    }
-
-    fn draw(
-        &self,
-        device_context: &ID3D11DeviceContext,
-        topology: D3D_PRIMITIVE_TOPOLOGY,
-        vertex_count: u32,
-        instance_count: u32,
-    ) -> Result<()> {
-        set_pipeline_state(
-            device_context,
-            slice::from_ref(&self.view),
-            topology,
-            &self.vertex,
-            &self.fragment,
-            &self.blend_state,
-        );
-        unsafe {
-            device_context.DrawInstanced(vertex_count, instance_count, 0, 0);
-        }
-        Ok(())
-    }
-
-    fn draw_with_texture(
-        &self,
-        device_context: &ID3D11DeviceContext,
-        texture: &[Option<ID3D11ShaderResourceView>],
-        sampler: &[Option<ID3D11SamplerState>],
-        instance_count: u32,
-    ) -> Result<()> {
-        set_pipeline_state(
-            device_context,
-            slice::from_ref(&self.view),
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-            &self.vertex,
-            &self.fragment,
-            &self.blend_state,
-        );
-        unsafe {
-            device_context.PSSetSamplers(0, Some(sampler));
-            device_context.VSSetShaderResources(0, Some(texture));
-            device_context.PSSetShaderResources(0, Some(texture));
-
-            device_context.DrawInstanced(4, instance_count, 0, 0);
-        }
-        Ok(())
+        self.instances.write(device, device_context, data)
     }
 
     fn draw_range(
@@ -2269,15 +2138,11 @@ impl<T> PipelineState<T> {
         first_instance: u32,
         instance_count: u32,
     ) -> Result<()> {
-        anyhow::ensure!(
-            first_instance as usize + instance_count as usize <= self.buffer_size,
-            "DirectX instance range exceeds the {} buffer",
-            self.label
-        );
+        self.ensure_range(first_instance, instance_count)?;
         update_batch_start(device_context, batch_params_buffer, first_instance)?;
         set_pipeline_state(
             device_context,
-            slice::from_ref(&self.view),
+            slice::from_ref(&self.instances.view),
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             &self.vertex,
             &self.fragment,
@@ -2302,11 +2167,7 @@ impl<T> PipelineState<T> {
         first_instance: u32,
         instance_count: u32,
     ) -> Result<()> {
-        anyhow::ensure!(
-            first_instance as usize + instance_count as usize <= self.buffer_size,
-            "DirectX instance range exceeds the {} buffer",
-            self.label
-        );
+        self.ensure_range(first_instance, instance_count)?;
         let (fragment, blend_state) = match shading {
             Some(shading) => (&shading.fragment, &shading.blend_state),
             None => (&self.fragment, &self.blend_state),
@@ -2314,7 +2175,7 @@ impl<T> PipelineState<T> {
         update_batch_start(device_context, batch_params_buffer, first_instance)?;
         set_pipeline_state(
             device_context,
-            slice::from_ref(&self.view),
+            slice::from_ref(&self.instances.view),
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             &self.vertex,
             fragment,
@@ -2326,6 +2187,15 @@ impl<T> PipelineState<T> {
             device_context.PSSetShaderResources(0, Some(texture));
             device_context.DrawInstanced(4, instance_count, 0, 0);
         }
+        Ok(())
+    }
+
+    fn ensure_range(&self, first_instance: u32, instance_count: u32) -> Result<()> {
+        anyhow::ensure!(
+            first_instance as usize + instance_count as usize <= self.instances.capacity,
+            "DirectX instance range exceeds the {} buffer",
+            self.instances.label
+        );
         Ok(())
     }
 }
@@ -2556,21 +2426,6 @@ fn blob_bytes(blob: &windows::Win32::Graphics::Direct3D::ID3DBlob) -> &[u8] {
     unsafe { slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()) }
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct PathRasterizationSprite {
-    xy_position: Point<ScaledPixels>,
-    st_position: Point<f32>,
-    color: Background,
-    bounds: Bounds<ScaledPixels>,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct PathSprite {
-    bounds: Bounds<ScaledPixels>,
-}
-
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
@@ -2655,14 +2510,7 @@ fn create_resources(
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let viewport = D3D11_VIEWPORT {
-        TopLeftX: 0.0,
-        TopLeftY: 0.0,
-        Width: width as f32,
-        Height: height as f32,
-        MinDepth: 0.0,
-        MaxDepth: 1.0,
-    };
+    let viewport = set_viewport(&devices.device_context, width as f32, height as f32);
     Ok((render_target, render_target_view, viewport))
 }
 
@@ -2678,67 +2526,17 @@ fn create_render_target_and_its_view(
 }
 
 #[inline]
-fn create_path_intermediate_texture(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
-    let texture = unsafe {
-        let mut output = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
-        output.unwrap()
-    };
-
-    let mut shader_resource_view = None;
-    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
-
-    Ok((texture, Some(shader_resource_view.unwrap())))
-}
-
-#[inline]
-fn create_path_intermediate_msaa_texture_and_view(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
-    let msaa_texture = unsafe {
-        let mut output = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: PATH_MULTISAMPLE_COUNT,
-                Quality: D3D11_STANDARD_MULTISAMPLE_PATTERN.0 as u32,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
-        output.unwrap()
-    };
-    let mut msaa_view = None;
-    unsafe { device.CreateRenderTargetView(&msaa_texture, None, Some(&mut msaa_view))? };
-    Ok((msaa_texture, Some(msaa_view.unwrap())))
+fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -> D3D11_VIEWPORT {
+    let viewport = [D3D11_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: width,
+        Height: height,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    }];
+    unsafe { device_context.RSSetViewports(Some(&viewport)) };
+    viewport[0]
 }
 
 #[inline]
@@ -2919,46 +2717,6 @@ fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID
 }
 
 #[inline]
-fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    // If the feature level is set to greater than D3D_FEATURE_LEVEL_9_3, the display
-    // device performs the blend in linear space, which is ideal.
-    let mut desc = D3D11_BLEND_DESC::default();
-    desc.RenderTarget[0].BlendEnable = true.into();
-    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
-    unsafe {
-        let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
-        Ok(state.unwrap())
-    }
-}
-
-#[inline]
-fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11BlendState> {
-    // If the feature level is set to greater than D3D_FEATURE_LEVEL_9_3, the display
-    // device performs the blend in linear space, which is ideal.
-    let mut desc = D3D11_BLEND_DESC::default();
-    desc.RenderTarget[0].BlendEnable = true.into();
-    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
-    unsafe {
-        let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
-        Ok(state.unwrap())
-    }
-}
-
-#[inline]
 fn create_vertex_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11VertexShader> {
     unsafe {
         let mut shader = None;
@@ -2998,13 +2756,18 @@ fn create_buffer(
     element_size: usize,
     buffer_size: usize,
 ) -> Result<ID3D11Buffer> {
+    let byte_width = element_size
+        .checked_mul(buffer_size)
+        .and_then(|size| u32::try_from(size).ok())
+        .context("structured buffer size overflows u32")?;
     let desc = D3D11_BUFFER_DESC {
-        ByteWidth: (element_size * buffer_size) as u32,
+        ByteWidth: byte_width,
         Usage: D3D11_USAGE_DYNAMIC,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
         MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
-        StructureByteStride: element_size as u32,
+        StructureByteStride: u32::try_from(element_size)
+            .context("structured buffer stride overflows u32")?,
     };
     let mut buffer = None;
     unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
@@ -3144,8 +2907,7 @@ pub(crate) mod shader_resources {
         Quad,
         Shadow,
         Underline,
-        PathRasterization,
-        PathSprite,
+        PathTile,
         MonochromeSprite,
         SubpixelSprite,
         /// Fragment only. `vertex_source` sends it to `SubpixelSprite` for a vertex stage.
@@ -3249,13 +3011,9 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => UNDERLINE_VERTEX_BYTES,
                     ShaderTarget::Fragment => UNDERLINE_FRAGMENT_BYTES,
                 },
-                ShaderModule::PathRasterization => match target {
-                    ShaderTarget::Vertex => PATH_RASTERIZATION_VERTEX_BYTES,
-                    ShaderTarget::Fragment => PATH_RASTERIZATION_FRAGMENT_BYTES,
-                },
-                ShaderModule::PathSprite => match target {
-                    ShaderTarget::Vertex => PATH_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => PATH_SPRITE_FRAGMENT_BYTES,
+                ShaderModule::PathTile => match target {
+                    ShaderTarget::Vertex => PATH_TILE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => PATH_TILE_FRAGMENT_BYTES,
                 },
                 ShaderModule::MonochromeSprite => match target {
                     ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
@@ -3355,8 +3113,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::Quad => "quad",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::Underline => "underline",
-                ShaderModule::PathRasterization => "path_rasterization",
-                ShaderModule::PathSprite => "path_sprite",
+                ShaderModule::PathTile => "path_tile",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::SubpixelSpriteLayered => "subpixel_sprite_layered",

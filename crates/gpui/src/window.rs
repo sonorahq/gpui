@@ -15,7 +15,7 @@ use crate::{
     GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent,
     KeyEvent, Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex, Modifiers,
     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
-    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PaintedPath, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shader,
@@ -66,6 +66,7 @@ use std::{
     cmp,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
+    iter,
     marker::PhantomData,
     mem,
     ops::Range,
@@ -5104,18 +5105,19 @@ impl Window {
         bounds
     }
 
-    /// Carries a solid quad that ends at the right or bottom edge on through the overscan, so
-    /// the panels and backgrounds a backdrop near that edge blurs go on past it as the window
-    /// would if it were larger. A quad shallower than the overscan is a row or a control that
-    /// only happens to end at the edge, and stays where it is. The strips go past the edge
-    /// only, so nothing in the window changes.
-    fn paint_quad_past_edges(&mut self, quad: &Quad) {
+    /// The strips that carry a solid quad that ends at the right or bottom edge on through the
+    /// overscan, so the panels and backgrounds a backdrop near that edge blurs go on past it as
+    /// the window would if it were larger. A quad shallower than the overscan is a row or a
+    /// control that only happens to end at the edge, and gets none. The strips lie past the
+    /// edge only, so nothing in the window changes.
+    fn strips_past_edges(&self, quad: &Quad) -> SmallVec<[Quad; 3]> {
+        let mut strips = SmallVec::new();
         let overscan = self.backdrop_overscan;
         if self.overscan_suppressed > 0 || (overscan.width.0 == 0 && overscan.height.0 == 0) {
-            return;
+            return strips;
         }
         if quad.background.as_solid().is_none() {
-            return;
+            return strips;
         }
         let scale = self.scale_factor();
         let width = (self.viewport_size.width.0 * scale).round();
@@ -5137,7 +5139,6 @@ impl Window {
             corner_radii: Corners::default(),
             ..*quad
         };
-        let mut strips = SmallVec::<[Quad; 3]>::new();
         if right {
             strips.push(strip(
                 width,
@@ -5162,9 +5163,7 @@ impl Window {
                 height + past_bottom,
             ));
         }
-        for strip in strips {
-            self.next_frame.scene.insert_primitive(strip);
-        }
+        strips
     }
 
     /// Moves the overscan towards what the last frame's backdrops needed: at once when it has
@@ -5434,28 +5433,20 @@ impl Window {
         });
     }
 
-    /// Creates a new painting layer for the specified bounds. A "layer" is a batch
-    /// of geometry that are non-overlapping and have the same draw order. This is typically used
+    /// Creates a new painting layer. A "layer" is a batch of geometry that are
+    /// non-overlapping and have the same draw order. This is typically used
     /// for performance reasons.
     ///
+    /// Layers painted inside `f` are drawn above this layer, including above
+    /// what `f` paints after them.
+    ///
     /// This method should only be called as part of the paint phase of element drawing.
-    pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
+    pub fn paint_layer<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint();
 
-        let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
-        if !clipped_bounds.is_empty() {
-            self.next_frame
-                .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
-        }
-
+        self.next_frame.scene.push_layer();
         let result = f(self);
-
-        if !clipped_bounds.is_empty() {
-            self.next_frame.scene.pop_layer();
-        }
-
+        self.next_frame.scene.pop_layer();
         result
     }
 
@@ -5484,7 +5475,6 @@ impl Window {
             if shadow.inset {
                 continue;
             }
-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             // The spread grows the rounded corners with the box, as CSS does, so a ring drawn
             // with a spread keeps one width around the corners. A square corner stays square,
             // and a corner rounded less than the spread grows by less, so it does not jump to
@@ -5510,17 +5500,26 @@ impl Window {
                 bottom_right: spread(corner_radii.bottom_right),
                 bottom_left: spread(corner_radii.bottom_left),
             };
+            let shape_bounds =
+                self.cover_bounds((bounds + shadow.offset).dilate(shadow.spread_radius));
+            if shape_bounds.is_empty() {
+                continue;
+            }
+            let blur_radius = shadow.blur_radius.scale(scale_factor);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
-                blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(shadow_bounds),
+                blur_radius,
+                // Leave room for the tail of the blur.
+                bounds: shape_bounds.dilate(blur_radius * 3.),
                 content_mask,
-                corner_radii: shadow_corner_radii.scale(scale_factor),
+                corner_radii: Corners::default(),
                 color: shadow.color.opacity(opacity),
+                shape_bounds,
+                shape_corner_radii: shadow_corner_radii.scale(scale_factor),
+                inset: false.into(),
+                element_corner_smoothing: corner_smoothing,
                 element_bounds,
                 element_corner_radii,
-                inset: 0,
-                element_corner_smoothing: corner_smoothing,
             });
         }
     }
@@ -5560,14 +5559,16 @@ impl Window {
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(hole),
+                bounds: element_bounds,
                 content_mask,
-                corner_radii: hole_corner_radii.scale(scale_factor),
+                corner_radii: element_corner_radii,
                 color: shadow.color.opacity(opacity),
+                shape_bounds: self.cover_bounds(hole),
+                shape_corner_radii: hole_corner_radii.scale(scale_factor),
+                inset: true.into(),
+                element_corner_smoothing: corner_smoothing,
                 element_bounds,
                 element_corner_radii,
-                inset: 1,
-                element_corner_smoothing: corner_smoothing,
             });
         }
     }
@@ -5873,8 +5874,14 @@ impl Window {
         };
 
         if !quad.background.is_transparent() {
-            self.next_frame.scene.insert_primitive(quad);
-            self.paint_quad_past_edges(&quad);
+            let strips = self.strips_past_edges(&quad);
+            let scene = &mut self.next_frame.scene;
+            match strips.is_empty() {
+                true => scene.insert_primitive(quad),
+                // The strips take the quad's order, so a backdrop the quad tints blurs none of
+                // them.
+                false => scene.insert_as_one(iter::once(quad).chain(strips)),
+            }
             return;
         }
 
@@ -5927,18 +5934,19 @@ impl Window {
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Background>) {
+    pub fn paint_path(&mut self, path: Path, color: impl Into<Background>) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
-        path.content_mask = content_mask;
         let color: Background = color.into();
-        path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        self.next_frame.scene.insert_primitive(PaintedPath::new(
+            path,
+            scale_factor,
+            content_mask,
+            color.opacity(opacity),
+        ));
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -11416,6 +11424,69 @@ mod tests {
                 past.ids.is_empty(),
                 "a pointer past the window edge must not reach a hitbox in the overscan"
             );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_a_tint_carried_past_the_edge_draws_over_its_backdrop(cx: &mut TestAppContext) {
+        const TINT: crate::Hsla = crate::Hsla {
+            h: 0.6,
+            s: 0.5,
+            l: 0.5,
+            a: 0.5,
+        };
+
+        struct EdgePaneView;
+
+        impl Render for EdgePaneView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .relative()
+                    .bg(hsla(0., 0., 0.1, 1.))
+                    // a frosted pane along the right edge, its translucent tint wider than the
+                    // overscan
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(px(200.))
+                            .backdrop_blur(px(12.))
+                            .bg(TINT),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| EdgePaneView);
+        // The first frame finds the backdrop and the next one draws with the overscan.
+        for _ in 0..2 {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(window.backdrop_overscan.width.0 > 0);
+            let scene = &window.rendered_frame.scene;
+            let width = (window.viewport_size.width.0 * window.scale_factor()).round();
+            let backdrop = scene.backdrops.first().expect("the pane's backdrop");
+            let strips: Vec<_> = scene
+                .quads
+                .iter()
+                .filter(|quad| {
+                    quad.bounds.left().0 >= width && quad.background.as_solid() == Some(TINT)
+                })
+                .collect();
+            assert!(!strips.is_empty());
+            for strip in strips {
+                assert!(
+                    strip.order >= backdrop.order,
+                    "a strip of the tint at {} draws under its backdrop at {}",
+                    strip.order,
+                    backdrop.order
+                );
+            }
         })
         .unwrap();
     }

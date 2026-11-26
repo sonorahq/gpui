@@ -6,8 +6,8 @@
 
 use gpui::{
     Backdrop, Background, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges, Filter,
-    Hsla, Path, Quad, ScaledPixels, Scene, Shader, ShaderQuad, ShaderSource, Shadow, Size, point,
-    px, size,
+    Hsla, PaintedPath, PathBuilder, Quad, ScaledPixels, Scene, Shader, ShaderQuad, ShaderSource,
+    Shadow, Size, point, px, size,
 };
 
 /// The width and height of every case's frame, in device pixels.
@@ -340,14 +340,10 @@ fn path_in_blurred_layer() -> Case {
             ..Filter::default()
         },
     );
-    let mut path = Path::new(point(px(16.), px(16.)));
-    for (x, y) in [(48., 16.), (48., 48.), (16., 48.)] {
-        path.line_to(point(px(x), px(y)));
-    }
-    let mut path = path.scale(1.);
-    path.content_mask = ContentMask { bounds: frame() };
-    path.color = Background::from(RED);
-    scene.insert_primitive(path);
+    scene.insert_primitive(polygon(
+        &[(16., 16.), (48., 16.), (48., 48.), (16., 48.)],
+        RED,
+    ));
     scene.pop_filter();
     scene.finish();
     Case::new("path_in_blurred_layer", scene, |image| {
@@ -368,19 +364,24 @@ fn path_in_blurred_layer() -> Case {
 /// spread inside a green square on the right.
 fn shadows() -> Case {
     let mut scene = white_scene();
-    let shadow =
-        |element: Bounds<ScaledPixels>, bounds: Bounds<ScaledPixels>, inset: bool| Shadow {
-            order: 0,
-            blur_radius: ScaledPixels(2.),
-            bounds,
-            corner_radii: Corners::default(),
-            content_mask: ContentMask { bounds: frame() },
-            color: BLACK,
-            element_bounds: element,
-            element_corner_radii: Corners::default(),
-            inset: inset as u32,
-            element_corner_smoothing: 0.,
-        };
+    // A drop shadow paints its shape and three blur radii around it, an inset one its element.
+    let shadow = |element: Bounds<ScaledPixels>, shape: Bounds<ScaledPixels>, inset: bool| Shadow {
+        order: 0,
+        blur_radius: ScaledPixels(2.),
+        bounds: match inset {
+            true => element,
+            false => shape.dilate(ScaledPixels(6.)),
+        },
+        corner_radii: Corners::default(),
+        content_mask: ContentMask { bounds: frame() },
+        color: BLACK,
+        shape_bounds: shape,
+        shape_corner_radii: Corners::default(),
+        inset: inset.into(),
+        element_corner_smoothing: 0.,
+        element_bounds: element,
+        element_corner_radii: Corners::default(),
+    };
     let dropped = rect(10., 24., 16., 16.);
     scene.insert_primitive(shadow(dropped, dropped.dilate(ScaledPixels(4.)), false));
     scene.insert_primitive(quad(dropped, RED));
@@ -497,14 +498,28 @@ fn backdrop(bounds: Bounds<ScaledPixels>, blur: f32, mask: Bounds<ScaledPixels>)
 }
 
 /// A filled right triangle with its right angle at the top left, as a path.
-fn triangle(x: f32, y: f32, side: f32, color: Hsla) -> Path<ScaledPixels> {
-    let mut path = Path::new(point(px(x), px(y)));
-    path.line_to(point(px(x + side), px(y)));
-    path.line_to(point(px(x), px(y + side)));
-    let mut path = path.scale(1.);
-    path.content_mask = ContentMask { bounds: frame() };
-    path.color = Background::from(color);
-    path
+fn triangle(x: f32, y: f32, side: f32, color: Hsla) -> PaintedPath {
+    polygon(&[(x, y), (x + side, y), (x, y + side)], color)
+}
+
+/// The polygon through `corners`, filled with `color` and clipped to the frame.
+fn polygon(corners: &[(f32, f32)], color: Hsla) -> PaintedPath {
+    let mut builder = PathBuilder::fill();
+    for (index, &(x, y)) in corners.iter().enumerate() {
+        match index {
+            0 => builder.move_to(point(px(x), px(y))),
+            _ => builder.line_to(point(px(x), px(y))),
+        }
+    }
+    builder.close();
+    let path = builder.build().expect("a polygon builds");
+    let frame = Bounds::new(point(px(0.), px(0.)), size(px(SIDE), px(SIDE)));
+    PaintedPath::new(
+        path,
+        1.,
+        ContentMask { bounds: frame },
+        Background::from(color),
+    )
 }
 
 /// A scene that starts with an opaque white frame.
