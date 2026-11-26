@@ -4761,7 +4761,10 @@ impl Window {
         );
     }
 
-    pub(crate) fn paint_index(&self) -> PaintIndex {
+    /// Where the next frame's paint output stands. It also marks the scene there, so a cached
+    /// view that starts or ends here can be replayed next frame with the orders it has now.
+    pub(crate) fn paint_index(&mut self) -> PaintIndex {
+        self.next_frame.scene.mark();
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
             #[cfg(any(test, feature = "test-support"))]

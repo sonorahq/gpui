@@ -40,6 +40,12 @@ where
     insert_path: Vec<usize>,
     /// Reusable stack for search operations.
     search_stack: Vec<NonNull<Node<U>>>,
+    /// How many orderings were searched for since the tree was made.
+    #[cfg(test)]
+    pub(crate) searches: usize,
+    /// How many bounds went in through [`BoundsTree::insert_known`] since the tree was made.
+    #[cfg(test)]
+    pub(crate) known_inserts: usize,
 }
 
 /// A node in the bounds tree.
@@ -205,8 +211,28 @@ where
         ordering
     }
 
+    /// Inserts bounds with the ordering [`BoundsTree::insert`] gave them in an earlier frame
+    /// that told the tree the same things up to this point. The tree ends up as `insert` would
+    /// leave it, without searching for the ordering.
+    pub fn insert_known(&mut self, new_bounds: Bounds<U>, ordering: u32) {
+        #[cfg(test)]
+        {
+            self.known_inserts += 1;
+        }
+        let new_leaf_idx = self.insert_leaf(new_bounds, ordering);
+        self.max_leaf = match self.max_leaf {
+            None => Some(new_leaf_idx),
+            Some(old_idx) if self.nodes[old_idx].max_order < ordering => Some(new_leaf_idx),
+            some => some,
+        };
+    }
+
     /// Finds the maximum ordering among all bounds that intersect with the query.
     fn find_max_ordering(&mut self, query: &Bounds<U>) -> u32 {
+        #[cfg(test)]
+        {
+            self.searches += 1;
+        }
         let Some(root_idx) = self.root else {
             return 0;
         };
@@ -440,6 +466,10 @@ where
             reserved: Vec::new(),
             insert_path: Vec::new(),
             search_stack: Vec::new(),
+            #[cfg(test)]
+            searches: 0,
+            #[cfg(test)]
+            known_inserts: 0,
         }
     }
 }

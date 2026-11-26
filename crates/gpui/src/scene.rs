@@ -27,6 +27,21 @@ pub type DrawOrder = u32;
 /// again.
 pub type SpanId = u64;
 
+/// The multiplier of the Fx hash, which folds what the bounds tree was told into
+/// [`Scene::history`].
+const HISTORY_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+/// What a scene tells its bounds tree, as folded into [`Scene::history`].
+#[derive(Clone, Copy)]
+#[repr(u64)]
+enum TreeEvent {
+    Insert = 1,
+    PushLayer,
+    PopLayer,
+    Open,
+    Close,
+}
+
 /// Where a named span sits among a scene's paint operations, with the bounds it was given.
 struct PaintSpan {
     operations: Range<usize>,
@@ -52,6 +67,12 @@ impl From<bool> for PaddedBool32 {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
+    /// A running hash of everything the bounds tree was told this frame, in order, along with
+    /// every layer pop. Two scenes with the same history hand out the same orders from there on.
+    history: u64,
+    /// The history at chosen paint operation indices, in rising index order, so a later frame
+    /// that replays from one of them can tell whether its orders still hold.
+    marks: Vec<(usize, u64)>,
     layer_stack: Vec<DrawOrder>,
     spans: FxHashMap<SpanId, PaintSpan>,
     span_stack: Vec<(SpanId, usize, Bounds<Pixels>)>,
@@ -78,6 +99,8 @@ impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
+        self.history = 0;
+        self.marks.clear();
         self.layer_stack.clear();
         self.spans.clear();
         self.span_stack.clear();
@@ -100,14 +123,25 @@ impl Scene {
         self.paint_operations.len()
     }
 
+    /// Notes the history at the current paint operation index, so a later frame can replay
+    /// from here with the orders this frame gives out.
+    pub(crate) fn mark(&mut self) {
+        let index = self.paint_operations.len();
+        if self.marks.last().is_none_or(|(last, _)| *last < index) {
+            self.marks.push((index, self.history));
+        }
+    }
+
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        self.record(TreeEvent::PushLayer, bounds);
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
         self.paint_operations
-            .push(PaintOperation::StartLayer(bounds));
+            .push(PaintOperation::StartLayer(bounds, order));
     }
 
     pub fn pop_layer(&mut self) {
+        self.record(TreeEvent::PopLayer, Bounds::default());
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
     }
@@ -126,6 +160,7 @@ impl Scene {
         content_mask: Bounds<ScaledPixels>,
         filter: Filter,
     ) {
+        self.record(TreeEvent::Open, Bounds::default());
         let start = self.primitive_bounds.open();
         let mut destination_bounds =
             scale_bounds_around(source_bounds, transform_origin, filter.scale);
@@ -152,6 +187,7 @@ impl Scene {
     pub fn pop_filter(&mut self) {
         if let Some(index) = self.effect_stack.pop() {
             let footprint = self.effects[index].destination_clip();
+            self.record(TreeEvent::Close, footprint);
             self.effects[index].end = self.primitive_bounds.close(footprint);
         }
         self.paint_operations.push(PaintOperation::EndFilter);
@@ -196,7 +232,7 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => {
                     self.insert_primitive(primitive.clone().faded(fade))
                 }
-                PaintOperation::StartLayer(bounds) => {
+                PaintOperation::StartLayer(bounds, _) => {
                     layers += 1;
                     self.push_layer(*bounds);
                 }
@@ -274,7 +310,7 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        let primitive = primitive.into();
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -283,11 +319,28 @@ impl Scene {
             return;
         }
 
-        let order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        let order = match self.layer_stack.last() {
+            Some(order) => *order,
+            None => self.order(clipped_bounds),
+        };
+        self.push_primitive(primitive, order);
+    }
+
+    /// Inserts a primitive replayed from a scene whose history matched this one's where the
+    /// replay began, with the order it was drawn at there.
+    fn keep_primitive(&mut self, primitive: Primitive) {
+        let order = primitive.order();
+        if self.layer_stack.is_empty() {
+            let clipped_bounds = primitive
+                .bounds()
+                .intersect(&primitive.content_mask().bounds);
+            self.record(TreeEvent::Insert, clipped_bounds);
+            self.primitive_bounds.insert_known(clipped_bounds, order);
+        }
+        self.push_primitive(primitive, order);
+    }
+
+    fn push_primitive(&mut self, mut primitive: Primitive, order: DrawOrder) {
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -335,11 +388,40 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Paints the operations `range` of `prev_scene` again. When this scene's history matches
+    /// the one `prev_scene` marked at `range.start`, every primitive keeps the order it had
+    /// there, which is the order a fresh insert would give it, and the bounds tree skips its
+    /// searches. The history covers open filters and layers too, so a match holds inside them.
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
-        for operation in &prev_scene.paint_operations[range] {
+        let first_mark = prev_scene
+            .marks
+            .partition_point(|(index, _)| *index < range.start);
+        let keep = prev_scene.marks.get(first_mark) == Some(&(range.start, self.history));
+        let mut marks = prev_scene.marks[first_mark..]
+            .iter()
+            .map(|(index, _)| *index)
+            .peekable();
+        for (index, operation) in (range.start..).zip(&prev_scene.paint_operations[range]) {
+            // A cached view nested in this range may be replayed alone next frame, so the
+            // marks inside it move along with what they mark.
+            if marks.next_if_eq(&index).is_some() {
+                self.mark();
+            }
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::Primitive(primitive) => match keep {
+                    true => self.keep_primitive(primitive.clone()),
+                    false => self.insert_primitive(primitive.clone()),
+                },
+                PaintOperation::StartLayer(bounds, order) => match keep {
+                    true => {
+                        self.record(TreeEvent::PushLayer, *bounds);
+                        self.primitive_bounds.insert_known(*bounds, *order);
+                        self.layer_stack.push(*order);
+                        self.paint_operations
+                            .push(PaintOperation::StartLayer(*bounds, *order));
+                    }
+                    false => self.push_layer(*bounds),
+                },
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartFilter(bounds, transform_origin, content_mask, filter) => {
                     self.push_filter(*bounds, *transform_origin, *content_mask, *filter)
@@ -348,6 +430,26 @@ impl Scene {
                 PaintOperation::StartSpan(id, bounds) => self.push_span(*id, *bounds),
                 PaintOperation::EndSpan => self.pop_span(),
             }
+        }
+    }
+
+    /// Asks the bounds tree for the order of `bounds` and folds the request into the history.
+    fn order(&mut self, bounds: Bounds<ScaledPixels>) -> DrawOrder {
+        self.record(TreeEvent::Insert, bounds);
+        self.primitive_bounds.insert(bounds)
+    }
+
+    /// Folds one event into the history.
+    fn record(&mut self, event: TreeEvent, bounds: Bounds<ScaledPixels>) {
+        let pair = |a: ScaledPixels, b: ScaledPixels| {
+            (u64::from(a.0.to_bits()) << 32) | u64::from(b.0.to_bits())
+        };
+        for word in [
+            event as u64,
+            pair(bounds.origin.x, bounds.origin.y),
+            pair(bounds.size.width, bounds.size.height),
+        ] {
+            self.history = (self.history.rotate_left(5) ^ word).wrapping_mul(HISTORY_SEED);
         }
     }
 
@@ -443,7 +545,8 @@ pub(crate) enum PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
-    StartLayer(Bounds<ScaledPixels>),
+    /// A layer's bounds and the order everything in it is drawn at.
+    StartLayer(Bounds<ScaledPixels>, DrawOrder),
     EndLayer,
     StartFilter(
         Bounds<ScaledPixels>,
@@ -961,6 +1064,253 @@ mod layer_filter_tests {
         );
     }
 
+    fn quad(bounds: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            order: 0,
+            border_style: BorderStyle::default(),
+            bounds,
+            content_mask: ContentMask {
+                bounds: rect(0.0, 0.0, 500.0, 500.0),
+            },
+            background: Background::default(),
+            border_color: Hsla::default(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+            corner_smoothing: 0.0,
+            pad: 0,
+        }
+    }
+
+    /// Paints three views the way a window does, marking the scene around each one, and
+    /// returns their paint operation ranges. A view is painted live when `prev` is `None`,
+    /// and otherwise replayed from the matching range of `prev`. The first view's middle
+    /// quad is drawn at `moved`.
+    fn paint_views(
+        scene: &mut Scene,
+        prev: Option<(&Scene, &[Range<usize>])>,
+        moved: Bounds<ScaledPixels>,
+        replay_first: bool,
+    ) -> Vec<Range<usize>> {
+        let content_mask = rect(0.0, 0.0, 500.0, 500.0);
+        let views: [&dyn Fn(&mut Scene); 3] = [
+            &|scene| {
+                scene.insert_primitive(quad(rect(0.0, 0.0, 200.0, 100.0)));
+                scene.insert_primitive(quad(moved));
+                scene.insert_primitive(quad(rect(150.0, 50.0, 100.0, 100.0)));
+            },
+            &|scene| {
+                scene.push_layer(rect(100.0, 80.0, 120.0, 60.0));
+                scene.insert_primitive(quad(rect(100.0, 80.0, 120.0, 60.0)));
+                scene.insert_primitive(quad(rect(110.0, 90.0, 20.0, 20.0)));
+                scene.pop_layer();
+                scene.insert_primitive(quad(rect(300.0, 0.0, 50.0, 50.0)));
+            },
+            &|scene| {
+                scene.push_filter(
+                    rect(120.0, 100.0, 80.0, 80.0),
+                    origin(160.0, 140.0),
+                    content_mask,
+                    Filter {
+                        blur: 4.0,
+                        ..Default::default()
+                    },
+                );
+                scene.insert_primitive(quad(rect(120.0, 100.0, 80.0, 80.0)));
+                scene.insert_primitive(quad(rect(130.0, 110.0, 10.0, 10.0)));
+                scene.pop_filter();
+                scene.insert_primitive(quad(rect(0.0, 120.0, 400.0, 20.0)));
+            },
+        ];
+        let mut ranges = Vec::new();
+        for (index, view) in views.iter().enumerate() {
+            scene.mark();
+            let start = scene.len();
+            match prev {
+                Some((prev, ranges)) if index > 0 || replay_first => {
+                    scene.replay(ranges[index].clone(), prev)
+                }
+                _ => view(scene),
+            }
+            ranges.push(start..scene.len());
+        }
+        scene.mark();
+        ranges
+    }
+
+    /// The order of every primitive and layer, in paint order.
+    fn orders(scene: &Scene) -> Vec<DrawOrder> {
+        scene
+            .paint_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PaintOperation::Primitive(primitive) => Some(primitive.order()),
+                PaintOperation::StartLayer(_, order) => Some(*order),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_replay_after_the_same_history_keeps_its_orders() {
+        let at_rest = rect(10.0, 10.0, 30.0, 30.0);
+        let mut painted = Scene::default();
+        let ranges = paint_views(&mut painted, None, at_rest, false);
+
+        let mut replayed = Scene::default();
+        paint_views(&mut replayed, Some((&painted, &ranges)), at_rest, true);
+
+        assert_eq!(orders(&replayed), orders(&painted));
+        assert_eq!(replayed.effects, painted.effects);
+        assert_eq!(replayed.history, painted.history);
+        assert_eq!(replayed.marks, painted.marks);
+        assert_eq!(replayed.primitive_bounds.searches, 0);
+        assert_eq!(replayed.primitive_bounds.known_inserts, 8);
+    }
+
+    #[test]
+    fn a_replay_after_a_changed_history_orders_afresh() {
+        let at_rest = rect(10.0, 10.0, 30.0, 30.0);
+        let moved = rect(105.0, 85.0, 100.0, 100.0);
+        let mut painted = Scene::default();
+        let ranges = paint_views(&mut painted, None, at_rest, false);
+
+        let mut fresh = Scene::default();
+        paint_views(&mut fresh, None, moved, false);
+        assert_ne!(orders(&fresh), orders(&painted));
+
+        let mut replayed = Scene::default();
+        paint_views(&mut replayed, Some((&painted, &ranges)), moved, false);
+
+        assert_eq!(orders(&replayed), orders(&fresh));
+        assert_eq!(replayed.effects, fresh.effects);
+        assert_eq!(replayed.marks, fresh.marks);
+        assert_eq!(replayed.primitive_bounds.known_inserts, 0);
+    }
+
+    #[test]
+    fn a_replay_after_a_quad_where_a_layer_was_orders_afresh() {
+        let bounds = rect(40.0, 40.0, 100.0, 100.0);
+        let paint = |scene: &mut Scene, prev: Option<(&Scene, Range<usize>)>, layer: bool| {
+            match layer {
+                true => scene.push_layer(bounds),
+                false => scene.insert_primitive(quad(bounds)),
+            }
+            scene.mark();
+            let start = scene.len();
+            match prev {
+                Some((prev, range)) => scene.replay(range, prev),
+                None => scene.insert_primitive(quad(rect(60.0, 60.0, 20.0, 20.0))),
+            }
+            let view = start..scene.len();
+            scene.mark();
+            if layer {
+                scene.pop_layer();
+            }
+            view
+        };
+        let mut painted = Scene::default();
+        let view = paint(&mut painted, None, true);
+
+        let mut fresh = Scene::default();
+        paint(&mut fresh, None, false);
+
+        let mut replayed = Scene::default();
+        paint(&mut replayed, Some((&painted, view)), false);
+
+        assert_eq!(orders(&replayed), orders(&fresh));
+        assert_eq!(replayed.primitive_bounds.known_inserts, 0);
+    }
+
+    #[test]
+    fn a_replay_inside_an_open_filter_keeps_its_orders() {
+        let content_mask = rect(0.0, 0.0, 500.0, 500.0);
+        let paint = |scene: &mut Scene, prev: Option<(&Scene, Range<usize>)>| {
+            scene.insert_primitive(quad(rect(0.0, 0.0, 300.0, 300.0)));
+            scene.push_filter(
+                rect(20.0, 20.0, 200.0, 200.0),
+                origin(120.0, 120.0),
+                content_mask,
+                Filter {
+                    blur: 4.0,
+                    ..Default::default()
+                },
+            );
+            scene.insert_primitive(quad(rect(20.0, 20.0, 200.0, 200.0)));
+            scene.mark();
+            let start = scene.len();
+            match prev {
+                Some((prev, range)) => scene.replay(range, prev),
+                None => {
+                    scene.push_layer(rect(40.0, 40.0, 100.0, 100.0));
+                    scene.insert_primitive(quad(rect(40.0, 40.0, 50.0, 50.0)));
+                    scene.pop_layer();
+                    scene.insert_primitive(quad(rect(60.0, 60.0, 100.0, 100.0)));
+                }
+            }
+            let view = start..scene.len();
+            scene.mark();
+            scene.pop_filter();
+            scene.insert_primitive(quad(rect(100.0, 100.0, 300.0, 50.0)));
+            view
+        };
+        let mut painted = Scene::default();
+        let view = paint(&mut painted, None);
+
+        let mut replayed = Scene::default();
+        paint(&mut replayed, Some((&painted, view)));
+
+        assert_eq!(orders(&replayed), orders(&painted));
+        assert_eq!(replayed.effects, painted.effects);
+        assert_eq!(replayed.history, painted.history);
+        assert_eq!(replayed.primitive_bounds.known_inserts, 2);
+    }
+
+    #[test]
+    fn a_replayed_closed_layer_lifts_only_what_is_painted_over_it() {
+        let content_mask = rect(0.0, 0.0, 500.0, 500.0);
+        let button = rect(100.0, 60.0, 20.0, 20.0);
+        let paint_layer = |scene: &mut Scene| {
+            scene.push_filter(button, origin(110.0, 70.0), content_mask, filter(0.9));
+            scene.insert_primitive(quad(button));
+            scene.pop_filter();
+        };
+        let mut painted = Scene::default();
+        painted.insert_primitive(quad(rect(0.0, 50.0, 500.0, 40.0)));
+        painted.mark();
+        let start = painted.len();
+        paint_layer(&mut painted);
+        let layer = start..painted.len();
+        painted.mark();
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0.0, 50.0, 500.0, 40.0)));
+        scene.mark();
+        scene.replay(layer, &painted);
+        scene.mark();
+        assert_eq!(scene.primitive_bounds.known_inserts, 1);
+        assert_eq!(orders(&scene), orders(&painted));
+        let row = scene.quads[0].order;
+        let layer = scene.effects[0];
+
+        let head = scene.primitive_bounds.insert(rect(0.0, 10.0, 500.0, 30.0));
+        assert!(head <= row, "head at {head}, row at {row}");
+        assert!(scene.filtered(head).is_none());
+
+        let label = scene.primitive_bounds.insert(rect(10.0, 15.0, 40.0, 20.0));
+        assert!(
+            label > layer.end,
+            "label at {label}, layer ends at {}",
+            layer.end
+        );
+
+        let over = scene.primitive_bounds.insert(rect(105.0, 65.0, 5.0, 5.0));
+        assert!(
+            over > layer.end,
+            "over at {over}, layer ends at {}",
+            layer.end
+        );
+    }
+
     #[test]
     fn backdrops_of_another_radius_blur_in_a_batch_of_their_own() {
         let content_mask = rect(0.0, 0.0, 500.0, 500.0);
@@ -1064,6 +1414,22 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+        }
+    }
+
+    /// The order the primitive was drawn at, once a scene has inserted it.
+    pub(crate) fn order(&self) -> DrawOrder {
+        match self {
+            Primitive::Shadow(shadow) => shadow.order,
+            Primitive::Backdrop(backdrop) => backdrop.order,
+            Primitive::Quad(quad) => quad.order,
+            Primitive::Shader(shader) => shader.order,
+            Primitive::Path(path) => path.order,
+            Primitive::Underline(underline) => underline.order,
+            Primitive::MonochromeSprite(sprite) => sprite.order,
+            Primitive::SubpixelSprite(sprite) => sprite.order,
+            Primitive::PolychromeSprite(sprite) => sprite.order,
+            Primitive::Surface(surface) => surface.order,
         }
     }
 }
