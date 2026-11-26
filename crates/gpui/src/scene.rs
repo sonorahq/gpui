@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
-    Path, PathTiles, Pixels, Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree,
-    point,
+    Path, PathTiles, Pixels, Point, Radians, ScaledPixels, ShaderId, Size, TimedTransformation,
+    bounds_tree::BoundsTree, point,
 };
 use collections::FxHashMap;
 use smallvec::SmallVec;
-use std::{collections::VecDeque, fmt::Debug, iter::Peekable, ops::Range, rc::Rc, slice};
+use std::{
+    collections::VecDeque, fmt::Debug, iter::Peekable, ops::Range, rc::Rc, slice, time::Duration,
+};
 
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
@@ -135,6 +137,7 @@ pub struct Scene {
     /// so a backdrop blur near those edges reads what lies there instead of nothing. The
     /// renderer draws the frame this much larger and shows only the window's part of it.
     pub overscan: Size<DevicePixels>,
+    animations: Vec<SpriteAnimation>,
 }
 
 #[expect(missing_docs)]
@@ -161,6 +164,76 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.overscan = Size::default();
+        self.animations.clear();
+    }
+
+    /// Inserts a sprite that [`Self::advance_animations`] keeps moving. The
+    /// sprite's color is taken as its color before the animation's alpha.
+    pub(crate) fn insert_animated_sprite(
+        &mut self,
+        mut sprite: MonochromeSprite,
+        mut animation: SpriteAnimation,
+    ) {
+        sprite.animation = SpriteAnimationId(self.animations.len() as u32);
+        animation.base_color = sprite.color;
+        if self.try_insert_primitive(sprite.into()) {
+            self.animations.push(animation);
+        }
+    }
+
+    /// Inserts a sprite replayed from a scene whose history matched, with the order it was drawn
+    /// at there, as [`Self::insert_animated_sprite`] does.
+    fn keep_animated_sprite(
+        &mut self,
+        mut sprite: MonochromeSprite,
+        mut animation: SpriteAnimation,
+    ) {
+        sprite.animation = SpriteAnimationId(self.animations.len() as u32);
+        animation.base_color = sprite.color;
+        self.keep_primitive(sprite.into());
+        self.animations.push(animation);
+    }
+
+    /// The sprite and its animation when `primitive` is a sprite this scene animates. Animation
+    /// ids index the scene they were inserted into, so a replay into another scene inserts the
+    /// pair again rather than the primitive alone.
+    fn animated_sprite(
+        &self,
+        primitive: &Primitive,
+    ) -> Option<(MonochromeSprite, SpriteAnimation)> {
+        let Primitive::MonochromeSprite(sprite) = primitive else {
+            return None;
+        };
+        let animation = self.animations.get(sprite.animation.0 as usize)?;
+        Some((*sprite, *animation))
+    }
+
+    /// How long the window may wait between presents of this scene while only
+    /// its animations need a frame: `None` when nothing in it animates, and
+    /// zero when an animation wants every frame.
+    pub(crate) fn animation_frame_interval(&self) -> Option<Duration> {
+        self.animations
+            .iter()
+            .map(|animation| {
+                animation
+                    .transformation
+                    .min_frame_interval()
+                    .unwrap_or_default()
+            })
+            .min()
+    }
+
+    /// Moves every animated sprite to its pose at `elapsed` time on the app's
+    /// synced animation clock, without the scene being rebuilt.
+    pub(crate) fn advance_animations(&mut self, elapsed: Duration) {
+        for animation in &self.animations {
+            let Some(sprite) = self.monochrome_sprites.get_mut(animation.sprite_index) else {
+                continue;
+            };
+            let pose = animation.transformation.at(elapsed);
+            sprite.transformation = pose.into_matrix(animation.center, animation.scale_factor);
+            sprite.color = animation.base_color.opacity(pose.alpha_factor());
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -352,7 +425,11 @@ impl Scene {
         for operation in &prev_scene.paint_operations[span.operations.clone()] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
-                    self.insert_primitive(primitive.clone().faded(fade))
+                    let primitive = primitive.clone().faded(fade);
+                    match prev_scene.animated_sprite(&primitive) {
+                        Some((sprite, animation)) => self.insert_animated_sprite(sprite, animation),
+                        None => self.insert_primitive(primitive),
+                    }
                 }
                 PaintOperation::StartLayer(_) => {
                     layers += 1;
@@ -432,10 +509,14 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        self.try_insert_primitive(primitive.into());
+    }
+
+    /// Returns whether the primitive was kept, rather than clipped away.
+    fn try_insert_primitive(&mut self, mut primitive: Primitive) -> bool {
         let clipped_bounds = primitive.clipped_bounds();
         if clipped_bounds.is_empty() {
-            return;
+            return false;
         }
 
         let kind = primitive.kind();
@@ -452,6 +533,7 @@ impl Scene {
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+        true
     }
 
     /// Inserts the pieces of one shape at one order between them, the one the highest piece
@@ -475,6 +557,7 @@ impl Scene {
 
     /// Inserts a primitive replayed from a scene whose history matched this one's where the
     /// replay began, with the order it was drawn at there.
+    #[inline]
     fn keep_primitive(&mut self, primitive: Primitive) {
         let index = self.paint_operations.len();
         if let Some(layer) = self
@@ -582,6 +665,7 @@ impl Scene {
             .iter()
             .map(|(index, _)| *index)
             .peekable();
+        let has_animations = !prev_scene.animations.is_empty();
         for (index, operation) in (range.start..).zip(&prev_scene.paint_operations[range]) {
             // A cached view nested in this range may be replayed alone next frame, so the
             // marks inside it move along with what they mark.
@@ -589,10 +673,21 @@ impl Scene {
                 self.mark();
             }
             match operation {
-                PaintOperation::Primitive(primitive) => match keep {
-                    true => self.keep_primitive(primitive.clone()),
-                    false => self.insert_primitive(primitive.clone()),
-                },
+                PaintOperation::Primitive(primitive) => {
+                    if has_animations
+                        && let Some((sprite, animation)) = prev_scene.animated_sprite(primitive)
+                    {
+                        match keep {
+                            true => self.keep_animated_sprite(sprite, animation),
+                            false => self.insert_animated_sprite(sprite, animation),
+                        }
+                    } else {
+                        match keep {
+                            true => self.keep_primitive(primitive.clone()),
+                            false => self.insert_primitive(primitive.clone()),
+                        }
+                    }
+                }
                 PaintOperation::StartLayer(key) => match layers_kept {
                     true => self.open_layer(*key),
                     false => self.push_layer(),
@@ -630,20 +725,34 @@ impl Scene {
             log::warn!("scene: a filtered layer was left open");
             self.effects[index].end = self.effects[index].start;
         }
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.backdrops.sort_by_key(|backdrop| backdrop.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.shaders
-            .sort_by_key(|shader| (shader.order, shader.shader));
+        let keys = &mut Vec::new();
+        sort_in_place(&mut self.shadows, keys, |shadow| (shadow.order, 0));
+        sort_in_place(&mut self.backdrops, keys, |backdrop| (backdrop.order, 0));
+        sort_in_place(&mut self.quads, keys, |quad| (quad.order, 0));
+        sort_in_place(&mut self.shaders, keys, |shader| {
+            (shader.order, shader.shader.0)
+        });
         self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
+        sort_in_place(&mut self.underlines, keys, |underline| (underline.order, 0));
+        sort_in_place(&mut self.monochrome_sprites, keys, |sprite| {
+            (sprite.order, sprite.tile.texture_id.index)
+        });
+        sort_in_place(&mut self.subpixel_sprites, keys, |sprite| {
+            (sprite.order, sprite.tile.texture_id.index)
+        });
+        sort_in_place(&mut self.polychrome_sprites, keys, |sprite| {
+            (sprite.order, sprite.tile.texture_id.index)
+        });
         self.surfaces.sort_by_key(|surface| surface.order);
+
+        // Sorting moved the sprites, so animations learn where theirs ended up.
+        if !self.animations.is_empty() {
+            for (index, sprite) in self.monochrome_sprites.iter().enumerate() {
+                if let Some(animation) = self.animations.get_mut(sprite.animation.0 as usize) {
+                    animation.sprite_index = index;
+                }
+            }
+        }
     }
 
     #[cfg_attr(
@@ -689,6 +798,62 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
         }
     }
+}
+
+/// Sorts small `(key, index)` pairs instead of the primitives themselves, then moves each
+/// primitive into place once. Primitives are large, so a comparison sort that shuffles them
+/// directly spends most of its time copying. Ties keep insertion order, as `sort_by_key`
+/// does, because the index is part of what is sorted.
+fn sort_in_place<T: Copy>(
+    primitives: &mut [T],
+    keys: &mut Vec<(u64, u32)>,
+    key: impl Fn(&T) -> (u32, u32),
+) {
+    if primitives.is_sorted_by_key(&key) {
+        return;
+    }
+    keys.clear();
+    keys.extend(primitives.iter().enumerate().map(|(index, primitive)| {
+        let (major, minor) = key(primitive);
+        ((major as u64) << 32 | minor as u64, index as u32)
+    }));
+    keys.sort_unstable();
+
+    // `keys[target].1` is the source index for `target`. Follow each cycle of that
+    // permutation, marking visited slots by pointing them at themselves.
+    for start in 0..primitives.len() {
+        if keys[start].1 as usize == start {
+            continue;
+        }
+        let displaced = primitives[start];
+        let mut target = start;
+        loop {
+            let source = keys[target].1 as usize;
+            keys[target].1 = target as u32;
+            if source == start {
+                primitives[target] = displaced;
+                break;
+            }
+            primitives[target] = primitives[source];
+            target = source;
+        }
+    }
+}
+
+/// Whether renderers draw opaque quads front to back in a depth pre-pass before the rest.
+/// The fork leaves it off, since its offscreen layer, blur and backdrop passes have no depth
+/// attachment. With it off a filled quad is painted whole and no shader culls opaque rectangles.
+pub const DEPTH_PREPASS: bool = false;
+
+/// The depth step between consecutive quads in a frame with `quad_count` quads.
+pub fn quad_depth_scale(quad_count: usize) -> f32 {
+    let denominator = (quad_count.min((1 << 24) - 1) + 1).next_power_of_two();
+    1.0 / denominator as f32
+}
+
+/// Maps a quad's index in [`Scene::quads`] to depth, with greater values closer.
+pub fn quad_depth(quad_id: u32, scale: f32) -> f32 {
+    ((quad_id + 1) as f32 * scale).min(1.0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
@@ -2567,12 +2732,58 @@ impl Default for TransformationMatrix {
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    pub animation: SpriteAnimationId,
     pub tile: AtlasTile,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub transformation: TransformationMatrix,
+}
+
+/// Refers to an animation of the scene a sprite is inserted into.
+///
+/// A single `u32` so it fits the sprite's existing padding and leaves the
+/// instance layout unchanged on every backend; renderers ignore it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct SpriteAnimationId(u32);
+
+impl SpriteAnimationId {
+    /// No animation.
+    pub const NONE: Self = Self(u32::MAX);
+}
+
+impl Default for SpriteAnimationId {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+/// A [`TimedTransformation`] the window applies to a sprite right before
+/// every present, so the scene can be presented again without being redrawn.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SpriteAnimation {
+    transformation: TimedTransformation,
+    center: Point<Pixels>,
+    scale_factor: f32,
+    base_color: Hsla,
+    sprite_index: usize,
+}
+
+impl SpriteAnimation {
+    pub(crate) fn new(
+        transformation: TimedTransformation,
+        center: Point<Pixels>,
+        scale_factor: f32,
+    ) -> Self {
+        Self {
+            transformation,
+            center,
+            scale_factor,
+            base_color: Hsla::default(),
+            sprite_index: usize::MAX,
+        }
+    }
 }
 
 impl From<MonochromeSprite> for Primitive {

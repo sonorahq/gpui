@@ -3,9 +3,9 @@ use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, BLUR_LEVELS, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
-    LayerEffect, PaintSurface, PaintedPath, PrimitiveBatch, Pyramid, ScaledPixels, Scene, ShaderId,
-    Size, point, size,
+    AtlasTextureId, BLUR_LEVELS, BlurPasses, Bounds, ContentMask, DEPTH_PREPASS, DevicePixels,
+    GAUSSIAN_REACH, LayerEffect, PaintSurface, PaintedPath, PrimitiveBatch, Pyramid, ScaledPixels,
+    Scene, ShaderId, Size, point, quad_depth, quad_depth_scale, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -22,7 +22,8 @@ use objc2_foundation::{NSRange, NSString};
 use objc2_metal::MTLCopyAllDevices;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLBuffer, MTLClearColor, MTLCommandBuffer,
-    MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLCommandEncoder, MTLCommandQueue, MTLCompareFunction, MTLCompileOptions,
+    MTLCreateSystemDefaultDevice, MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice,
     MTLDrawable, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
     MTLRenderPipelineState, MTLResourceOptions, MTLScissorRect, MTLStorageMode, MTLStoreAction,
@@ -174,7 +175,6 @@ enum DisplayLinkMode {
 pub struct MetalRenderer {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     layer: Option<Retained<CAMetalLayer>>,
-    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -185,6 +185,7 @@ pub struct MetalRenderer {
     path_tiles_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     shadows_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     quads_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    opaque_quads_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     underlines_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
@@ -203,6 +204,9 @@ pub struct MetalRenderer {
     /// it. A shader that failed to build is kept as `None`, so it is not built again every frame.
     custom_pipeline_states:
         FxHashMap<ShaderId, Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
+    depth_write_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
+    depth_test_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
+    depth_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: CFRetained<CVMetalTextureCache>,
@@ -354,6 +358,7 @@ impl MetalRenderer {
             "path_tile_vertex",
             "path_tile_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let shadows_pipeline_state = build_pipeline_state(
             &device,
@@ -362,6 +367,7 @@ impl MetalRenderer {
             "shadow_vertex",
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let quads_pipeline_state = build_pipeline_state(
             &device,
@@ -370,6 +376,16 @@ impl MetalRenderer {
             "quad_vertex",
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
+        )?;
+        let opaque_quads_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "opaque_quads",
+            "opaque_quad_vertex",
+            "opaque_quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            false,
         )?;
         let underlines_pipeline_state = build_pipeline_state(
             &device,
@@ -378,6 +394,7 @@ impl MetalRenderer {
             "underline_vertex",
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -386,6 +403,7 @@ impl MetalRenderer {
             "monochrome_sprite_vertex",
             "monochrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let polychrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -394,6 +412,7 @@ impl MetalRenderer {
             "polychrome_sprite_vertex",
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
@@ -402,6 +421,7 @@ impl MetalRenderer {
             "surface_vertex",
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         )?;
 
         // A backdrop mixes the blurred copy into what it covers rather than laying it over:
@@ -489,6 +509,9 @@ impl MetalRenderer {
             FilterBlend::Over,
         )?;
 
+        let depth_write_state = build_depth_stencil_state(&device, true)?;
+        let depth_test_state = build_depth_stencil_state(&device, false)?;
+
         let command_queue = device.newCommandQueue().context("creating command queue")?;
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
         #[expect(
@@ -514,7 +537,6 @@ impl MetalRenderer {
             layer,
             presents_with_transaction: false,
             display_link_mode: DisplayLinkMode::Detached,
-            #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -522,6 +544,7 @@ impl MetalRenderer {
             path_tiles_pipeline_state,
             shadows_pipeline_state,
             quads_pipeline_state,
+            opaque_quads_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
@@ -536,6 +559,9 @@ impl MetalRenderer {
             composite_pipeline_state,
             masked_pipeline_state,
             custom_pipeline_states: FxHashMap::default(),
+            depth_write_state,
+            depth_test_state,
+            depth_texture: None,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
@@ -982,10 +1008,14 @@ impl MetalRenderer {
             true => self.filter_texture(FilterTarget::Frame, viewport_size)?,
             false => texture.retain(),
         };
+        let depth_texture = DEPTH_PREPASS
+            .then(|| self.depth_texture_matching(&main_texture))
+            .transpose()?;
 
         let mut command_encoder = new_command_encoder_for_texture(
             &command_buffer,
             &main_texture,
+            depth_texture.as_deref(),
             viewport_size,
             Some(MTLClearColor {
                 red: 0.,
@@ -994,14 +1024,25 @@ impl MetalRenderer {
                 alpha,
             }),
         )?;
-        // SAFETY: Metal copies the viewport bytes, which match every vertex
-        // shader's `GlobalInputIndex_ViewportSize` argument.
+        let depth_scale = quad_depth_scale(scene.quads.len());
+        // SAFETY: Metal copies both values, which match every vertex shader's
+        // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
         unsafe {
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&viewport_size).cast(),
                 mem::size_of_val(&viewport_size),
                 GlobalInputIndex::ViewportSize as usize,
             );
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&depth_scale).cast(),
+                mem::size_of_val(&depth_scale),
+                GlobalInputIndex::DepthScale as usize,
+            );
+        }
+
+        if DEPTH_PREPASS {
+            self.draw_opaque_quads(scene.quads.len(), instance_bindings, &command_encoder);
+            command_encoder.setDepthStencilState(Some(&self.depth_test_state));
         }
 
         let mut stack: Vec<usize> = Vec::new();
@@ -1012,6 +1053,7 @@ impl MetalRenderer {
         // share the target when everything it draws lands inside it.
         let mut wiped: Vec<Bounds<ScaledPixels>> = Vec::new();
 
+        let mut quad_cursor: u32 = 0;
         let mut path_tile_cursor = 0;
         for batch in scene.batches() {
             let wanted = filtered
@@ -1059,6 +1101,7 @@ impl MetalRenderer {
                     stack.len(),
                     &main_texture,
                     viewport_size,
+                    depth_scale,
                 )?;
             }
 
@@ -1076,11 +1119,30 @@ impl MetalRenderer {
                 // margin a blur reads past it, is ever read back, so only that is wiped.
                 command_encoder =
                     new_discarding_command_encoder(&command_buffer, &target, viewport_size)?;
-                bind_viewport(&command_encoder, viewport_size);
+                bind_viewport(&command_encoder, viewport_size, depth_scale);
                 self.clear_within(&command_encoder, layer_wipe(layer), viewport_size);
                 stack.push(*index);
                 spans.push(layer.destination_clip());
                 wiped.push(layer_wipe(layer));
+            }
+
+            // Quad shaders assign each quad its own depth.
+            // In every other batch type, the depth is fixed to the position of the quad cursor.
+            if DEPTH_PREPASS {
+                let (znear, zfar) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
+                    (0.0, 1.0)
+                } else {
+                    let depth = quad_depth(quad_cursor, depth_scale) as f64;
+                    (depth, depth)
+                };
+                command_encoder.setViewport(MTLViewport {
+                    originX: 0.0,
+                    originY: 0.0,
+                    width: i32::from(viewport_size.width) as f64,
+                    height: i32::from(viewport_size.height) as f64,
+                    znear,
+                    zfar,
+                });
             }
 
             match batch {
@@ -1088,6 +1150,7 @@ impl MetalRenderer {
                     self.draw_shadows(range, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::Quads(range) => {
+                    quad_cursor += range.len() as u32;
                     self.draw_quads(range, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::Shaders { shader, range } => {
@@ -1097,6 +1160,7 @@ impl MetalRenderer {
                             range,
                             instance_bindings,
                             viewport_size,
+                            depth_scale,
                             &command_encoder,
                         );
                     }
@@ -1171,10 +1235,11 @@ impl MetalRenderer {
                     command_encoder = new_command_encoder_for_texture(
                         &command_buffer,
                         &target,
+                        None,
                         viewport_size,
                         None,
                     )?;
-                    bind_viewport(&command_encoder, viewport_size);
+                    bind_viewport(&command_encoder, viewport_size, depth_scale);
                     self.draw_backdrops(
                         range,
                         instance_bindings,
@@ -1212,6 +1277,7 @@ impl MetalRenderer {
                 stack.len(),
                 &main_texture,
                 viewport_size,
+                depth_scale,
             )?;
         }
 
@@ -1244,6 +1310,7 @@ impl MetalRenderer {
         depth: usize,
         main_texture: &ProtocolObject<dyn MTLTexture>,
         viewport_size: Size<DevicePixels>,
+        depth_scale: f32,
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
         let source = self.filter_texture(
             FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)),
@@ -1267,8 +1334,9 @@ impl MetalRenderer {
             )?,
             false => source,
         };
-        let encoder = new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None)?;
-        bind_viewport(&encoder, viewport_size);
+        let encoder =
+            new_command_encoder_for_texture(command_buffer, &onto, None, viewport_size, None)?;
+        bind_viewport(&encoder, viewport_size, depth_scale);
         self.composite_layer(&encoder, &blurred, layer, clip, viewport_size);
         Ok(encoder)
     }
@@ -1344,6 +1412,7 @@ impl MetalRenderer {
             None => new_command_encoder_for_texture(
                 command_buffer,
                 target,
+                None,
                 size,
                 Some(MTLClearColor {
                     red: 0.,
@@ -1637,6 +1706,7 @@ impl MetalRenderer {
         let encoder = new_command_encoder_for_texture(
             command_buffer,
             &target,
+            None,
             viewport_size,
             Some(MTLClearColor {
                 red: 0.,
@@ -1743,6 +1813,75 @@ impl MetalRenderer {
                 4,
                 backdrops.len(),
                 backdrops.start,
+            );
+        }
+    }
+
+    fn depth_texture_matching(
+        &mut self,
+        target: &ProtocolObject<dyn MTLTexture>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+        if let Some(depth_texture) = &self.depth_texture
+            && depth_texture.width() == target.width()
+            && depth_texture.height() == target.height()
+        {
+            return Ok(depth_texture.clone());
+        }
+        let descriptor = MTLTextureDescriptor::new();
+        // SAFETY: The size is the size of an existing render target, which the device supports.
+        unsafe {
+            descriptor.setWidth(target.width());
+            descriptor.setHeight(target.height());
+        }
+        descriptor.setPixelFormat(MTLPixelFormat::Depth32Float);
+        descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        // The depth buffer never leaves its render pass, so Apple GPUs can keep
+        // it in tile memory without allocating any backing store.
+        descriptor.setStorageMode(if self.is_apple_gpu {
+            MTLStorageMode::Memoryless
+        } else {
+            MTLStorageMode::Private
+        });
+        let depth_texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .context("allocating depth texture")?;
+        self.depth_texture = Some(depth_texture.clone());
+        Ok(depth_texture)
+    }
+
+    fn draw_opaque_quads(
+        &self,
+        quad_count: usize,
+        instance_bindings: &InstanceBindings,
+        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    ) {
+        if quad_count == 0 {
+            return;
+        }
+        let quad_count_value = quad_count as u32;
+
+        command_encoder.setRenderPipelineState(&self.opaque_quads_pipeline_state);
+        command_encoder.setDepthStencilState(Some(&self.depth_write_state));
+        // SAFETY: The scene's quads and the copied count match the shader layouts and slots.
+        // Metal retains the buffer, and writer.finish publishes its writes.
+        unsafe {
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&instance_bindings.quads.buffer),
+                instance_bindings.quads.offset,
+                QuadInputIndex::Quads as usize,
+            );
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&quad_count_value).cast(),
+                mem::size_of_val(&quad_count_value),
+                QuadInputIndex::QuadCount as usize,
+            );
+            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                MTLPrimitiveType::TriangleStrip,
+                0,
+                4,
+                quad_count,
+                0,
             );
         }
     }
@@ -1887,6 +2026,7 @@ impl MetalRenderer {
         shaders: Range<usize>,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
+        depth_scale: f32,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
         if shaders.is_empty() {
@@ -1954,8 +2094,8 @@ impl MetalRenderer {
                 shaders.start,
             );
         }
-        // The globals took the slot the viewport is bound at for the whole pass.
-        bind_viewport(command_encoder, viewport_size);
+        // The globals and instances took the slots of the viewport and depth scale.
+        bind_viewport(command_encoder, viewport_size, depth_scale);
     }
 
     fn draw_underlines(
@@ -2223,19 +2363,25 @@ fn layer_wipe(layer: LayerEffect) -> Bounds<ScaledPixels> {
     layer.source_bounds.dilate(margin + ScaledPixels(1.))
 }
 
-/// Binds the viewport every primitive shader reads at `GlobalInputIndex::ViewportSize`. A pass
-/// starts without it, and the custom shader globals share its slot.
+/// Binds the viewport and quad depth scale the primitive shaders read at `GlobalInputIndex`. A
+/// pass starts without them, and the custom shader globals and instances share their slots.
 fn bind_viewport(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     viewport_size: Size<DevicePixels>,
+    depth_scale: f32,
 ) {
-    // SAFETY: Metal copies the viewport bytes, which match every vertex shader's
-    // `GlobalInputIndex_ViewportSize` argument.
+    // SAFETY: Metal copies both values, which match every vertex shader's
+    // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
     unsafe {
         encoder.setVertexBytes_length_atIndex(
             ptr::NonNull::from(&viewport_size).cast(),
             mem::size_of_val(&viewport_size),
             GlobalInputIndex::ViewportSize as usize,
+        );
+        encoder.setVertexBytes_length_atIndex(
+            ptr::NonNull::from(&depth_scale).cast(),
+            mem::size_of_val(&depth_scale),
+            GlobalInputIndex::DepthScale as usize,
         );
     }
 }
@@ -2250,8 +2396,6 @@ fn whole_scissor(viewport_size: Size<DevicePixels>) -> MTLScissorRect {
     }
 }
 
-/// Starts a render pass into `texture`. The pass descriptor retains the texture, so it may be a
-/// temporary the caller drops before the encoder ends.
 /// An encoder on `texture` that keeps nothing it held, for a pass that writes everything it later
 /// reads.
 fn new_discarding_command_encoder(
@@ -2284,9 +2428,13 @@ fn new_discarding_command_encoder(
     Ok(command_encoder)
 }
 
+/// Starts a render pass into `texture`, with a depth attachment only when `depth_texture` is given.
+/// The pass descriptor retains the textures, so they may be temporaries the caller drops before
+/// the encoder ends.
 fn new_command_encoder_for_texture(
     command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     texture: &ProtocolObject<dyn MTLTexture>,
+    depth_texture: Option<&ProtocolObject<dyn MTLTexture>>,
     viewport_size: Size<DevicePixels>,
     clear_color: Option<MTLClearColor>,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
@@ -2304,6 +2452,15 @@ fn new_command_encoder_for_texture(
         color_attachment.setClearColor(clear_color);
     } else {
         color_attachment.setLoadAction(MTLLoadAction::Load);
+    }
+
+    if let Some(depth_texture) = depth_texture {
+        let depth_attachment = render_pass_descriptor.depthAttachment();
+        depth_attachment.setTexture(Some(depth_texture));
+        depth_attachment.setLoadAction(MTLLoadAction::Clear);
+        depth_attachment.setClearDepth(0.0);
+        // The depth buffer is only needed within this pass.
+        depth_attachment.setStoreAction(MTLStoreAction::DontCare);
     }
 
     let command_encoder = command_buffer
@@ -2466,10 +2623,10 @@ const _: () = {
 
 #[repr(C)]
 pub enum FilterInputIndex {
-    Backdrops = 1,
-    ViewportSize = 2,
-    Params = 3,
-    Source = 4,
+    Backdrops = 2,
+    ViewportSize = 3,
+    Params = 4,
+    Source = 5,
 }
 
 fn mask_params(layer: LayerEffect, destination_clip: Bounds<ScaledPixels>) -> MaskParams {
@@ -2561,6 +2718,7 @@ fn build_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: MTLPixelFormat,
+    blending: bool,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
     let vertex_fn = library
         .newFunctionWithName(&NSString::from_str(vertex_fn_name))
@@ -2576,13 +2734,16 @@ fn build_pipeline_state(
     // SAFETY: Index zero is within the pipeline's color attachment array.
     let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
     color_attachment.setPixelFormat(pixel_format);
-    color_attachment.setBlendingEnabled(true);
+    color_attachment.setBlendingEnabled(blending);
     color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
     color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
     color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
     color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
     color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    if DEPTH_PREPASS {
+        descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
+    }
 
     device
         .newRenderPipelineStateWithDescriptor_error(&descriptor)
@@ -2644,6 +2805,18 @@ fn build_custom_pipeline_state(
     device
         .newRenderPipelineStateWithDescriptor_error(&descriptor)
         .map_err(|error| anyhow::anyhow!("custom shader `{}`: {error}", program.label))
+}
+
+fn build_depth_stencil_state(
+    device: &ProtocolObject<dyn MTLDevice>,
+    write_depth: bool,
+) -> Result<Retained<ProtocolObject<dyn MTLDepthStencilState>>> {
+    let descriptor = MTLDepthStencilDescriptor::new();
+    descriptor.setDepthCompareFunction(MTLCompareFunction::Greater);
+    descriptor.setDepthWriteEnabled(write_depth);
+    device
+        .newDepthStencilStateWithDescriptor(&descriptor)
+        .context("creating depth stencil state")
 }
 
 #[derive(Clone)]
@@ -2833,43 +3006,45 @@ impl InstanceBufferWriter {
 #[repr(C)]
 enum GlobalInputIndex {
     ViewportSize = 0,
+    DepthScale = 1,
 }
 
 #[repr(C)]
 enum ShadowInputIndex {
-    Shadows = 1,
+    Shadows = 2,
 }
 
 #[repr(C)]
 enum QuadInputIndex {
-    Quads = 1,
+    Quads = 2,
+    QuadCount = 3,
 }
 
 #[repr(C)]
 enum UnderlineInputIndex {
-    Underlines = 1,
+    Underlines = 2,
 }
 
 #[repr(C)]
 enum SpriteInputIndex {
-    Sprites = 1,
-    AtlasTextureSize = 2,
-    AtlasTexture = 3,
+    Sprites = 2,
+    AtlasTextureSize = 3,
+    AtlasTexture = 4,
 }
 
 #[repr(C)]
 enum SurfaceInputIndex {
-    Surfaces = 1,
-    TextureSize = 2,
-    YTexture = 3,
-    CbCrTexture = 4,
+    Surfaces = 2,
+    TextureSize = 3,
+    YTexture = 4,
+    CbCrTexture = 5,
 }
 
 #[repr(C)]
 enum PathTileInputIndex {
-    Tiles = 1,
-    Curves = 2,
-    Paints = 3,
+    Tiles = 2,
+    Curves = 3,
+    Paints = 4,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

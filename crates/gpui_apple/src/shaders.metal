@@ -41,10 +41,6 @@ float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
 float2 corner_shape(float radius, float smoothing, float2 half_size);
 float superellipse_sdf(float2 point, float radius, float exponent);
 float quad_sdf_impl(float2 center_to_point, float corner_radius, float corner_exponent);
-float gaussian(float x, float sigma);
-float2 erf(float2 x);
-float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 
@@ -95,18 +91,39 @@ float pixel_coverage(float2 position, Bounds_ScaledPixels bounds) {
   return overlap.x * overlap.y;
 }
 
+constant float4 CULLED_POSITION = float4(0., 0., 0., 1.);
+
+float quad_depth(uint quad_id, float depth_scale) {
+  return saturate(float(quad_id + 1u) * depth_scale);
+}
+
+// Opaque rectangles are drawn by the opaque pass instead of the quad pass. The fork draws no
+// opaque pass (`DEPTH_PREPASS` in scene.rs), so the quad pass keeps every quad. Upstream's test is
+// a solid opaque background with neither rounded corners nor a border.
+bool is_opaque_rectangle(Quad quad) {
+  return false;
+}
+
 vertex QuadFragmentInput quad_vertex(
     uint vertex_id [[vertex_id]], uint quad_id [[instance_id]],
     constant Quad *quads [[buffer(QuadInputIndex_Quads)]],
     constant Size_DevicePixels *viewport_size
-    [[buffer(GlobalInputIndex_ViewportSize)]]) {
-  float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    [[buffer(GlobalInputIndex_ViewportSize)]],
+    constant float *depth_scale [[buffer(GlobalInputIndex_DepthScale)]]) {
   Quad quad = quads[quad_id];
+  if (is_opaque_rectangle(quad)) {
+    QuadFragmentInput culled = {};
+    culled.position = CULLED_POSITION;
+    return culled;
+  }
+
+  float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
   Bounds_ScaledPixels cover = pixel_cover(quad.bounds);
   ClippedVertex clipped =
       clip_to_mask(unit_vertex, cover, quad.content_mask.bounds);
   float4 device_position =
       to_device_position_impl(clipped.position, viewport_size);
+  device_position.z = quad_depth(quad_id, *depth_scale);
   float4 border_color = hsla_to_rgba(quad.border_color);
   // A quad off the pixel grid covers its edge pixels only in part, which the fragment weighs.
   bool on_grid = all(float4(cover.origin.x, cover.origin.y, cover.size.width, cover.size.height) ==
@@ -414,11 +431,8 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       }
     }
 
-    // Blend the border on top of the background and then linearly interpolate
-    // between the two as we slide inside the background.
-    float4 blended_border = over(background, border_color);
-    color = mix(background, blended_border,
-                saturate(antialias_threshold - inner_sdf));
+    border_color.a *= saturate(antialias_threshold - inner_sdf);
+    color = over(background, border_color);
   }
 
   // The distance field knows nothing of how much of the pixel the quad covers, so a quad
@@ -476,11 +490,117 @@ float quarter_ellipse_sdf(float2 point, float2 radii) {
   return unit_circle_sdf * (radii.x + radii.y) * -0.5;
 }
 
+struct OpaqueQuadFragmentInput {
+  float4 position [[position]];
+  float4 color [[flat]];
+};
+
+vertex OpaqueQuadFragmentInput opaque_quad_vertex(
+    uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
+    constant Quad *quads [[buffer(QuadInputIndex_Quads)]],
+    constant uint *quad_count [[buffer(QuadInputIndex_QuadCount)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(GlobalInputIndex_ViewportSize)]],
+    constant float *depth_scale [[buffer(GlobalInputIndex_DepthScale)]]) {
+  uint quad_id = *quad_count - 1u - instance_id;
+  Quad quad = quads[quad_id];
+  if (!is_opaque_rectangle(quad)) {
+    return OpaqueQuadFragmentInput{CULLED_POSITION, float4(0.)};
+  }
+
+  float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+  ClippedVertex clipped =
+      clip_to_mask(unit_vertex, quad.bounds, quad.content_mask.bounds);
+  float4 device_position =
+      to_device_position_impl(clipped.position, viewport_size);
+  device_position.z = quad_depth(quad_id, *depth_scale);
+  return OpaqueQuadFragmentInput{device_position,
+                                 hsla_to_rgba(quad.background.solid)};
+}
+
+fragment float4 opaque_quad_fragment(OpaqueQuadFragmentInput input
+                                     [[stage_in]]) {
+  return input.color;
+}
+
+struct PreparedBlurredRoundedRect {
+  float4 shape;
+  float4 r1;
+  float4 exponent;
+  float4 scale;
+};
+
 struct ShadowFragmentInput {
   float4 position [[position]];
   float4 color [[flat]];
   uint shadow_id [[flat]];
+  float4 blur_shape [[flat]];
+  float4 blur_r1 [[flat]];
+  float4 blur_exponent [[flat]];
+  float4 blur_scale [[flat]];
 };
+
+float erf7(float x) {
+  x = clamp(x, -10., 10.) * (2. / sqrt(M_PI_F));
+  float xx = x * x;
+  x = x + (0.24295 + (0.03395 + 0.0104 * xx) * xx) * (x * xx);
+  return x / sqrt(1. + x * x);
+}
+
+// Raph Levien's blurred rounded rectangle approximation, whose blur s is sigma * sqrt(2):
+// https://raphlinus.github.io/graphics/2020/04/21/blurred-rounded-rects.html
+PreparedBlurredRoundedRect prepare_blurred_rounded_rect(float2 size, Corners_ScaledPixels corner_radii, float sigma) {
+  float min_edge = min(size.x, size.y);
+  if (min_edge <= 0.) {
+    return PreparedBlurredRoundedRect{
+        float4(0.), float4(0.), float4(2.), float4(0.)};
+  }
+  float s = max(sigma * sqrt(2.), 1e-6);
+  float s_inv = 1. / s;
+  float r_max = 0.5 * min_edge;
+  float4 radii = float4(corner_radii.top_left, corner_radii.top_right,
+                        corner_radii.bottom_right, corner_radii.bottom_left);
+  float4 r0 = min(sqrt(radii * radii + 1.15 * 1.15 * s * s), r_max);
+  float4 r1 = min(sqrt(radii * radii + 4. * s * s), r_max);
+
+  float2 half_extent = 0.5 * s_inv * size;
+  float delta = 1.25 * s * (exp(-half_extent.x * half_extent.x) - exp(-half_extent.y * half_extent.y));
+  float2 adjusted_size = float2(size.x + min(delta, 0.), size.y - max(delta, 0.));
+  float4 peak = s_inv * 0.5 * (max(adjusted_size.x, adjusted_size.y) - 0.5 * radii);
+
+  PreparedBlurredRoundedRect output;
+  output.shape = float4(0.5 * adjusted_size, s_inv, min_edge);
+  output.r1 = r1;
+  output.exponent = 2. * r1 / r0;
+  output.scale = 0.5 * float4(erf7(peak.x), erf7(peak.y), erf7(peak.z), erf7(peak.w));
+  return output;
+}
+
+float pick_corner(float2 center_to_point, float4 values) {
+  Corners_ScaledPixels corners = {values.x, values.y, values.z, values.w};
+  return pick_corner_radius(center_to_point, corners);
+}
+
+float blurred_rounded_rect(float2 center_to_point, PreparedBlurredRoundedRect prepared) {
+  float r1 = pick_corner(center_to_point, prepared.r1);
+  float exponent = pick_corner(center_to_point, prepared.exponent);
+  float scale = pick_corner(center_to_point, prepared.scale);
+  float s_inv = prepared.shape.z;
+  float min_edge = prepared.shape.w;
+
+  float2 p0 = abs(center_to_point) - (prepared.shape.xy - r1);
+  float2 p1 = max(p0, 0.);
+  float d_pos;
+  if (p1.x > 0. && p1.y > 0.) {
+    d_pos = pow(pow(p1.x, exponent) + pow(p1.y, exponent), 1. / exponent);
+  } else {
+    d_pos = p1.x + p1.y;
+  }
+
+  float d_neg = min(max(p0.x, p0.y), 0.);
+  float d = d_pos + d_neg - r1;
+  return scale * (erf7(s_inv * (min_edge + d)) - erf7(s_inv * d));
+}
 
 vertex ShadowFragmentInput shadow_vertex(
     uint vertex_id [[vertex_id]], uint shadow_id [[instance_id]],
@@ -495,11 +615,18 @@ vertex ShadowFragmentInput shadow_vertex(
   float4 device_position =
       to_device_position_impl(clipped.position, viewport_size);
   float4 color = hsla_to_rgba(shadow.color);
+  PreparedBlurredRoundedRect blur = prepare_blurred_rounded_rect(
+      float2(shadow.shape_bounds.size.width, shadow.shape_bounds.size.height),
+      shadow.shape_corner_radii, shadow.blur_radius);
 
   return ShadowFragmentInput{
       device_position,
       color,
-      shadow_id};
+      shadow_id,
+      blur.shape,
+      blur.r1,
+      blur.exponent,
+      blur.scale};
 }
 
 fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
@@ -507,48 +634,20 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                 [[buffer(ShadowInputIndex_Shadows)]]) {
   Shadow shadow = shadows[input.shadow_id];
 
-  float2 origin = float2(shadow.shape_bounds.origin.x, shadow.shape_bounds.origin.y);
-  float2 size = float2(shadow.shape_bounds.size.width, shadow.shape_bounds.size.height);
-  float2 half_size = size / 2.;
-  float2 center = origin + half_size;
-  float2 point = input.position.xy - center;
-  float corner_radius;
-  if (point.x < 0.) {
-    if (point.y < 0.) {
-      corner_radius = shadow.shape_corner_radii.top_left;
-    } else {
-      corner_radius = shadow.shape_corner_radii.bottom_left;
-    }
-  } else {
-    if (point.y < 0.) {
-      corner_radius = shadow.shape_corner_radii.top_right;
-    } else {
-      corner_radius = shadow.shape_corner_radii.bottom_right;
-    }
-  }
-
   float alpha;
-  if (shadow.blur_radius == 0.) {
+  if (shadow.shape_bounds.size.width <= 0. || shadow.shape_bounds.size.height <= 0.) {
+    alpha = 0.;
+  } else if (shadow.blur_radius == 0.) {
     float distance = quad_sdf(input.position.xy, shadow.shape_bounds,
                               shadow.shape_corner_radii, 0.0);
     alpha = saturate(0.5 - distance);
   } else {
-    // The signal is only non-zero in a limited range, so don't waste samples
-    float low = point.y - half_size.y;
-    float high = point.y + half_size.y;
-    float start = clamp(-3. * shadow.blur_radius, low, high);
-    float end = clamp(3. * shadow.blur_radius, low, high);
-
-    // Accumulate samples (we can get away with surprisingly few samples)
-    float step = (end - start) / 4.;
-    float y = start + step * 0.5;
-    alpha = 0.;
-    for (int i = 0; i < 4; i++) {
-      alpha += blur_along_x(point.x, point.y - y, shadow.blur_radius,
-                            corner_radius, half_size) *
-               gaussian(y, shadow.blur_radius) * step;
-      y += step;
-    }
+    float2 origin = float2(shadow.shape_bounds.origin.x, shadow.shape_bounds.origin.y);
+    float2 size = float2(shadow.shape_bounds.size.width, shadow.shape_bounds.size.height);
+    float2 center = origin + size / 2.;
+    PreparedBlurredRoundedRect blur = {input.blur_shape, input.blur_r1,
+                                       input.blur_exponent, input.blur_scale};
+    alpha = blurred_rounded_rect(input.position.xy - center, blur);
   }
 
   if (shadow.inset != 0u) {
@@ -1154,30 +1253,6 @@ float quad_sdf_impl(float2 corner_center_to_point, float corner_radius, float co
     }
 }
 
-// A standard gaussian function, used for weighting samples
-float gaussian(float x, float sigma) {
-  return exp(-(x * x) / (2. * sigma * sigma)) / (sqrt(2. * M_PI_F) * sigma);
-}
-
-// This approximates the error function, needed for the gaussian integral
-float2 erf(float2 x) {
-  float2 s = sign(x);
-  float2 a = abs(x);
-  float2 r1 = 1. + (0.278393 + (0.230389 + (0.000972 + 0.078108 * a) * a) * a) * a;
-  float2 r2 = r1 * r1;
-  return s - s / (r2 * r2);
-}
-
-float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size) {
-  float delta = min(half_size.y - corner - abs(y), 0.);
-  float curved =
-      half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
-  float2 integral =
-      0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
-  return integral.y - integral.x;
-}
-
 ClippedVertex clip_to_mask(float2 unit_vertex, Bounds_ScaledPixels bounds,
                            Bounds_ScaledPixels mask) {
   float2 bounds_origin = float2(bounds.origin.x, bounds.origin.y);
@@ -1212,12 +1287,10 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixe
 }
 
 float4 over(float4 below, float4 above) {
-  float4 result;
   float alpha = above.a + below.a * (1.0 - above.a);
-  result.rgb =
-      (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
-  result.a = alpha;
-  return result;
+  float3 premultiplied =
+      above.rgb * above.a + below.rgb * below.a * (1.0 - above.a);
+  return float4(premultiplied / (alpha == 0.0 ? 1.0 : alpha), alpha);
 }
 
 PreparedBackground prepare_background(Background background) {

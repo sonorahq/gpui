@@ -41,6 +41,7 @@ mod shader_compilation {
             ("blit", true),
             ("mask", true),
             ("quad", true),
+            ("opaque_quad", true),
             ("shadow", true),
             ("path_tile", true),
             ("underline", true),
