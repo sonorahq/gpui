@@ -557,6 +557,7 @@ impl Scene {
 
     /// Inserts a primitive replayed from a scene whose history matched this one's where the
     /// replay began, with the order it was drawn at there.
+    #[inline]
     fn keep_primitive(&mut self, primitive: Primitive) {
         let index = self.paint_operations.len();
         if let Some(layer) = self
@@ -664,6 +665,7 @@ impl Scene {
             .iter()
             .map(|(index, _)| *index)
             .peekable();
+        let has_animations = !prev_scene.animations.is_empty();
         for (index, operation) in (range.start..).zip(&prev_scene.paint_operations[range]) {
             // A cached view nested in this range may be replayed alone next frame, so the
             // marks inside it move along with what they mark.
@@ -672,15 +674,18 @@ impl Scene {
             }
             match operation {
                 PaintOperation::Primitive(primitive) => {
-                    match (keep, prev_scene.animated_sprite(primitive)) {
-                        (true, Some((sprite, animation))) => {
-                            self.keep_animated_sprite(sprite, animation)
+                    if has_animations
+                        && let Some((sprite, animation)) = prev_scene.animated_sprite(primitive)
+                    {
+                        match keep {
+                            true => self.keep_animated_sprite(sprite, animation),
+                            false => self.insert_animated_sprite(sprite, animation),
                         }
-                        (false, Some((sprite, animation))) => {
-                            self.insert_animated_sprite(sprite, animation)
+                    } else {
+                        match keep {
+                            true => self.keep_primitive(primitive.clone()),
+                            false => self.insert_primitive(primitive.clone()),
                         }
-                        (true, None) => self.keep_primitive(primitive.clone()),
-                        (false, None) => self.insert_primitive(primitive.clone()),
                     }
                 }
                 PaintOperation::StartLayer(key) => match layers_kept {
