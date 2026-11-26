@@ -3,10 +3,15 @@ name: shaders
 # Compiles the Metal and HLSL shaders with Apple's and Microsoft's own compilers, which only run
 # on their systems, builds the squircle example on each so the shapes can be checked by eye, and
 # runs the renderer tests there. The WGSL shaders are validated by the gpui_wgpu tests instead.
+# Each job uploads the render fixture's PNGs, so a change can be compared with an earlier run.
 on:
   pull_request:
     paths:
+      - "crates/gpui/src/backdrop_test_fixture.rs"
+      - "crates/gpui/src/bounds_tree.rs"
       - "crates/gpui/src/scene.rs"
+      - "crates/gpui/src/shader/**"
+      - "crates/gpui/src/window.rs"
       - "crates/gpui/examples/squircle.rs"
       - "crates/gpui_apple/**"
       - "crates/gpui_macos/**"
@@ -27,10 +32,18 @@ jobs:
           name: squircle-macos
           path: target/release/examples/squircle
       # The validation layer rejects wrong load actions, texture usage and scissors outside the
-      # target, which a compiler cannot catch.
+      # target, which a compiler cannot catch. Shader validation adds out of bounds reads and
+      # writes inside the shaders.
       - run: cargo test --package gpui_apple --package gpui_macos
         env:
           MTL_DEBUG_LAYER: "1"
+          MTL_SHADER_VALIDATION: "1"
+          GPUI_RENDER_FIXTURE_OUT: ${{ runner.temp }}/render-fixture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: render-fixture-metal
+          path: ${{ runner.temp }}/render-fixture
 
   hlsl:
     runs-on: windows-latest
@@ -45,3 +58,10 @@ jobs:
           name: squircle-windows
           path: target/release/examples/squircle.exe
       - run: cargo test --package gpui_windows
+        env:
+          GPUI_RENDER_FIXTURE_OUT: ${{ runner.temp }}/render-fixture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: render-fixture-directx
+          path: ${{ runner.temp }}/render-fixture
