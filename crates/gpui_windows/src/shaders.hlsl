@@ -1498,6 +1498,9 @@ struct Backdrop {
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
+    Hsla tint;
+    float tint_amount;
+    float saturation;
 };
 
 struct BackdropFragmentInput {
@@ -1525,14 +1528,24 @@ BackdropFragmentInput backdrop_vertex(uint vertex_id: SV_VertexID, uint instance
 // covers; over a see-through window laying it over left `a + a(1 - a)` where the window asked
 // for `a`. The mix is two draws over one instance buffer: `backdrop_punch_fragment` for
 // `dst *= (1 - k)`, then this one, added on top.
+//
+// The tint mixes the copy towards its colour by its amount, alpha and all, so a surface whose
+// tint carries the window's own alpha comes out as see-through as the window over whatever it
+// covers. The frame holds premultiplied colour, so the tint is premultiplied before the mix.
+// Saturation scales the copy's colour away from its grey at the same luma. The scale is linear,
+// so it applies to premultiplied colour as it stands, clamped to what the alpha can hold.
 float4 backdrop_fragment(BackdropFragmentInput input): SV_Target {
     Backdrop backdrop = backdrops[input.backdrop_id];
     float2 position = input.position.xy;
     float4 sampled = t_sprite.Sample(s_sprite, position / global_viewport_size);
     float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
     float coverage = saturate(0.5 - distance);
+    float luma = dot(sampled.rgb, float3(0.2126, 0.7152, 0.0722));
+    float3 vivid = clamp(lerp(float3(luma, luma, luma), sampled.rgb, backdrop.saturation), 0.0, sampled.a);
+    float4 tint = hsla_to_rgba(backdrop.tint);
+    float4 tinted = lerp(float4(vivid, sampled.a), float4(tint.rgb * tint.a, tint.a), backdrop.tint_amount);
 
-    return sampled * coverage * backdrop.opacity;
+    return tinted * coverage * backdrop.opacity;
 }
 
 // The hole the blurred copy lands in: alpha alone, blended so what it covers keeps `1 - k` of

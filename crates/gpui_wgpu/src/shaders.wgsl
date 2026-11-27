@@ -1604,6 +1604,9 @@ struct Backdrop {
     bounds: Bounds,
     content_mask: Bounds,
     corner_radii: Corners,
+    tint: Hsla,
+    tint_amount: f32,
+    saturation: f32,
 }
 
 struct BackdropVarying {
@@ -1632,6 +1635,12 @@ fn vs_backdrop(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) i
 // draws over one instance buffer, `fs_backdrop_punch` for `dst *= (1 - k)` and this one, drawn
 // additively, for `dst += blurred * k`; a single blend cannot carry both k and the sample's
 // own alpha out of one fragment.
+//
+// The tint mixes the copy towards its colour by its amount, alpha and all, so a surface whose
+// tint carries the window's own alpha comes out as see-through as the window over whatever it
+// covers. The frame holds premultiplied colour, so the tint is premultiplied before the mix.
+// Saturation scales the copy's colour away from its grey at the same luma. The scale is linear,
+// so it applies to premultiplied colour as it stands, clamped to what the alpha can hold.
 @fragment
 fn fs_backdrop(input: BackdropVarying) -> @location(0) vec4<f32> {
     let backdrop = load_backdrop(input.backdrop_id);
@@ -1639,8 +1648,12 @@ fn fs_backdrop(input: BackdropVarying) -> @location(0) vec4<f32> {
     let sampled = textureSample(t_sprite, s_sprite, position / globals.viewport_size);
     let distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
     let coverage = saturate(0.5 - distance);
+    let luma = dot(sampled.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let vivid = clamp(mix(vec3<f32>(luma), sampled.rgb, backdrop.saturation), vec3<f32>(0.0), vec3<f32>(sampled.a));
+    let tint = hsla_to_rgba(backdrop.tint);
+    let tinted = mix(vec4<f32>(vivid, sampled.a), vec4<f32>(tint.rgb * tint.a, tint.a), backdrop.tint_amount);
 
-    return sampled * coverage * backdrop.opacity;
+    return tinted * coverage * backdrop.opacity;
 }
 
 /// The hole the blurred copy lands in: alpha alone, blended so the destination keeps `1 - k`

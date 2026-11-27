@@ -1477,6 +1477,12 @@ vertex BackdropVertexOutput backdrop_vertex(
 // covers; over a see-through window they are not, and laying it over left `a + a(1 - a)`
 // where the window asked for `a`. The mix is two draws over one instance buffer:
 // `backdrop_punch_fragment` for `dst *= (1 - k)`, then this one, added on top.
+//
+// The tint mixes the copy towards its colour by its amount, alpha and all, so a surface whose
+// tint carries the window's own alpha comes out as see-through as the window over whatever it
+// covers. The frame holds premultiplied colour, so the tint is premultiplied before the mix.
+// Saturation scales the copy's colour away from its grey at the same luma. The scale is linear,
+// so it applies to premultiplied colour as it stands, clamped to what the alpha can hold.
 fragment float4 backdrop_fragment(
     BackdropFragmentInput input [[stage_in]],
     constant Backdrop *backdrops [[buffer(FilterInputIndex_Backdrops)]],
@@ -1491,8 +1497,12 @@ fragment float4 backdrop_fragment(
   float4 sampled = source.sample(source_sampler, position / extent);
   float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
   float coverage = saturate(0.5 - distance);
+  float luma = dot(sampled.rgb, float3(0.2126, 0.7152, 0.0722));
+  float3 vivid = clamp(mix(float3(luma), sampled.rgb, backdrop.saturation), float3(0.0), float3(sampled.a));
+  float4 tint = hsla_to_rgba(backdrop.tint);
+  float4 tinted = mix(float4(vivid, sampled.a), float4(tint.rgb * tint.a, tint.a), backdrop.tint_amount);
 
-  return sampled * coverage * backdrop.opacity;
+  return tinted * coverage * backdrop.opacity;
 }
 
 // The hole the blurred copy lands in: alpha alone, blended so what it covers keeps `1 - k` of

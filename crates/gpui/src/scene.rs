@@ -2597,7 +2597,7 @@ impl PrimitiveBatch {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Backdrop {
@@ -2611,6 +2611,28 @@ pub struct Backdrop {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    /// The colour the blurred copy is mixed towards, alpha included, and how far.
+    pub tint: Hsla,
+    pub tint_amount: f32,
+    /// How saturated the blurred copy comes out before the tint, 1 for as it was.
+    pub saturation: f32,
+}
+
+impl Default for Backdrop {
+    fn default() -> Self {
+        Self {
+            order: DrawOrder::default(),
+            corner_smoothing: 0.,
+            blur: 0.,
+            opacity: 0.,
+            bounds: Bounds::default(),
+            content_mask: ContentMask::default(),
+            corner_radii: Corners::default(),
+            tint: Hsla::default(),
+            tint_amount: 0.,
+            saturation: 1.,
+        }
+    }
 }
 
 impl From<Backdrop> for Primitive {
