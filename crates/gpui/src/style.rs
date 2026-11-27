@@ -298,6 +298,12 @@ pub struct Style {
     /// Blur whatever is painted behind this element
     pub backdrop_blur: Option<Pixels>,
 
+    /// Mix the blurred backdrop towards a colour
+    pub backdrop_tint: Option<BackdropTint>,
+
+    /// Saturate the blurred backdrop by this factor before the tint
+    pub backdrop_saturation: Option<f32>,
+
     /// Draw this element and its subtree offscreen, and put the result through these effects
     pub filter: LayerFilter,
 
@@ -362,6 +368,18 @@ pub enum Visibility {
     Visible,
     /// The element should not be drawn, but should still take up space in the layout.
     Hidden,
+}
+
+/// The colour a backdrop blur is mixed towards, alpha included, and how far. Unlike a
+/// background laid over the blur, the mix can make the backdrop clearer as well as denser: a
+/// tint with a see-through window's own alpha hides what is painted behind the element while
+/// letting the desktop through just as much as the window does, whatever passes under it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct BackdropTint {
+    /// The colour the backdrop is mixed towards, with the alpha it is mixed towards.
+    pub color: Hsla,
+    /// How far the backdrop is mixed, from 0 for the plain blur to 1 for the colour alone.
+    pub amount: f32,
 }
 
 /// The possible values of the box-shadow property
@@ -847,7 +865,9 @@ impl Style {
         window.paint_drop_shadows(bounds, corner_radii, smoothing, &self.box_shadow);
 
         if let Some(blur) = self.backdrop_blur {
-            window.paint_backdrop(bounds, corner_radii, smoothing, blur);
+            let tint = self.backdrop_tint.unwrap_or_default();
+            let saturation = self.backdrop_saturation.unwrap_or(1.);
+            window.paint_backdrop(bounds, corner_radii, smoothing, blur, saturation, tint);
         }
 
         let background_color = self.background.as_ref().and_then(Fill::color);
@@ -954,6 +974,8 @@ impl Default for Style {
             corner_smoothing: 0.,
             box_shadow: Default::default(),
             backdrop_blur: None,
+            backdrop_tint: None,
+            backdrop_saturation: None,
             filter: LayerFilter::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

@@ -8,25 +8,25 @@ use crate::subscription::SingleSubscriberSet;
 use crate::taffy::TaffyLayoutEngine;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Backdrop, Background, BorderStyle, Bounds,
-    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, DEPTH_PREPASS, Decorations,
-    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
-    Entity, EntityId, EventEmitter, FileDropEvent, Filter, FontId, Global, GlobalElementId,
-    GlyphId, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext,
-    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex,
-    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
-    MouseUpEvent, PaintedPath, Path, PathHash, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
-    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
-    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shader, ShaderInstance, ShaderQuad, Shadow,
-    SharedString, Size, SpanId, SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style,
-    SubpixelSprite, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
-    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
-    prelude::*, px, rems, size, transparent_black,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Backdrop, BackdropTint, Background, BorderStyle,
+    Bounds, BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, DEPTH_PREPASS,
+    Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId,
+    Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Filter, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
+    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayerFilter, LayoutId,
+    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
+    MouseMoveEvent, MouseUpEvent, PaintedPath, Path, PathHash, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shader, ShaderInstance,
+    ShaderQuad, Shadow, SharedString, Size, SpanId, SpriteAnimation, SpriteAnimationId,
+    StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
+    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, ScrollCoast, TouchGestureRecognizer};
@@ -5841,7 +5841,9 @@ impl Window {
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
-    /// Blur whatever has already been painted behind the given bounds.
+    /// Blur whatever has already been painted behind the given bounds, saturate it by
+    /// `saturation` and mix it towards `tint`. A saturation of 1 and a tint of no amount leave
+    /// the blur as it is.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_backdrop(
@@ -5850,6 +5852,8 @@ impl Window {
         corner_radii: Corners<Pixels>,
         corner_smoothing: f32,
         blur: Pixels,
+        saturation: f32,
+        tint: BackdropTint,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -5876,6 +5880,9 @@ impl Window {
                 bounds: self.snapped_content_mask().bounds.intersect(&visible),
             },
             corner_radii: corner_radii.scale(scale_factor),
+            tint: tint.color,
+            tint_amount: tint.amount,
+            saturation,
         });
     }
 

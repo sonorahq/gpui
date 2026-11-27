@@ -606,6 +606,24 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Saturates the blurred backdrop by `factor` before any tint, so the colours under a thick
+    /// tint still come through: 1 leaves them as they are and 0 turns them grey. It takes
+    /// [`Self::backdrop_blur`] to show.
+    fn backdrop_saturate(mut self, factor: f32) -> Self {
+        self.style().backdrop_saturation = Some(factor.max(0.));
+        self
+    }
+
+    /// Mixes the blurred backdrop `amount` of the way towards `color`, alpha included. See
+    /// [`crate::BackdropTint`]. It takes [`Self::backdrop_blur`] to show.
+    fn backdrop_tint(mut self, color: impl Into<Hsla>, amount: f32) -> Self {
+        self.style().backdrop_tint = Some(crate::BackdropTint {
+            color: color.into(),
+            amount: amount.clamp(0., 1.),
+        });
+        self
+    }
+
     /// Sets the font weight of this element
     ///
     /// This value cascades to its child elements.

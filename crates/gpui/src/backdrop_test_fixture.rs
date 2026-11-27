@@ -69,6 +69,8 @@ pub fn cases() -> Vec<Case> {
     cases.push(path_in_blurred_layer());
     cases.push(shadows());
     cases.push(overscan());
+    cases.push(tinted_backdrop());
+    cases.push(saturated_backdrop());
     cases
 }
 
@@ -446,6 +448,74 @@ fn overscan() -> Case {
     })
 }
 
+/// A backdrop across the middle of a frame that is blue at half alpha on the left and opaque red
+/// on the right, mixed most of the way towards white at half alpha. The mix takes alpha along
+/// with colour, so whatever alpha the frame holds under the backdrop keeps a quarter of itself
+/// and takes the rest from the tint, where a fill laid over the blur only ever made it denser.
+/// A renderer that clears to transparent keeps the half-alpha left as see-through as it was; one
+/// that clears opaque clears both sides to the same mix.
+fn tinted_backdrop() -> Case {
+    const AMOUNT: f32 = 0.75;
+    const TINT_ALPHA: f32 = 0.5;
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(rect(0., 0., 32., 64.), BLUE.opacity(0.5)));
+    scene.insert_primitive(quad(rect(32., 0., 32., 64.), RED));
+    scene.insert_primitive(Backdrop {
+        tint: WHITE.opacity(TINT_ALPHA),
+        tint_amount: AMOUNT,
+        ..backdrop(rect(0., 16., 64., 32.), 2., frame())
+    });
+    scene.finish();
+    Case::new("tinted_backdrop", scene, |image| {
+        for x in [8, 56] {
+            let under = f32::from(image.get_pixel(x, 4).0[3]);
+            let alpha = (under * (1. - AMOUNT) + 255. * TINT_ALPHA * AMOUNT).round() as u8;
+            expect(
+                image,
+                x,
+                32,
+                &format!("alpha {alpha}, mixed from {under} and the tint's"),
+                |[.., a]| a.abs_diff(alpha) <= 3,
+            )?;
+        }
+        expect(image, 8, 32, "blue tinted towards white", |[r, _, b, _]| {
+            b > r && r > 40
+        })?;
+        expect(image, 56, 32, "red tinted towards white", |[r, g, _, _]| {
+            r > g && g > 40
+        })
+    })
+}
+
+/// A backdrop across the middle of a muted red frame that doubles its saturation: red comes out
+/// at full strength and the green and blue under it fall away, where above it they stay as
+/// they were.
+fn saturated_backdrop() -> Case {
+    let muted = Hsla {
+        h: 0.,
+        s: 0.5,
+        l: 0.5,
+        a: 1.,
+    };
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(frame(), muted));
+    scene.insert_primitive(Backdrop {
+        saturation: 2.,
+        ..backdrop(rect(0., 16., 64., 32.), 2., frame())
+    });
+    scene.finish();
+    Case::new("saturated_backdrop", scene, |image| {
+        let [red, green, ..] = image.get_pixel(32, 4).0;
+        expect(
+            image,
+            32,
+            32,
+            &format!("more saturated than the {red}, {green} above it"),
+            |[r, g, ..]| r >= red && r > 245 && g.saturating_add(15) < green,
+        )
+    })
+}
+
 const RED: Hsla = gpui::red();
 const BLUE: Hsla = gpui::blue();
 const WHITE: Hsla = gpui::white();
@@ -494,6 +564,9 @@ fn backdrop(bounds: Bounds<ScaledPixels>, blur: f32, mask: Bounds<ScaledPixels>)
         bounds,
         content_mask: ContentMask { bounds: mask },
         corner_radii: Corners::default(),
+        tint: Hsla::default(),
+        tint_amount: 0.,
+        saturation: 1.,
     }
 }
 
