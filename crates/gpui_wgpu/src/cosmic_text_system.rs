@@ -388,26 +388,15 @@ impl CosmicTextSystemState {
         Ok(())
     }
 
-    #[profiling::function]
-    fn load_family(
+    /// Loads each listed fallback family and picks its face nearest to `weight`, skipping
+    /// families that are not installed. A fallback never brings in a chain of its own.
+    fn fallback_chain(
         &mut self,
-        name: &str,
-        features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
+        features: &FontFeatures,
         weight: CosmicWeight,
-        as_fallback: bool,
-    ) -> Result<SmallVec<[FontId; 4]>> {
-        let loaded_font_key = FontKey::new(
-            SharedString::from(name.to_owned()),
-            features.clone(),
-            fallbacks.cloned(),
-            weight,
-        );
-
-        // recurse with `fallbacks = None` so a fallback family cannot pull in
-        // another chain. missing fallback families are dropped so a typo in
-        // settings still lets the primary family load.
-        let user_fallback_chain: Arc<[(FontId, SharedString)]> = match fallbacks {
+    ) -> Result<Arc<[(FontId, SharedString)]>> {
+        let chain: Arc<[(FontId, SharedString)]> = match fallbacks {
             Some(fallbacks) if !fallbacks.fallback_list().is_empty() => {
                 let mut chain: Vec<(FontId, SharedString)> = Vec::new();
                 for fallback_name in fallbacks.fallback_list() {
@@ -455,6 +444,45 @@ impl CosmicTextSystemState {
             }
             _ => Arc::from(Vec::new()),
         };
+        Ok(chain)
+    }
+
+    /// The fallback chain built at `weight` during one `load_family` call, building it once.
+    fn fallback_chain_at(
+        &mut self,
+        chains: &mut SmallVec<[(CosmicWeight, Arc<[(FontId, SharedString)]>); 2]>,
+        fallbacks: Option<&FontFallbacks>,
+        features: &FontFeatures,
+        weight: CosmicWeight,
+    ) -> Result<Arc<[(FontId, SharedString)]>> {
+        if let Some((_, chain)) = chains.iter().find(|(built, _)| *built == weight) {
+            return Ok(Arc::clone(chain));
+        }
+        let chain = self.fallback_chain(fallbacks, features, weight)?;
+        chains.push((weight, Arc::clone(&chain)));
+        Ok(chain)
+    }
+
+    #[profiling::function]
+    fn load_family(
+        &mut self,
+        name: &str,
+        features: &FontFeatures,
+        fallbacks: Option<&FontFallbacks>,
+        weight: CosmicWeight,
+        as_fallback: bool,
+    ) -> Result<SmallVec<[FontId; 4]>> {
+        let loaded_font_key = FontKey::new(
+            SharedString::from(name.to_owned()),
+            features.clone(),
+            fallbacks.cloned(),
+            weight,
+        );
+
+        // A static face is shared by every requested weight, so its fallbacks follow the weight
+        // it draws at. Otherwise the weight that loaded the family last would set them for all.
+        let mut chains: SmallVec<[(CosmicWeight, Arc<[(FontId, SharedString)]>); 2]> =
+            SmallVec::new();
 
         let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback);
 
@@ -478,7 +506,9 @@ impl CosmicTextSystemState {
                 if !as_fallback && !self.loaded_fonts[font_id.0].primary {
                     continue;
                 }
-                self.loaded_fonts[font_id.0].user_fallback_chain = Arc::clone(&user_fallback_chain);
+                let drawn = self.loaded_fonts[font_id.0].instantiated_weight;
+                self.loaded_fonts[font_id.0].user_fallback_chain =
+                    self.fallback_chain_at(&mut chains, fallbacks, features, drawn)?;
                 loaded_font_ids.push(font_id);
                 continue;
             }
@@ -539,12 +569,16 @@ impl CosmicTextSystemState {
                 .and_then(|static_key| self.loaded_font_ids_by_key.get(static_key))
                 .filter(|font_id| as_fallback || self.loaded_fonts[font_id.0].primary)
             {
-                self.loaded_fonts[font_id.0].user_fallback_chain = Arc::clone(&user_fallback_chain);
+                let drawn = self.loaded_fonts[font_id.0].instantiated_weight;
+                self.loaded_fonts[font_id.0].user_fallback_chain =
+                    self.fallback_chain_at(&mut chains, fallbacks, features, drawn)?;
                 loaded_font_ids.push(font_id);
                 self.loaded_font_ids_by_key.insert(key, font_id);
                 continue;
             }
 
+            let user_fallback_chain =
+                self.fallback_chain_at(&mut chains, fallbacks, features, instantiated_weight)?;
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
             self.loaded_fonts.push(LoadedFont {
@@ -554,7 +588,7 @@ impl CosmicTextSystemState {
                 primary,
                 instantiated_weight,
                 wght_coords,
-                user_fallback_chain: Arc::clone(&user_fallback_chain),
+                user_fallback_chain,
             });
             self.loaded_font_ids_by_key.insert(key, font_id);
             if let Some(static_key) = static_key {
