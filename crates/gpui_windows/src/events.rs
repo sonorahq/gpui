@@ -20,6 +20,9 @@ use windows::{
 use crate::*;
 use gpui::*;
 
+/// What `SPI_GETWHEELSCROLLLINES` reports when the wheel is set to scroll one screen at a time.
+const WHEEL_PAGESCROLL: u32 = u32::MAX;
+
 pub(crate) const WM_GPUI_CURSOR_STYLE_CHANGED: u32 = WM_USER + 1;
 pub(crate) const WM_GPUI_CLOSE_ONE_WINDOW: u32 = WM_USER + 2;
 pub(crate) const WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD: u32 = WM_USER + 3;
@@ -576,25 +579,26 @@ impl WindowsWindowInner {
                 .get(),
         };
 
-        let wheel_distance =
-            (wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_amount as f32;
+        let notches = wparam.signed_hiword() as f32 / WHEEL_DELTA as f32;
+        let wheel_distance = notches * wheel_scroll_amount as f32;
         let mut cursor_point = POINT {
             x: lparam.signed_loword().into(),
             y: lparam.signed_hiword().into(),
         };
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
+        let delta = match (modifiers.shift, wheel_scroll_amount) {
+            (true, _) => ScrollDelta::Lines(point(wheel_distance, 0.)),
+            // "One screen at a time" reports `WHEEL_PAGESCROLL`, which taken as a line count
+            // would throw the view billions of lines to its far end on every notch.
+            (false, WHEEL_PAGESCROLL) => ScrollDelta::Pixels(point(
+                px(0.),
+                self.state.logical_size.get().height * notches,
+            )),
+            (false, _) => ScrollDelta::Lines(point(0., wheel_distance)),
+        };
         let input = PlatformInput::Scroll(ScrollEvent {
             position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
-            delta: ScrollDelta::Lines(match modifiers.shift {
-                true => Point {
-                    x: wheel_distance,
-                    y: 0.0,
-                },
-                false => Point {
-                    y: wheel_distance,
-                    x: 0.0,
-                },
-            }),
+            delta,
             modifiers,
             touch_phase: TouchPhase::Moved,
             source: ScrollSource::Pointer,
